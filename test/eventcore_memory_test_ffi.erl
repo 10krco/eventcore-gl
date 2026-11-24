@@ -8,13 +8,21 @@ stops_with_owner(Start) ->
         Parent ! {server, Server},
         receive stop -> ok end
     end),
-    receive
-        {server, Server} ->
-            Ref = monitor(process, Server),
-            Owner ! stop,
-            receive
-                {'DOWN', Ref, process, Server, normal} -> true
-            after 1000 -> false
-            end
-    after 1000 -> false
+    try
+        receive
+            {server, Server} ->
+                Ref = monitor(process, Server),
+                Owner ! stop,
+                try
+                    receive
+                        {'DOWN', Ref, process, Server, normal} -> true
+                    after 1000 -> false
+                    end
+                after
+                    demonitor(Ref, [flush])
+                end
+        after 1000 -> false
+        end
+    after
+        Owner ! stop
     end.

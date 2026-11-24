@@ -1,6 +1,7 @@
 import eventcore/memory
 import eventcore/store
 import eventcore/stream
+import store_contract
 
 pub fn append_is_atomic_with_stale_read_only_participant_test() {
   let assert Ok(memory) = memory.start()
@@ -50,4 +51,10 @@ fn stops_with_owner(
 
 pub fn store_stops_with_owner_test() {
   assert stops_with_owner(memory.start)
+}
+
+pub fn passes_the_shared_stream_and_append_contract_test() {
+  let assert Ok(pid) = memory.start()
+  store_contract.check_atomic_streams(memory.as_store(pid))
+  assert memory.close(pid) == Ok(Nil)
 }

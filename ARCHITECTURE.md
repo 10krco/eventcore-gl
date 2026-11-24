@@ -19,3 +19,8 @@ including read-only participants, before recording any events. The in-memory
 adapter owns its state in one OTP server per store. It returns only the requested
 part of the immutable history and stops when its creating process exits.
 See [ADR 0002](docs/decisions/0002-optimistic-append.md).
+
+Command execution folds each participating stream into state as events arrive.
+It reads initial declarations in order and enqueues discovered participants
+after each stream. An append conflict restarts the fold and discovery from the
+original declarations. See [ADR 0003](docs/decisions/0003-command-replay.md).
