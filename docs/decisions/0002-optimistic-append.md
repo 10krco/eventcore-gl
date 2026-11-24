@@ -11,5 +11,6 @@ from fresh reads before retrying.
 
 The in-memory adapter serializes requests through one OTP server per store.
 It validates every expected version before returning the updated server state.
-Reads capture immutable history, so a caller can consume it while the server
-handles further requests. The caller owns the store's lifetime.
+Reads capture the requested events from immutable history, so a caller can
+consume them while the server handles further requests. The creating process
+owns the store's lifetime and can close it early.

@@ -1,4 +1,5 @@
-//// In-memory event store backed by an OTP process. Call close when finished.
+//// In-memory event store backed by an OTP process. The store stops when its
+//// creating process exits. Call close to release it earlier.
 
 import eventcore/store.{
   type Event, type EventStream, type Store, type StoreError, type Writes,
@@ -60,12 +61,14 @@ fn read_after(
   after: Version,
 ) -> Result(EventStream(payload), StoreError) {
   let Memory(server) = memory
-  call(server, fn(streams) { #(streams, history(streams, id)) })
-  |> result.replace_error(store.StoreFailure(store.ReadStream))
-  |> result.map(fn(history) {
+  call(server, fn(streams) {
+    let history = history(streams, id)
     let count = stream.event_count(history.version) - stream.event_count(after)
-    history.newest_first
-    |> list.take(count)
+    #(streams, list.take(history.newest_first, count))
+  })
+  |> result.replace_error(store.StoreFailure(store.ReadStream))
+  |> result.map(fn(newest_first) {
+    newest_first
     |> list.fold([], fn(items, event) { [Ok(event), ..items] })
     |> store.from_items
   })

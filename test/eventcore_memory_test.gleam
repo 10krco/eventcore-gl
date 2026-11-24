@@ -42,3 +42,12 @@ pub fn append_is_atomic_with_stale_read_only_participant_test() {
   assert store.read_stream(storage, credit)
     == Error(store.StoreFailure(store.ReadStream))
 }
+
+@external(erlang, "eventcore_memory_test_ffi", "stops_with_owner")
+fn stops_with_owner(
+  start: fn() -> Result(memory.Memory(Nil), store.StoreError),
+) -> Bool
+
+pub fn store_stops_with_owner_test() {
+  assert stops_with_owner(memory.start)
+}
