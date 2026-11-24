@@ -25,10 +25,19 @@ Owning Tiber task `20261124-m7wf`.
 | Capability and upstream reference | Observable acceptance scenario | BEAM evidence |
 | --- | --- | --- |
 | [Persist and verify filesystem transactions](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/tests/git_robustness_test.rs) | Reopen a store after atomic multi-stream append, exercise configured sync policies, and detect a tampered transaction and a dangling parent. | [Filesystem journal tests](../test/eventcore_filesystem_test.gleam) |
-| [Merge independently written filesystem replicas](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/tests/merge_mode_test.rs) | Distinguish copied replica identities, detect shared-replica conflicts and forks, decline or reconcile a fork, and obtain identical canonical history in either union direction, including merges of merges. | Planned |
+| [Merge independently written filesystem replicas](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/tests/merge_mode_test.rs) | Distinguish copied replica identities, detect shared-replica conflicts and forks, decline or reconcile a fork, and obtain identical canonical history in either union direction, including merges of merges. | [Replica reconciliation tests](../test/eventcore_filesystem_test.gleam) |
 | [Run SQLite storage contracts](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-sqlite/tests/contract_suite_test.rs) | Pass the shared adapter contracts, persist batch appends across reopen, accept a supplied connection, and migrate fresh encrypted event and checkpoint databases. | Planned |
 | [Run PostgreSQL storage contracts](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-postgres/tests/contract_suite_test.rs) | Pass shared contracts against a real database, migrate and reconnect, commit batches atomically, retry competing writers, and assert the published observability behavior. | Planned |
 | [Restore and catch up command state](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore/tests/command_state_snapshot_test.rs) | Handle a missing snapshot, persist monotonically advancing snapshots, exercise the default 100-event refresh threshold and replay only required events in stream order. Exercise restart on each supporting adapter. | Planned |
+
+Rust 2.1.0 closes a fork when any transaction joins its ancestry and passes
+only the initial competing transactions to the resolver. Gleam keeps the
+fork open until an explicit resolution names it and supplies each branch's
+events through its current head. Unrelated streams can advance while writes
+to the forked stream wait for resolution. These differences prevent unrelated
+writes from concealing a conflict and give the resolver the full evidence.
+[Rust fork detection](https://github.com/jwilger/eventcore/blob/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/src/merge.rs#L231)
+[Rust resolver context](https://github.com/jwilger/eventcore/blob/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/src/lib.rs#L622)
 
 ## Projections
 
