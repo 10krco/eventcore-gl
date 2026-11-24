@@ -1,0 +1,14 @@
+assert_lefthook_installed: true
+no_auto_install: true
+
+pre-commit:
+  jobs:
+    - name: development-system-format
+      run: "'gleam' 'format' '--check'"
+    - name: development-system-build
+      run: "'gleam' 'build' '--warnings-as-errors'"
+    - name: development-system-test
+      run: "'gleam' 'test'"
+
+pre-push:
+  jobs: []

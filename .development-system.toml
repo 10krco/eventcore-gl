@@ -1,0 +1,55 @@
+schema_version = 3
+
+[delivery]
+mode = "pull-request"
+trunk_branch = "main"
+merge_method = "squash"
+
+[forge]
+provider = "git_hub"
+repository = "10krco/eventcore-gl"
+
+[signing]
+commit = true
+
+[features]
+tiber = true
+
+[tiber]
+max_queued = 5
+
+[scopes.source]
+category = "source"
+include = ["src/**/*.gleam", "src/**/*.erl"]
+
+[scopes.tests]
+category = "tests"
+include = ["test/**/*.gleam", "test/**/*.erl", "test/fixtures/**"]
+
+[scopes.documentation]
+category = "documentation"
+include = ["README.md", "ARCHITECTURE.md", "docs/**/*.md", "LICENSE"]
+
+[scopes.developer_environment]
+category = "developer_environment"
+include = [".envrc", ".gitignore", ".github/workflows/*.yml", "AGENTS.md", "flake.nix", "flake.lock", "gleam.toml", "manifest.toml"]
+
+[scopes.build_output]
+category = "build_output"
+include = ["build/**"]
+
+[commands.format]
+argv = ["gleam", "format", "--check"]
+capability = "verification"
+
+[commands.build]
+argv = ["gleam", "build", "--warnings-as-errors"]
+capability = "verification"
+output_scopes = ["build_output"]
+network = "allowed"
+
+[commands.test]
+argv = ["gleam", "test"]
+capability = "tests"
+output_scopes = ["build_output"]
+network = "allowed"
