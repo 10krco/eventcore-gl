@@ -19,3 +19,5 @@ jobs:
       - run: nix develop --no-update-lock-file -c gleam format --check
       - run: nix develop --no-update-lock-file -c gleam build --warnings-as-errors
       - run: nix develop --no-update-lock-file -c gleam test
+      - name: Verify the committed Gleam manifest
+        run: git diff --exit-code HEAD -- manifest.toml
