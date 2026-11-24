@@ -1,6 +1,7 @@
 //// In-memory event store backed by an OTP process. The store stops when its
 //// creating process exits. Call close to release it earlier.
 
+import eventcore/projection
 import eventcore/snapshot
 import eventcore/store.{
   type Event, type EventStream, type Store, type StoreError, type Writes,
@@ -19,6 +20,9 @@ type State(payload) {
   State(
     streams: Dict(Id, History(payload)),
     snapshots: Dict(snapshot.Key, snapshot.Snapshot),
+    projection_events: Dict(Int, Event(payload)),
+    last_position: Int,
+    checkpoints: Dict(String, projection.Position),
   )
 }
 
@@ -41,7 +45,7 @@ fn call(
 fn stop(server: Server(state)) -> Result(Nil, Nil)
 
 pub fn start() -> Result(Memory(payload), StoreError) {
-  start_server(State(dict.new(), dict.new()))
+  start_server(State(dict.new(), dict.new(), dict.new(), 0, dict.new()))
   |> result.map(Memory)
   |> result.replace_error(store.StoreFailure(store.StartStore))
 }
@@ -105,19 +109,8 @@ fn append_events(
       case checked {
         Error(_) as conflict -> #(state, conflict)
         Ok(Nil) -> {
-          let updated =
-            writes
-            |> store.entries
-            |> list.fold(streams, fn(streams, event) {
-              let previous = history(streams, event.stream)
-              let updated =
-                History(stream.next_version(previous.version), [
-                  event,
-                  ..previous.newest_first
-                ])
-              dict.insert(streams, event.stream, updated)
-            })
-          #(State(..state, streams: updated), Ok(Nil))
+          let updated = list.fold(store.entries(writes), state, record_event)
+          #(updated, Ok(Nil))
         }
       }
     })
@@ -157,6 +150,107 @@ pub fn snapshots(memory: Memory(payload)) -> snapshot.Repository {
         #(next, Nil)
       })
       |> result.replace_error(store.StoreFailure(store.SaveSnapshot))
+    },
+  )
+}
+
+fn record_event(
+  state: State(payload),
+  event: Event(payload),
+) -> State(payload) {
+  let previous = history(state.streams, event.stream)
+  let updated =
+    History(stream.next_version(previous.version), [
+      event,
+      ..previous.newest_first
+    ])
+  let position = state.last_position + 1
+  State(
+    ..state,
+    streams: dict.insert(state.streams, event.stream, updated),
+    projection_events: dict.insert(state.projection_events, position, event),
+    last_position: position,
+  )
+}
+
+/// Enumerates events in append order across streams.
+pub fn projection_reader(
+  memory: Memory(payload),
+) -> projection.Reader(payload) {
+  let Memory(server) = memory
+  fn(filter, page) {
+    let after = case projection.page_after(page) {
+      Some(position) -> projection.sequence(position)
+      None -> 0
+    }
+    call(server, fn(state) {
+      let events =
+        read_deliveries(
+          state,
+          filter,
+          after + 1,
+          projection.page_limit(page),
+          [],
+        )
+      #(state, events)
+    })
+    |> result.replace_error(store.StoreFailure(store.ReadProjection))
+    |> result.flatten
+  }
+}
+
+fn read_deliveries(
+  state: State(payload),
+  filter: projection.Filter,
+  next: Int,
+  remaining: Int,
+  reversed: List(projection.Delivery(payload)),
+) -> Result(List(projection.Delivery(payload)), StoreError) {
+  case remaining == 0 || next > state.last_position {
+    True -> Ok(list.reverse(reversed))
+    False -> {
+      let failure = store.StoreFailure(store.ReadProjection)
+      use event <- result.try(
+        dict.get(state.projection_events, next) |> result.replace_error(failure),
+      )
+      case projection.matches(filter, event.stream, event.kind) {
+        False -> read_deliveries(state, filter, next + 1, remaining, reversed)
+        True -> {
+          use position <- result.try(
+            projection.position(next) |> result.replace_error(failure),
+          )
+          read_deliveries(state, filter, next + 1, remaining - 1, [
+            projection.Delivery(event, position),
+            ..reversed
+          ])
+        }
+      }
+    }
+  }
+}
+
+pub fn projection_checkpoints(
+  memory: Memory(payload),
+) -> projection.Checkpoints {
+  let Memory(server) = memory
+  projection.Checkpoints(
+    load: fn(name) {
+      call(server, fn(state) {
+        #(state, option.from_result(dict.get(state.checkpoints, name)))
+      })
+      |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
+    },
+    save: fn(name, position) {
+      call(server, fn(state) {
+        #(
+          State(
+            ..state,
+            checkpoints: dict.insert(state.checkpoints, name, position),
+          ),
+          Nil,
+        )
+      })
+      |> result.replace_error(store.StoreFailure(store.SaveCheckpoint))
     },
   )
 }
