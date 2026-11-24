@@ -100,3 +100,10 @@ scanned cursor once a page finishes. Stop signals interrupt idle and retry
 waits. Memory leases live in the store process, require a holder on its BEAM node, and are reclaimed when their
 holder exits. [ADR 0010](docs/decisions/0010-legacy-projection-runner.md)
 records the failure and checkpoint policies.
+
+Filesystem projections use a replica-local ingestion sequence. The server
+recovers persisted assignments before assigning positions to imported
+transactions. It exposes bounded pages after the assignment is published.
+Named checkpoints use atomic local files, and the store process owns the
+named leases on its BEAM node. See
+[ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md).
