@@ -2,6 +2,7 @@
 //// creating process exits. Call close to release it earlier.
 
 import eventcore/projection
+import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/store.{
   type Event, type EventStream, type Store, type StoreError, type Writes,
@@ -290,3 +291,24 @@ pub fn projection_checkpoints(
     },
   )
 }
+
+/// Uses a store-local lease for each named projector.
+pub fn projection_backend(
+  memory: Memory(payload),
+) -> projection_runner.Backend(payload) {
+  let Memory(server) = memory
+  projection_runner.Backend(
+    projection_reader(memory),
+    projection_checkpoints(memory),
+    fn(name) {
+      use release <- result.map(acquire(server, name))
+      projection_runner.Lease(release)
+    },
+  )
+}
+
+@external(erlang, "eventcore_memory_ffi", "acquire")
+fn acquire(
+  server: Server(state),
+  name: String,
+) -> Result(fn() -> Nil, projection_runner.LeadershipError)

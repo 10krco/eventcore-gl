@@ -92,3 +92,11 @@ resume by subscription name. The memory adapter records its global append
 order in the same OTP transition as stream versions. It scans bounded chunks
 outside the store process up to a fixed frontier and returns the scanned
 position even when the filter finds no matches. See [ADR 0009](docs/decisions/0009-projection-cursors.md).
+
+The legacy projection runner acquires the named backend lease, loads its
+checkpoint, and drives batch or continuous polling in the caller's BEAM
+process. It advances after successful or skipped deliveries and can save the
+scanned cursor once a page finishes. Stop signals interrupt idle and retry
+waits. Memory leases live in the store process and are reclaimed when their
+holder exits. [ADR 0010](docs/decisions/0010-legacy-projection-runner.md)
+records the failure and checkpoint policies.
