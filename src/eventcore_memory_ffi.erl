@@ -71,6 +71,8 @@ handle_info(_Message, State) -> {noreply, State}.
 
 
 live_lease(error) -> false;
+% A live code upgrade can retain a remote holder from the previous version.
+live_lease({ok, {Holder, _}}) when node(Holder) =/= node() -> true;
 live_lease({ok, {Holder, Token}}) ->
     case erlang:is_process_alive(Holder) of
         true -> true;
