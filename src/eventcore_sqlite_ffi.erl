@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 -export([start_file/2, start_memory/0, start_supplied/1, stop/1, migrate/2,
-         read/3, append/3, load_snapshot/2, save_snapshot/3, checkpoint/2, save_checkpoint/3, reset_checkpoint/2]).
+         read/3, append/3, load_snapshot/2, save_snapshot/4, checkpoint/2, save_checkpoint/3, reset_checkpoint/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_file(Path, Encryption) -> start({file, Path, Encryption}).
@@ -23,8 +23,8 @@ append(Server, Expected, Events) ->
     call(Server, {append, Expected, Events}, {error, {store_failure, append_events}}).
 load_snapshot(Server, Name) ->
     call(Server, {load_snapshot, Name}, {error, nil}).
-save_snapshot(Server, Name, Value) ->
-    call(Server, {save_snapshot, Name, Value}, {error, nil}).
+save_snapshot(Server, Name, Observed, Value) ->
+    call(Server, {save_snapshot, Name, Observed, Value}, {error, nil}).
 checkpoint(Server, Name) ->
     call(Server, {checkpoint, Name}, {error, checkpoint_failed}).
 save_checkpoint(Server, Name, Position) ->
@@ -117,8 +117,8 @@ handle_call({append, Expected, Events}, _From, {Connection, _} = State) ->
 handle_call({load_snapshot, Name}, _From, {Connection, _} = State) ->
     Reply = guard_query(fun() -> read_snapshot(Connection, Name) end, {error, nil}),
     {reply, Reply, State};
-handle_call({save_snapshot, Name, Value}, _From, {Connection, _} = State) ->
-    Reply = transaction(Connection, fun() -> write_snapshot(Connection, Name, Value) end,
+handle_call({save_snapshot, Name, Observed, Value}, _From, {Connection, _} = State) ->
+    Reply = transaction(Connection, fun() -> write_snapshot(Connection, Name, Observed, Value) end,
                         {error, nil}),
     reply_or_stop(Reply, State);
 handle_call({checkpoint, Name}, _From, {Connection, _} = State) ->
@@ -204,11 +204,10 @@ read_snapshot(Connection, Name) ->
             end
     end.
 
-write_snapshot(Connection, Name, Value) ->
+write_snapshot(Connection, Name, Observed, Value) ->
     case read_snapshot(Connection, Name) of
-        {ok, none} -> replace_snapshot(Connection, Name, Value);
-        {ok, {some, Previous}} ->
-            case eventcore@snapshot:covers(Value, Previous) of
+        {ok, Current} ->
+            case eventcore@snapshot:can_replace(Current, Observed, Value) of
                 true -> replace_snapshot(Connection, Name, Value);
                 false -> {ok, nil}
             end;

@@ -1,7 +1,7 @@
 -module(eventcore_filesystem_ffi).
 -behaviour(gen_server).
 -export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
-         event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/4,
+         event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/5,
          replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -56,10 +56,10 @@ append(Pid, Revision, Expected, Events) ->
     guarded_call(Pid, Revision, {append, Expected, Events}, append_events).
 
 load_snapshot(Pid, Revision, Name) ->
-    guarded_call(Pid, Revision, {load_snapshot, Name}, load_snapshot).
+    guarded_call(Pid, {some, Revision}, {load_snapshot, Name}, load_snapshot).
 
-save_snapshot(Pid, Revision, Name, Value) ->
-    guarded_call(Pid, Revision, {save_snapshot, Name, Value}, save_snapshot).
+save_snapshot(Pid, Revision, Name, Observed, Value) ->
+    guarded_call(Pid, {some, Revision}, {save_snapshot, Name, Observed, Value}, save_snapshot).
 
 guarded_call(Pid, Revision, Request, Operation) ->
     Reply = call(Pid, {with_history, Revision, Request}, {error, {store_failure, Operation}}),
@@ -259,8 +259,8 @@ handle_call({with_history, _, Request}, From, State) ->
     handle_call(Request, From, State);
 handle_call({load_snapshot, Name}, _From, State) ->
     {reply, read_snapshot(snapshot_path(Name, State), State), State};
-handle_call({save_snapshot, Name, Value}, _From, State) ->
-    {reply, persist_snapshot(snapshot_path(Name, State), Value, State), State};
+handle_call({save_snapshot, Name, Observed, Value}, _From, State) ->
+    {reply, persist_snapshot(snapshot_path(Name, State), Observed, Value, State), State};
 handle_call({read, Id, After}, _From, #state{streams = Streams} = State) ->
     {Version, Reversed} = maps:get(Id, Streams, {0, []}),
     Tail = lists:reverse(lists:sublist(Reversed, max(0, Version - After))),
@@ -372,11 +372,10 @@ read_snapshot(Path, State) ->
 snapshot_prefix(#state{transactions = Transactions, ordered = Reversed}, Count) ->
     eventcore_filesystem_graph:event_prefix_token(Count, lists:reverse(Reversed), Transactions).
 
-persist_snapshot(Path, Value, #state{snapshot_directory = Directory, sync = Sync,
+persist_snapshot(Path, Observed, Value, #state{snapshot_directory = Directory, sync = Sync,
                                      streams = Streams} = State) ->
     Replace = case read_snapshot(Path, State) of
-        {ok, none} -> true;
-        {ok, {some, Previous}} -> eventcore@snapshot:covers(Value, Previous);
+        {ok, Current} -> eventcore@snapshot:can_replace(Current, Observed, Value);
         {error, nil} -> error
     end,
     case Replace of

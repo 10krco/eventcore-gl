@@ -155,8 +155,8 @@ pub fn snapshots(events: EventStore(payload)) -> snapshot.Repository {
       load_snapshot(events.server, snapshot.name(key))
       |> result.replace_error(store.StoreFailure(store.LoadSnapshot))
     },
-    save: fn(key, value) {
-      save_snapshot(events.server, snapshot.name(key), value)
+    save: fn(key, observed, value) {
+      save_snapshot(events.server, snapshot.name(key), observed, value)
       |> result.replace_error(store.StoreFailure(store.SaveSnapshot))
     },
   )
@@ -263,5 +263,6 @@ fn load_snapshot(
 fn save_snapshot(
   server: Server,
   name: String,
+  observed: Option(snapshot.Snapshot),
   value: snapshot.Snapshot,
 ) -> Result(Nil, Nil)

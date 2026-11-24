@@ -244,11 +244,6 @@ fn reconcile_forks(
   }
 }
 
-/// Command checkpoints live in Git-ignored local journal state.
-pub fn snapshots(filesystem: Filesystem(payload)) -> snapshot.Repository {
-  snapshot_repository(filesystem, None)
-}
-
 /// Acquire a store and repository for one command execution. Ordinary appends
 /// retain the view and still use optimistic stream versions. Reconciliation
 /// invalidates it, in which case acquire a fresh view and reconstruct again.
@@ -258,20 +253,26 @@ pub fn command_view(
   use revision <- result.try(history_revision(filesystem.server))
   Ok(#(
     event_store(filesystem, Some(revision)),
-    snapshot_repository(filesystem, Some(revision)),
+    snapshot_repository(filesystem, revision),
   ))
 }
 
 fn snapshot_repository(
   filesystem: Filesystem(payload),
-  revision: Option(Int),
+  revision: Int,
 ) -> snapshot.Repository {
   snapshot.Repository(
     load: fn(key) {
       load_snapshot(filesystem.server, revision, snapshot.name(key))
     },
-    save: fn(key, value) {
-      save_snapshot(filesystem.server, revision, snapshot.name(key), value)
+    save: fn(key, observed, value) {
+      save_snapshot(
+        filesystem.server,
+        revision,
+        snapshot.name(key),
+        observed,
+        value,
+      )
     },
   )
 }
@@ -398,15 +399,16 @@ fn append(
 @external(erlang, "eventcore_filesystem_ffi", "load_snapshot")
 fn load_snapshot(
   server: Server,
-  revision: Option(Int),
+  revision: Int,
   name: String,
 ) -> Result(Option(snapshot.Snapshot), StoreError)
 
 @external(erlang, "eventcore_filesystem_ffi", "save_snapshot")
 fn save_snapshot(
   server: Server,
-  revision: Option(Int),
+  revision: Int,
   name: String,
+  observed: Option(snapshot.Snapshot),
   value: snapshot.Snapshot,
 ) -> Result(Nil, StoreError)
 

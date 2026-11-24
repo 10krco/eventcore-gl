@@ -4,7 +4,7 @@ import eventcore/store.{type StoreError}
 import eventcore/stream.{type Id, type Version}
 import gleam/dict
 import gleam/list
-import gleam/option.{type Option}
+import gleam/option.{type Option, None, Some}
 import gleam/string
 
 pub opaque type Key {
@@ -32,11 +32,12 @@ pub type Snapshot {
   Snapshot(checkpoints: List(Checkpoint))
 }
 
-/// Save atomically if the incoming snapshot covers every stored stream version.
+/// Save atomically. Removing participants requires the exact snapshot that
+/// was loaded for replay. Shared stream versions must always advance or match.
 pub type Repository {
   Repository(
     load: fn(Key) -> Result(Option(Snapshot), StoreError),
-    save: fn(Key, Snapshot) -> Result(Nil, StoreError),
+    save: fn(Key, Option(Snapshot), Snapshot) -> Result(Nil, StoreError),
   )
 }
 
@@ -47,21 +48,28 @@ pub type Codec(state) {
   )
 }
 
-/// True when every stream in the earlier snapshot is present at an equal or
-/// higher version in the candidate.
-pub fn covers(candidate: Snapshot, earlier: Snapshot) -> Bool {
-  let versions =
-    list.fold(candidate.checkpoints, dict.new(), fn(versions, checkpoint) {
-      dict.insert(
-        versions,
-        checkpoint.stream,
-        stream.event_count(checkpoint.version),
-      )
-    })
-  list.all(earlier.checkpoints, fn(checkpoint) {
-    case dict.get(versions, checkpoint.stream) {
-      Ok(count) -> count >= stream.event_count(checkpoint.version)
-      Error(Nil) -> False
+/// Decide under the repository's write lock whether to replace its value.
+pub fn can_replace(
+  current: Option(Snapshot),
+  observed: Option(Snapshot),
+  candidate: Snapshot,
+) -> Bool {
+  case current {
+    None -> True
+    Some(earlier) -> {
+      let versions =
+        list.fold(candidate.checkpoints, dict.new(), fn(versions, checkpoint) {
+          dict.insert(versions, checkpoint.stream, checkpoint.version)
+        })
+      let may_drop = observed == current
+      list.all(earlier.checkpoints, fn(checkpoint) {
+        case dict.get(versions, checkpoint.stream) {
+          Ok(version) ->
+            stream.event_count(version)
+            >= stream.event_count(checkpoint.version)
+          Error(Nil) -> may_drop
+        }
+      })
     }
-  })
+  }
 }

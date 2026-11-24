@@ -139,12 +139,13 @@ pub fn snapshots(memory: Memory(payload)) -> snapshot.Repository {
       })
       |> result.replace_error(store.StoreFailure(store.LoadSnapshot))
     },
-    save: fn(key, candidate) {
+    save: fn(key, observed, candidate) {
       call(server, fn(state) {
-        let replace = case dict.get(state.snapshots, key) {
-          Ok(previous) -> snapshot.covers(candidate, previous)
-          Error(Nil) -> True
+        let current = case dict.get(state.snapshots, key) {
+          Ok(previous) -> Some(previous)
+          Error(Nil) -> None
         }
+        let replace = snapshot.can_replace(current, observed, candidate)
         let next = case replace {
           True ->
             State(

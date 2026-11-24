@@ -68,7 +68,8 @@ pragmas. See [ADR 0006](docs/decisions/0006-sqlite-storage.md).
 Commands can save replay state after each participating stream in the order
 the runtime discovers it. A saved version vector lets the runtime read only
 the suffix of each unchanged stream. If an earlier stream advances, the
-runtime rebuilds subsequent streams from the new accumulated state. Filesystem
-snapshots are local to the journal and tied to a fingerprint of the canonical
+runtime rebuilds subsequent streams from the new accumulated state. A refresh
+can remove participants when the stored snapshot still matches the one observed
+during replay. Filesystem snapshots are local to the journal and tied to a fingerprint of the canonical
 event prefix. Use the journal's command view to keep replay and writes on the
 same history across reconciliation. See [ADR 0007](docs/decisions/0007-command-snapshots.md).

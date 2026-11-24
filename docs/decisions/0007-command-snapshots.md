@@ -16,8 +16,9 @@ the recorded participant order before resuming replay. Start with a full replay
 and save after 100 reconstructed events. Refresh a saved snapshot when any
 participant advances, rebuilding subsequent checkpoints from the changed state.
 
-Save a candidate atomically if it covers the previous version vector. Memory
-keeps the snapshots with the event store. SQLite keeps them in the event
+Save a candidate atomically if its shared stream versions cover the previous
+versions. Removing a participant requires the exact snapshot observed during
+replay. Encode checkpoints only when a save is due. Memory keeps the snapshots with the event store. SQLite keeps them in the event
 database. The filesystem journal atomically publishes them as local files
 tied to a canonical event prefix. A filesystem command view pins the replay
 revision across reads, snapshot operations and appends.

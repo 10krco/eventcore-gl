@@ -2,7 +2,7 @@
 
 import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError, type Writes}
-import eventcore/stream.{type Id}
+import eventcore/stream.{type Id, type Version}
 import gleam/float
 import gleam/int
 import gleam/list
@@ -182,7 +182,6 @@ pub fn execute_with_snapshot(
     use restored <- result.try(replay_snapshot(
       storage,
       command,
-      codec,
       queue,
       SnapshotReplay(command.initial_state(), store.writes(), [], 0, False),
       option.unwrap(checkpoints, []),
@@ -191,17 +190,26 @@ pub fn execute_with_snapshot(
       Some(_) -> restored.advanced
       None -> restored.count >= 100
     }
+    let ordered = list.reverse(restored.checkpoints)
     use _ <- result.try(case refresh {
-      True ->
-        repository.save(
-          key,
-          snapshot.Snapshot(list.reverse(restored.checkpoints)),
+      True -> {
+        use encoded <- result.try(
+          list.try_map(ordered, fn(checkpoint) {
+            use bytes <- result.try(case checkpoint.encoded {
+              Some(bytes) -> Ok(bytes)
+              None ->
+                codec.encode(checkpoint.state)
+                |> result.map_error(InvalidSnapshot)
+            })
+            Ok(snapshot.Checkpoint(checkpoint.stream, checkpoint.version, bytes))
+          }),
         )
+        repository.save(key, stored, snapshot.Snapshot(encoded))
         |> result.map_error(StorageError)
+      }
       False -> Ok(Nil)
     })
-    let participants =
-      list.reverse(restored.checkpoints) |> list.map(fn(c) { c.stream })
+    let participants = list.map(ordered, fn(c) { c.stream })
     Ok(#(restored.state, restored.writes, participants))
   })
 }
@@ -366,11 +374,20 @@ fn validate_checkpoints(
   }
 }
 
+type ReplayCheckpoint(state) {
+  ReplayCheckpoint(
+    stream: Id,
+    version: Version,
+    state: state,
+    encoded: Option(BitArray),
+  )
+}
+
 type SnapshotReplay(state, payload) {
   SnapshotReplay(
     state: state,
     writes: Writes(payload),
-    checkpoints: List(snapshot.Checkpoint),
+    checkpoints: List(ReplayCheckpoint(state)),
     count: Int,
     advanced: Bool,
   )
@@ -379,7 +396,6 @@ type SnapshotReplay(state, payload) {
 fn replay_snapshot(
   storage: Store(payload),
   command: Command(state, payload, domain_error),
-  codec: snapshot.Codec(state),
   queue: ReplayQueue,
   progress: SnapshotReplay(state, payload),
   cached: List(#(snapshot.Checkpoint, state)),
@@ -406,10 +422,10 @@ fn replay_snapshot(
         |> result.map_error(StorageError),
       )
       let changed = current != version
-      use encoded <- result.try(case encoded, changed {
-        Some(bytes), False -> Ok(bytes)
-        _, _ -> codec.encode(state) |> result.map_error(InvalidSnapshot)
-      })
+      let encoded = case changed {
+        True -> None
+        False -> encoded
+      }
       use writes <- result.try(
         store.register(progress.writes, id, current)
         |> result.map_error(StorageError),
@@ -418,7 +434,10 @@ fn replay_snapshot(
         SnapshotReplay(
           state,
           writes,
-          [snapshot.Checkpoint(id, current, encoded), ..progress.checkpoints],
+          [
+            ReplayCheckpoint(id, current, state, encoded),
+            ..progress.checkpoints
+          ],
           progress.count + stream.event_count(current),
           progress.advanced || changed,
         )
@@ -429,7 +448,6 @@ fn replay_snapshot(
       replay_snapshot(
         storage,
         command,
-        codec,
         enqueue(queue, command.discover(state)),
         progress,
         cached,

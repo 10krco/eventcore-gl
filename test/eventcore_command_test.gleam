@@ -305,25 +305,24 @@ pub fn saved_command_state_replays_later_streams_after_an_earlier_tail_test() {
         events
       },
     )
-  let save = fn(_, saved) {
-    record(saves, saved)
-    Ok(Nil)
-  }
-  let initial = snapshot.Repository(fn(_) { Ok(None) }, save)
+  let repository = memory.snapshots(pid)
+  let cached =
+    snapshot.Repository(repository.load, fn(key, observed, saved) {
+      record(saves, saved)
+      repository.save(key, observed, saved)
+    })
   let assert Ok(_) =
     command.execute_with_snapshot(
       traced,
       command,
       command.default_policy(),
-      initial,
+      cached,
       key,
       codec,
     )
   assert drain(handled) == [1002]
   assert drain(reads) == [#(first, zero), #(later, zero)]
-  let assert [saved] = drain(saves)
-
-  let cached = snapshot.Repository(fn(_) { Ok(Some(saved)) }, save)
+  let assert [_] = drain(saves)
   let assert Ok(_) =
     command.execute_with_snapshot(
       traced,
@@ -354,6 +353,22 @@ pub fn saved_command_state_replays_later_streams_after_an_earlier_tail_test() {
   assert drain(reads) == [#(first, version_100), #(replacement, zero)]
   let assert [snapshot.Snapshot([_, checkpoint])] = drain(saves)
   assert checkpoint.stream == replacement
+  let assert Ok(_) =
+    command.execute_with_snapshot(
+      traced,
+      command,
+      command.default_policy(),
+      cached,
+      key,
+      codec,
+    )
+  assert drain(handled) == [1034]
+  assert drain(reads)
+    == [
+      #(first, stream.next_version(version_100)),
+      #(replacement, stream.next_version(zero)),
+    ]
+  assert drain(saves) == []
   let assert Ok(Nil) = memory.close(pid)
 }
 
@@ -383,11 +398,18 @@ pub fn memory_snapshot_rejects_a_regressing_version_vector_test() {
       snapshot.Checkpoint(second, one, <<6>>),
     ])
   assert snapshots.load(key) == Ok(None)
-  assert snapshots.save(key, original) == Ok(Nil)
-  assert snapshots.save(key, regressing) == Ok(Nil)
+  assert snapshots.save(key, None, original) == Ok(Nil)
+  assert snapshots.save(key, Some(original), regressing) == Ok(Nil)
   assert snapshots.load(key) == Ok(Some(original))
-  assert snapshots.save(key, covering) == Ok(Nil)
+  assert snapshots.save(key, Some(original), covering) == Ok(Nil)
   assert snapshots.load(key) == Ok(Some(covering))
+
+  let without_second =
+    snapshot.Snapshot([snapshot.Checkpoint(first, two, <<7>>)])
+  assert snapshots.save(key, Some(original), without_second) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(covering))
+  assert snapshots.save(key, Some(covering), without_second) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(without_second))
   let assert Ok(Nil) = memory.close(pid)
 }
 
@@ -431,7 +453,20 @@ pub fn snapshot_refresh_threshold_applies_before_a_command_rejection_test() {
       codec,
     )
   }
-  assert run() == Error(command.Rejected(command.BusinessRule("declined")))
+  let fail_encode =
+    snapshot.Codec(
+      fn(_) { Error("encoder called below threshold") },
+      codec.decode,
+    )
+  assert command.execute_with_snapshot(
+      storage,
+      reject,
+      command.default_policy(),
+      snapshots,
+      key,
+      fail_encode,
+    )
+    == Error(command.Rejected(command.BusinessRule("declined")))
   assert snapshots.load(key) == Ok(None)
 
   let assert Ok(tail) = store.register(store.writes(), id, version_99)
