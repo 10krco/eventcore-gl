@@ -8,6 +8,7 @@ import eventcore/store.{
 }
 import eventcore/stream.{type Id, type Version}
 import gleam/dict.{type Dict}
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
@@ -173,6 +174,10 @@ fn record_event(
   )
 }
 
+const projection_chunk_size = 128
+
+const read_projection_failure = store.StoreFailure(store.ReadProjection)
+
 /// Enumerates events in append order across streams.
 pub fn projection_reader(
   memory: Memory(payload),
@@ -183,49 +188,80 @@ pub fn projection_reader(
       Some(position) -> projection.sequence(position)
       None -> 0
     }
-    call(server, fn(state) {
-      let events =
-        read_deliveries(
-          state,
-          filter,
-          after + 1,
-          projection.page_limit(page),
-          [],
-        )
-      #(state, events)
-    })
-    |> result.replace_error(store.StoreFailure(store.ReadProjection))
-    |> result.flatten
+    use high <- result.try(
+      call(server, fn(state) { #(state, state.last_position) })
+      |> result.replace_error(read_projection_failure),
+    )
+    scan_page(
+      server,
+      filter,
+      high,
+      after + 1,
+      projection.page_limit(page),
+      [],
+      [],
+    )
   }
 }
 
-fn read_deliveries(
-  state: State(payload),
+fn scan_page(
+  server: Server(State(payload)),
   filter: projection.Filter,
+  high: Int,
   next: Int,
   remaining: Int,
+  chunk: List(Event(payload)),
   reversed: List(projection.Delivery(payload)),
-) -> Result(List(projection.Delivery(payload)), StoreError) {
-  case remaining == 0 || next > state.last_position {
-    True -> Ok(list.reverse(reversed))
-    False -> {
-      let failure = store.StoreFailure(store.ReadProjection)
-      use event <- result.try(
-        dict.get(state.projection_events, next) |> result.replace_error(failure),
+) -> Result(projection.PageResult(payload), StoreError) {
+  case remaining == 0 || next > high, chunk {
+    True, _ ->
+      Ok(projection.PageResult(
+        list.reverse(reversed),
+        option.from_result(projection.position(next - 1)),
+      ))
+    False, [] -> {
+      let through = int.min(high, next + projection_chunk_size - 1)
+      use chunk <- result.try(
+        call(server, fn(state) {
+          #(state, fetch_chunk(state.projection_events, next, through, []))
+        })
+        |> result.replace_error(read_projection_failure)
+        |> result.flatten,
       )
+      scan_page(server, filter, high, next, remaining, chunk, reversed)
+    }
+    False, [event, ..rest] ->
       case projection.matches(filter, event.stream, event.kind) {
-        False -> read_deliveries(state, filter, next + 1, remaining, reversed)
+        False ->
+          scan_page(server, filter, high, next + 1, remaining, rest, reversed)
         True -> {
           use position <- result.try(
-            projection.position(next) |> result.replace_error(failure),
+            projection.position(next)
+            |> result.replace_error(read_projection_failure),
           )
-          read_deliveries(state, filter, next + 1, remaining - 1, [
+          scan_page(server, filter, high, next + 1, remaining - 1, rest, [
             projection.Delivery(event, position),
             ..reversed
           ])
         }
       }
-    }
+  }
+}
+
+fn fetch_chunk(
+  by_position: Dict(Int, Event(payload)),
+  next: Int,
+  through: Int,
+  reversed: List(Event(payload)),
+) -> Result(List(Event(payload)), StoreError) {
+  case next > through {
+    True -> Ok(list.reverse(reversed))
+    False ->
+      case dict.get(by_position, next) {
+        Error(Nil) -> Error(read_projection_failure)
+        Ok(event) ->
+          fetch_chunk(by_position, next + 1, through, [event, ..reversed])
+      }
   }
 }
 

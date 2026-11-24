@@ -47,7 +47,11 @@ pub fn memory_filtered_read_resumes_in_append_order_test() {
   let assert Ok(pattern) = projection.pattern("ledger/*")
   let filter = projection.with_event_type(pattern, "applied")
   let assert Ok(first_page) = projection.page(None, 1)
-  let assert Ok([projection.Delivery(first, cursor)]) = read(filter, first_page)
+  let assert Ok(projection.PageResult(
+    [projection.Delivery(first, cursor)],
+    Some(scanned),
+  )) = read(filter, first_page)
+  assert scanned == cursor
   assert first == debit_event
   assert projection.sequence(cursor) == 2
   assert checkpoints.load("balances") == Ok(None)
@@ -55,10 +59,56 @@ pub fn memory_filtered_read_resumes_in_append_order_test() {
   let assert Ok(saved) = checkpoints.load("balances")
   assert saved == Some(cursor)
   let assert Ok(resume) = projection.page(saved, 1)
-  let assert Ok([projection.Delivery(second, cursor)]) = read(filter, resume)
+  let assert Ok(projection.PageResult(
+    [projection.Delivery(second, cursor)],
+    Some(scanned),
+  )) = read(filter, resume)
+  assert scanned == cursor
   assert second == credit_event
   assert projection.sequence(cursor) == 4
   let assert Ok(drained) = projection.page(Some(cursor), 1)
-  assert read(filter, drained) == Ok([])
+  assert read(filter, drained) == Ok(projection.PageResult([], Some(cursor)))
   assert memory.close(memory) == Ok(Nil)
+}
+
+pub fn empty_page_advances_to_scanned_frontier_test() {
+  let assert Ok(memory) = memory.start()
+  let events = memory.as_store(memory)
+  let assert Ok(id) = stream.id("notifications")
+  let assert Ok(writes) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(writes) = emit_unrelated(writes, id, 260)
+  assert events.append_events(writes) == Ok(Nil)
+
+  let read = memory.projection_reader(memory)
+  let filter = projection.with_event_type(projection.all(), "subscribed")
+  let assert Ok(first) = projection.page(None, 1)
+  let assert Ok(projection.PageResult([], Some(scanned))) = read(filter, first)
+  assert projection.sequence(scanned) == 260
+
+  let assert Ok(version) = stream.version(260)
+  let matching = store.Event(id, "subscribed", 261)
+  let assert Ok(writes) =
+    store.writes()
+    |> store.register(id, version)
+    |> result.try(store.append(_, matching))
+  assert events.append_events(writes) == Ok(Nil)
+  let assert Ok(next) = projection.page(Some(scanned), 1)
+  let assert Ok(projection.PageResult(
+    [projection.Delivery(event, position)],
+    Some(scanned),
+  )) = read(filter, next)
+  assert event == matching
+  assert position == scanned
+  assert projection.sequence(position) == 261
+  assert memory.close(memory) == Ok(Nil)
+}
+
+fn emit_unrelated(writes: store.Writes(Int), id: stream.Id, remaining: Int) {
+  case remaining {
+    0 -> Ok(writes)
+    _ ->
+      store.append(writes, store.Event(id, "unrelated", remaining))
+      |> result.try(fn(writes) { emit_unrelated(writes, id, remaining - 1) })
+  }
 }

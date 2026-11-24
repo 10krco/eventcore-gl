@@ -48,8 +48,17 @@ pub type Delivery(payload) {
   Delivery(event: Event(payload), position: Position)
 }
 
+/// The cursor covers deliveries and non-matching events examined by this
+/// page. Persist it only after processing every delivery in the page.
+pub type PageResult(payload) {
+  PageResult(
+    deliveries: List(Delivery(payload)),
+    scanned_through: Option(Position),
+  )
+}
+
 pub type Reader(payload) =
-  fn(Filter, Page) -> Result(List(Delivery(payload)), StoreError)
+  fn(Filter, Page) -> Result(PageResult(payload), StoreError)
 
 pub type Checkpoints {
   Checkpoints(

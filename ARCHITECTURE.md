@@ -89,5 +89,6 @@ A projection reads an exclusive page after a backend-local cursor. The
 reader applies stream and event-type filters before filling the page.
 Checkpoint persistence sits behind a separate interface, so the caller can
 resume by subscription name. The memory adapter records its global append
-order in the same OTP transition as stream versions, then pages by position
-across streams. See [ADR 0009](docs/decisions/0009-projection-cursors.md).
+order in the same OTP transition as stream versions. It scans bounded chunks
+outside the store process up to a fixed frontier and returns the scanned
+position even when the filter finds no matches. See [ADR 0009](docs/decisions/0009-projection-cursors.md).
