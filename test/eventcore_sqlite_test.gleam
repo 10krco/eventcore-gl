@@ -182,10 +182,24 @@ fn two_writers(
 ) -> #(Result(Nil, store.StoreError), Result(Nil, store.StoreError))
 
 pub fn a_database_error_rolls_back_the_batch_and_keeps_the_connection_usable_test() {
-  let connection = open_supplied()
+  assert_failed_batch_rolls_back(open_supplied(), reject_kind)
+}
+
+pub fn an_ignored_write_rolls_back_with_and_without_count_rows_test() {
+  let counted = open_supplied()
+  let uncounted = open_supplied()
+  assert disable_count_changes(uncounted) == Nil
+  assert_failed_batch_rolls_back(counted, ignore_kind)
+  assert_failed_batch_rolls_back(uncounted, ignore_kind)
+}
+
+fn assert_failed_batch_rolls_back(
+  connection: sqlite.Connection,
+  install_trigger: fn(sqlite.Connection) -> Nil,
+) {
   let assert Ok(db) = sqlite.from_connection(connection, binary_codec())
   assert sqlite.migrate(db) == Ok(Nil)
-  assert reject_kind(connection) == Nil
+  assert install_trigger(connection) == Nil
   let events = sqlite.as_store(db)
   let assert Ok(left) = stream.id("rollback-left")
   let assert Ok(right) = stream.id("rollback-right")
@@ -210,3 +224,9 @@ pub fn a_database_error_rolls_back_the_batch_and_keeps_the_connection_usable_tes
 
 @external(erlang, "eventcore_sqlite_test_ffi", "reject_kind")
 fn reject_kind(connection: sqlite.Connection) -> Nil
+
+@external(erlang, "eventcore_sqlite_test_ffi", "ignore_kind")
+fn ignore_kind(connection: sqlite.Connection) -> Nil
+
+@external(erlang, "eventcore_sqlite_test_ffi", "disable_count_changes")
+fn disable_count_changes(connection: sqlite.Connection) -> Nil

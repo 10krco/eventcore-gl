@@ -121,7 +121,7 @@ handle_call({checkpoint, Name}, _From, {Connection, _} = State) ->
     {reply, Reply, State};
 handle_call({save_checkpoint, Name, Position}, _From, {Connection, _} = State) ->
     Reply = guard_query(fun() ->
-        ok = write_query(Connection, "INSERT INTO eventcore_checkpoints(name, position) VALUES(?, ?) "
+        ok = write_one(Connection, "INSERT INTO eventcore_checkpoints(name, position) VALUES(?, ?) "
                          "ON CONFLICT(name) DO UPDATE SET position = excluded.position", [Name, Position]),
         {ok, nil}
     end, {error, checkpoint_failed}),
@@ -212,9 +212,15 @@ insert_events(Connection, [{event, {id, Name} = Stream, Kind, Payload} | Rest], 
     Length = bit_size(Payload),
     Padding = (8 - Length rem 8) rem 8,
     Bytes = <<Length:64, Payload/bitstring, 0:Padding>>,
-    ok = write_query(Connection, "INSERT INTO eventcore_events(stream, version, kind, payload) "
+    ok = write_one(Connection, "INSERT INTO eventcore_events(stream, version, kind, payload) "
                      "VALUES(?, ?, ?, ?)", [Name, Version, Kind, {blob, Bytes}]),
     insert_events(Connection, Rest, Versions#{Stream := Version}).
+
+write_one(Connection, Sql, Parameters) ->
+    ok = write_query(Connection, Sql, Parameters),
+    %% count_changes omits updates performed by UPSERT. changes() counts them.
+    [{1}] = sqlite:query(Connection, "SELECT changes()"),
+    ok.
 
 write_query(Connection, Sql, Parameters) ->
     case sqlite:query(Connection, Sql, Parameters) of

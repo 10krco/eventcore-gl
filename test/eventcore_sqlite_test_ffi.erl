@@ -1,6 +1,7 @@
 -module(eventcore_sqlite_test_ffi).
 -export([temp_database/0, delete_database/1, two_writers/2, open_supplied/0, pragmas/1,
-         reject_kind/1, sqlite_test_backend/0, insert_invalid_payloads/1, file_journal_mode/1]).
+         reject_kind/1, ignore_kind/1, disable_count_changes/1, sqlite_test_backend/0,
+         insert_invalid_payloads/1, file_journal_mode/1]).
 
 sqlite_test_backend() ->
     unicode:characters_to_binary(os:getenv("EVENTCORE_SQLITE_TEST_BACKEND", "plain")).
@@ -62,6 +63,16 @@ await_write(Tag, Writer) ->
 
 
 reject_kind(Db) ->
+    install_trigger(Db, "ABORT, 'refused'").
+
+ignore_kind(Db) ->
+    install_trigger(Db, "IGNORE").
+
+disable_count_changes(Db) ->
+    [] = sqlite:query(Db, "PRAGMA count_changes = OFF"),
+    nil.
+
+install_trigger(Db, Action) ->
     [] = sqlite:query(Db, "CREATE TRIGGER reject_kind BEFORE INSERT ON eventcore_events "
-                         "WHEN NEW.kind = 'refused' BEGIN SELECT RAISE(ABORT, 'refused'); END"),
+                         "WHEN NEW.kind = 'refused' BEGIN SELECT RAISE(" ++ Action ++ "); END"),
     nil.
