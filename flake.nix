@@ -34,7 +34,7 @@
         USE_SYSTEM_SQLITE = "1";
         CFLAGS = "-I${sqlcipherSqlite}/include";
         LDFLAGS = "-L${sqlcipherSqlite}/lib";
-        packages = with pkgs; [ gleam beamPackages.erlang beamPackages.rebar3 lefthook git gh tiber util-linux ];
+        packages = with pkgs; [ gleam beamPackages.erlang beamPackages.rebar3 lefthook git gh tiber util-linux postgresql ];
       };
     };
 }

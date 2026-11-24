@@ -73,3 +73,12 @@ can remove participants when the stored snapshot still matches the one observed
 during replay. Filesystem snapshots are local to the journal and tied to a fingerprint of the canonical
 event prefix. Use the journal's command view to keep replay and writes on the
 same history across reconciliation. See [ADR 0007](docs/decisions/0007-command-snapshots.md).
+
+## PostgreSQL adapter
+
+PostgreSQL stores event payloads as binary records and assigns their global
+positions inside the append transaction. Transaction-scoped stream locks
+protect version checks across pools, including streams registered for reads
+only. The same database stores subscriber checkpoints and command snapshots.
+Snapshot replacement uses a lock keyed by snapshot name. See
+[ADR 0008](docs/decisions/0008-postgresql-storage.md).
