@@ -11,9 +11,9 @@ transactions into a shared directory.
 
 Write each batch as a versioned Erlang term in a temporary file next to its
 final SHA-256-named path. Publish it with one rename. Full sync flushes
-the file before rename and the directory afterward. When opening a new
-journal, it also flushes the parent entries for newly created directories. Callers provide codecs
-for event payloads. The journal rebuilds its index on open and verifies every
+the file before rename and the directory afterward. Each Full open also flushes parent entries along the
+journal directory’s ancestor chain so that a retry completes any interrupted
+directory syncs. Callers provide codecs for event payloads. The journal rebuilds its index on open and verifies every
 transaction checksum before reading its contents.
 
 One OTP server holds the util-linux `flock` advisory lock for the life of
@@ -25,6 +25,6 @@ metadata keeps local locks and staging files out of Git.
 The file format belongs to this adapter. Reopening requires a graph scan.
 Damaged transactions are excluded from the reconstructed history and reported
 by status. Transactions with missing parents remain readable and status names
-the missing parents. A complete graph with incompatible stream versions
+the missing parents. Appends require all parents to be present. A complete graph with incompatible stream versions
 requires reconciliation before it can open. A directory sync error after rename returns an append
 error while retaining the newly visible transaction in memory.

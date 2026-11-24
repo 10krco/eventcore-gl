@@ -146,6 +146,54 @@ pub fn incompatible_transaction_histories_require_reconciliation_test() {
   copy_transactions(right, left)
   let assert Error(filesystem.ConflictingHistory) =
     filesystem.open(left, codec())
+  let unrelated = temp_root()
+  let assert Ok(other) = stream.id("unrelated")
+  let assert Ok(journal) = filesystem.open(unrelated, codec())
+  let storage = filesystem.as_store(journal)
+  let assert Ok(first) =
+    store.register(store.writes(), other, stream.initial_version)
+  let assert Ok(first) = store.append(first, store.Event(other, "added", 3))
+  assert storage.append_events(first) == Ok(Nil)
+  let assert [#(_, parent_path)] = transaction_paths(unrelated)
+  let one = stream.next_version(stream.initial_version)
+  let assert Ok(second) = store.register(store.writes(), other, one)
+  let assert Ok(second) = store.append(second, store.Event(other, "added", 4))
+  assert storage.append_events(second) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+  remove(parent_path)
+  copy_transactions(unrelated, left)
+
+  let assert Ok(journal) = filesystem.open(left, codec())
+  let storage = filesystem.as_store(journal)
+  let assert Ok(events) = store.read_stream(storage, id)
+  let assert Ok([_, _]) = store.collect(events)
+  let two = stream.next_version(one)
+  let assert Ok(writes) = store.register(store.writes(), id, two)
+  let assert Ok(writes) = store.append(writes, store.Event(id, "added", 5))
+  let assert Error(store.StoreFailure(_)) = storage.append_events(writes)
+  assert filesystem.close(journal) == Ok(Nil)
   remove_root(left)
   remove_root(right)
+  remove_root(unrelated)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "set_mode")
+fn set_mode(path: String, mode: Int) -> Nil
+
+@external(erlang, "eventcore_filesystem_test_ffi", "is_directory")
+fn is_directory(path: String) -> Bool
+
+pub fn full_open_retries_sync_for_existing_ancestor_entries_test() {
+  let parent = temp_root()
+  let root = parent <> "/nested/journal"
+  set_mode(parent, 0o300)
+  let first_open = filesystem.open(root, codec())
+  let second_open = filesystem.open(root, codec())
+  set_mode(parent, 0o700)
+  let assert Error(filesystem.CannotOpen) = first_open
+  let assert Error(filesystem.CannotOpen) = second_open
+  assert is_directory(root <> "/events")
+  let assert Ok(journal) = filesystem.open(root, codec())
+  assert filesystem.close(journal) == Ok(Nil)
+  remove_root(parent)
 }

@@ -32,7 +32,6 @@ under `events/`. Its filename is the SHA-256 checksum of the versioned
 transaction bytes. The transaction records its parent IDs, expected stream
 versions and encoded events. A single OTP process holds a host advisory lock,
 checks versions and publishes files by atomic rename. Full sync flushes the
-transaction file, its directory, and parent entries for directories the store
-creates. On reopen the server rebuilds stream histories from the transaction
-graph and reports damaged files and missing parents. Complete graphs with
-incompatible stream versions require reconciliation. See [ADR 0004](docs/decisions/0004-filesystem-journal.md).
+transaction file, its directory, and the journal directory’s ancestor entries on every open. On reopen the server rebuilds stream histories from the transaction
+graph and reports damaged files and missing parents. Appends require all parents to be present. Complete graphs with incompatible
+stream versions require reconciliation. See [ADR 0004](docs/decisions/0004-filesystem-journal.md).

@@ -58,25 +58,22 @@ init({Owner, RequestedRoot, Sync}) ->
     end.
 
 ensure_directory(Path, Sync) ->
-    case filelib:is_dir(Path) of
-        true -> ok;
-        false ->
-            Parent = filename:dirname(Path),
-            case ensure_directory(Parent, Sync) of
-                ok -> create_directory(Path, Parent, Sync);
-                Error -> Error
-            end
+    case filelib:ensure_path(Path) of
+        ok -> sync_ancestors(Path, Sync);
+        Error -> Error
     end.
 
-create_directory(Path, Parent, Sync) ->
-    case file:make_dir(Path) of
-        ok -> sync_directory(Parent, Sync);
-        {error, eexist} ->
-            case filelib:is_dir(Path) of
-                true -> sync_directory(Parent, Sync);
-                false -> {error, enotdir}
-            end;
-        Error -> Error
+% An earlier open may have created directories and then failed to sync their
+% entries. Flush the parent chain even when all directories already exist.
+sync_ancestors(_Path, unsynced) -> ok;
+sync_ancestors(Path, full) ->
+    case filename:dirname(Path) of
+        Path -> ok;
+        Parent ->
+            case sync_directory(Parent, full) of
+                ok -> sync_ancestors(Parent, full);
+                Error -> Error
+            end
     end.
 
 prepare(Root, #state{sync = Sync} = State) ->
@@ -153,6 +150,8 @@ handle_call({read, Id, After}, _From, #state{streams = Streams} = State) ->
     {Version, Reversed} = maps:get(Id, Streams, {0, []}),
     Tail = lists:reverse(lists:sublist(Reversed, max(0, Version - After))),
     {reply, {ok, Tail}, State};
+handle_call({append, _, _}, _From, #state{dangling = [_ | _]} = State) ->
+    {reply, {error, {store_failure, append_events}}, State};
 handle_call({append, Expected, Events}, _From, #state{streams = Streams} = State) ->
     case check_versions(Expected, Streams) of
         ok when Events =:= [] -> {reply, {ok, nil}, State};
