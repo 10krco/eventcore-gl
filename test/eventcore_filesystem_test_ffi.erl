@@ -1,7 +1,7 @@
 -module(eventcore_filesystem_test_ffi).
 -export([temp_root/0, remove_root/1, transaction_paths/1, tamper/1, remove/1,
          copy_transactions/2, add_malformed_transaction/2,
-         set_mode/2, is_directory/1]).
+         open_with_failed_ancestor_sync/2, is_directory/1]).
 
 temp_root() ->
     Random = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
@@ -43,8 +43,13 @@ add_malformed_transaction(Root, Path) ->
     ok = file:write_file(filename:join(Directory, <<Id/binary, ".txn">>), Invalid),
     Id.
 
-set_mode(Path, Mode) ->
-    ok = file:change_mode(Path, Mode),
-    nil.
+open_with_failed_ancestor_sync(Root, Ancestor) ->
+    Sync = fun(Directory) when Directory =:= Ancestor -> {error, eio};
+              (_) -> ok
+           end,
+    case eventcore_filesystem_ffi:start(Root, full, Sync) of
+        {ok, Server} -> eventcore_filesystem_ffi:stop(Server);
+        Error -> Error
+    end.
 
 is_directory(Path) -> filelib:is_dir(Path).

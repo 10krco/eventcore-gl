@@ -1,6 +1,6 @@
 -module(eventcore_filesystem_ffi).
 -behaviour(gen_server).
--export([start/2, stop/1, status/1, read/3, append/3]).
+-export([start/2, start/3, stop/1, status/1, read/3, append/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
@@ -10,7 +10,11 @@
 }).
 
 start(Root, Sync) ->
-    case gen_server:start(?MODULE, {self(), Root, Sync}, []) of
+    start(Root, Sync, fun(Directory) -> sync_directory(Directory, Sync) end).
+
+% Accept a sync function to exercise open failures in the Erlang tests.
+start(Root, Sync, SyncAncestor) ->
+    case gen_server:start(?MODULE, {self(), Root, Sync, SyncAncestor}, []) of
         {ok, Pid} -> {ok, Pid};
         {error, {shutdown, store_locked}} -> {error, store_locked};
         {error, {shutdown, lock_executable_missing}} -> {error, lock_executable_missing};
@@ -36,11 +40,11 @@ call(Pid, Request, Failure) ->
         exit:_ -> Failure
     end.
 
-init({Owner, RequestedRoot, Sync}) ->
+init({Owner, RequestedRoot, Sync, SyncAncestor}) ->
     process_flag(trap_exit, true),
     Root = filename:absname(RequestedRoot),
     Directory = filename:join(Root, <<"events">>),
-    case ensure_directory(Directory, Sync) of
+    case ensure_directory(Directory, Sync, SyncAncestor) of
         ok ->
             case acquire_lock(filename:join(Root, <<".lock">>)) of
                 {ok, Lock} ->
@@ -57,21 +61,21 @@ init({Owner, RequestedRoot, Sync}) ->
         {error, Reason} -> {stop, {shutdown, Reason}}
     end.
 
-ensure_directory(Path, Sync) ->
+ensure_directory(Path, Sync, SyncAncestor) ->
     case filelib:ensure_path(Path) of
-        ok -> sync_ancestors(Path, Sync);
+        ok when Sync =:= unsynced -> ok;
+        ok -> sync_ancestors(Path, SyncAncestor);
         Error -> Error
     end.
 
 % An earlier open may have created directories and then failed to sync their
 % entries. Flush the parent chain even when all directories already exist.
-sync_ancestors(_Path, unsynced) -> ok;
-sync_ancestors(Path, full) ->
+sync_ancestors(Path, SyncAncestor) ->
     case filename:dirname(Path) of
         Path -> ok;
         Parent ->
-            case sync_directory(Parent, full) of
-                ok -> sync_ancestors(Parent, full);
+            case SyncAncestor(Parent) of
+                ok -> sync_ancestors(Parent, SyncAncestor);
                 Error -> Error
             end
     end.

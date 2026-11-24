@@ -177,8 +177,11 @@ pub fn incompatible_transaction_histories_require_reconciliation_test() {
   remove_root(unrelated)
 }
 
-@external(erlang, "eventcore_filesystem_test_ffi", "set_mode")
-fn set_mode(path: String, mode: Int) -> Nil
+@external(erlang, "eventcore_filesystem_test_ffi", "open_with_failed_ancestor_sync")
+fn open_with_failed_ancestor_sync(
+  root: String,
+  ancestor: String,
+) -> Result(Nil, filesystem.OpenError)
 
 @external(erlang, "eventcore_filesystem_test_ffi", "is_directory")
 fn is_directory(path: String) -> Bool
@@ -186,13 +189,11 @@ fn is_directory(path: String) -> Bool
 pub fn full_open_retries_sync_for_existing_ancestor_entries_test() {
   let parent = temp_root()
   let root = parent <> "/nested/journal"
-  set_mode(parent, 0o300)
-  let first_open = filesystem.open(root, codec())
-  let second_open = filesystem.open(root, codec())
-  set_mode(parent, 0o700)
-  let assert Error(filesystem.CannotOpen) = first_open
-  let assert Error(filesystem.CannotOpen) = second_open
+  assert open_with_failed_ancestor_sync(root, parent)
+    == Error(filesystem.CannotOpen)
   assert is_directory(root <> "/events")
+  assert open_with_failed_ancestor_sync(root, parent)
+    == Error(filesystem.CannotOpen)
   let assert Ok(journal) = filesystem.open(root, codec())
   assert filesystem.close(journal) == Ok(Nil)
   remove_root(parent)
