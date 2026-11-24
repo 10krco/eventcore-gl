@@ -24,7 +24,7 @@
       };
     in {
       devShells.${system}.default = pkgs.mkShell {
-        packages = with pkgs; [ gleam beamPackages.erlang beamPackages.rebar3 lefthook git gh tiber ];
+        packages = with pkgs; [ gleam beamPackages.erlang beamPackages.rebar3 lefthook git gh tiber util-linux ];
       };
     };
 }
