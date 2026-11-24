@@ -149,10 +149,13 @@ branches(Stream, Claims, Transactions, Order) ->
     AcceptedHeads = lists:append(maps:values(ClaimMap)),
     Covered = lists:foldl(fun(Id, Acc) -> mark_ancestry([Id], Transactions, Acc) end,
                           #{}, AcceptedHeads),
-    Heads = branch_frontier(lists:reverse(Order), Owners, Covered, Transactions),
+    Rank = maps:from_list(lists:zip(Order, lists:seq(1, length(Order)))),
+    Heads = lists:sort(maps:fold(fun(Owner, Members, Acc) ->
+        owner_frontier(Owner, Members, Covered, Transactions, Rank) ++ Acc
+    end, [], ByOwner)),
     case Heads of
         [_, _ | _] ->
-            [{Id, branch_history(Id, Stream, ClaimMap, Owners, ByOwner, Transactions, Order)}
+            [{Id, branch_history(Id, Stream, ClaimMap, Owners, ByOwner, Transactions, Rank)}
              || Id <- Heads];
         _ -> []
     end.
@@ -181,26 +184,34 @@ branch_ownership(Stream, Claims, AcceptedByClaim, Transactions, Order) ->
     end, {#{}, #{}}, Order),
     Owners.
 
-% Walk newest first. For each owner, mark its heads' ancestors once so that a
-% long resolved suffix does not require pairwise ancestry checks.
-branch_frontier(Reversed, Owners, Covered, Transactions) ->
-    {Heads, _} = lists:foldl(fun(Id, {Heads, ByOwner} = Acc) ->
-        case maps:find(Id, Owners) of
-            error -> Acc;
-            {ok, Owner} ->
-                Seen = maps:get(Owner, ByOwner, #{}),
-                case maps:is_key(Id, Seen) of
-                    true -> Acc;
-                    false ->
-                        Updated = ByOwner#{Owner => mark_ancestry([Id], Transactions, Seen)},
-                        case maps:is_key(Id, Covered) of
-                            true -> {Heads, Updated};
-                            false -> {[Id | Heads], Updated}
-                        end
+% A singleton is already maximal. For longer branches, retain only the
+% current owner's visited map and stop at its claim, before the shared prefix.
+owner_frontier(_, [Id], Covered, _, _) ->
+    case maps:is_key(Id, Covered) of true -> []; false -> [Id] end;
+owner_frontier(Owner, Members, Covered, Transactions, Rank) ->
+    NewestFirst = lists:sort(fun(A, B) -> maps:get(A, Rank) > maps:get(B, Rank) end, Members),
+    ClaimRank = maps:get(Owner, Rank),
+    {Heads, _} = lists:foldl(fun(Id, {Heads, Seen} = Acc) ->
+        case maps:is_key(Id, Seen) of
+            true -> Acc;
+            false ->
+                Updated = mark_after_claim([Id], Transactions, Rank, ClaimRank, Seen),
+                case maps:is_key(Id, Covered) of
+                    true -> {Heads, Updated};
+                    false -> {[Id | Heads], Updated}
                 end
         end
-    end, {[], #{}}, Reversed),
-    lists:sort(Heads).
+    end, {[], #{}}, NewestFirst),
+    Heads.
+
+mark_after_claim([], _, _, _, Seen) -> Seen;
+mark_after_claim([Id | Rest], Transactions, Rank, ClaimRank, Seen) ->
+    case not maps:is_key(Id, Seen) andalso maps:get(Id, Rank, 0) >= ClaimRank of
+        true ->
+            #{parents := Parents} = maps:get(Id, Transactions),
+            mark_after_claim(Parents ++ Rest, Transactions, Rank, ClaimRank, Seen#{Id => true});
+        false -> mark_after_claim(Rest, Transactions, Rank, ClaimRank, Seen)
+    end.
 
 mark_ancestry([], _, Seen) -> Seen;
 mark_ancestry([Id | Rest], Transactions, Seen) ->
@@ -210,10 +221,10 @@ mark_ancestry([Id | Rest], Transactions, Seen) ->
         _ -> mark_ancestry(Rest, Transactions, Seen)
     end.
 
-branch_history(Head, Stream, Claims, Owners, ByOwner, Transactions, Order) ->
+branch_history(Head, Stream, Claims, Owners, ByOwner, Transactions, Rank) ->
     Evidence = branch_evidence([Head], Claims, Owners, ByOwner, Transactions, #{}),
-    lists:append([branch_events(Stream, Id, Transactions)
-                  || Id <- Order, maps:is_key(Id, Evidence)]).
+    Ordered = lists:sort([{maps:get(Id, Rank), Id} || Id := _ <- Evidence]),
+    lists:append([branch_events(Stream, Id, Transactions) || {_, Id} <- Ordered]).
 
 branch_evidence([], _, _, _, _, Evidence) -> Evidence;
 branch_evidence([Head | Rest], Claims, Owners, ByOwner, Transactions, Evidence) ->
