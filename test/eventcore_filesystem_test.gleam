@@ -1,0 +1,100 @@
+import eventcore/filesystem
+import eventcore/store
+import eventcore/stream
+import gleam/bit_array
+import gleam/int
+import gleam/list
+import gleam/result
+import store_contract
+
+@external(erlang, "eventcore_filesystem_test_ffi", "temp_root")
+fn temp_root() -> String
+
+@external(erlang, "eventcore_filesystem_test_ffi", "remove_root")
+fn remove_root(root: String) -> Nil
+
+@external(erlang, "eventcore_filesystem_test_ffi", "transaction_paths")
+fn transaction_paths(root: String) -> List(#(String, String))
+
+@external(erlang, "eventcore_filesystem_test_ffi", "tamper")
+fn tamper(path: String) -> Nil
+
+@external(erlang, "eventcore_filesystem_test_ffi", "remove")
+fn remove(path: String) -> Nil
+
+fn codec() -> filesystem.Codec(Int) {
+  filesystem.Codec(
+    fn(_, value) { Ok(bit_array.from_string(int.to_string(value))) },
+    fn(_, bytes) {
+      use text <- result.try(
+        bit_array.to_string(bytes) |> result.replace_error("expected text"),
+      )
+      int.parse(text) |> result.replace_error("expected integer")
+    },
+  )
+}
+
+pub fn full_sync_reopens_atomic_writes_and_locks_exclusively_test() {
+  let root = temp_root()
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let assert Error(filesystem.StoreLocked) = filesystem.open(root, codec())
+  let storage = filesystem.as_store(journal)
+  store_contract.check_atomic_streams(storage)
+  let assert Ok(left) = stream.id("left")
+  let assert Ok(right) = stream.id("right")
+  let a = store.Event(left, "debit", -35)
+  let b = store.Event(right, "credit", 35)
+  let assert Ok(batch) =
+    store.register(store.writes(), left, stream.initial_version)
+  let assert Ok(batch) = store.register(batch, right, stream.initial_version)
+  let assert Ok(batch) = store.append(batch, a)
+  let assert Ok(batch) = store.append(batch, b)
+  assert storage.append_events(batch) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let storage = filesystem.as_store(journal)
+  let assert Ok(events) = store.read_stream(storage, left)
+  assert store.collect(events) == Ok([a])
+  let assert Ok(events) = store.read_stream(storage, right)
+  assert store.collect(events) == Ok([b])
+  assert filesystem.status(journal) == Ok(filesystem.Status([], []))
+  assert filesystem.close(journal) == Ok(Nil)
+  remove_root(root)
+}
+
+pub fn corrupt_and_dangling_transactions_have_distinct_status_test() {
+  let root = temp_root()
+  let config = filesystem.Config(root, filesystem.Unsynced)
+  let assert Ok(journal) = filesystem.open_with_config(config, codec())
+  let storage = filesystem.as_store(journal)
+  let assert Ok(id) = stream.id("chain")
+  let zero = stream.initial_version
+  let one = stream.next_version(zero)
+  let assert Ok(first) = store.register(store.writes(), id, zero)
+  let assert Ok(first) = store.append(first, store.Event(id, "added", 1))
+  assert storage.append_events(first) == Ok(Nil)
+  let assert [#(parent, parent_path)] = transaction_paths(root)
+  let assert Ok(second) = store.register(store.writes(), id, one)
+  let second_event = store.Event(id, "added", 2)
+  let assert Ok(second) = store.append(second, second_event)
+  assert storage.append_events(second) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+  let assert Ok(#(child, _)) =
+    list.find(transaction_paths(root), fn(file) { file.0 != parent })
+
+  tamper(parent_path)
+  let assert Ok(journal) = filesystem.open_with_config(config, codec())
+  assert filesystem.status(journal)
+    == Ok(filesystem.Status([parent], [filesystem.Dangling(child, [parent])]))
+  assert filesystem.close(journal) == Ok(Nil)
+
+  remove(parent_path)
+  let assert Ok(journal) = filesystem.open_with_config(config, codec())
+  assert filesystem.status(journal)
+    == Ok(filesystem.Status([], [filesystem.Dangling(child, [parent])]))
+  let assert Ok(events) = store.read_stream(filesystem.as_store(journal), id)
+  assert store.collect(events) == Ok([second_event])
+  assert filesystem.close(journal) == Ok(Nil)
+  remove_root(root)
+}

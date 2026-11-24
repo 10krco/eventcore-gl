@@ -24,3 +24,14 @@ Command execution folds each participating stream into state as events arrive.
 It reads initial declarations in order and enqueues discovered participants
 after each stream. An append conflict restarts the fold and discovery from the
 original declarations. See [ADR 0003](docs/decisions/0003-command-replay.md).
+
+## Filesystem journal
+
+The filesystem adapter publishes each append as one immutable transaction
+under `events/`. Its filename is the SHA-256 checksum of the versioned
+transaction bytes. The transaction records its parent IDs, expected stream
+versions and encoded events. A single OTP process holds a host advisory lock,
+checks versions and publishes files by atomic rename. Full sync flushes the
+transaction file and its directory. On reopen the server rebuilds stream
+histories from the transaction graph and reports damaged files and missing
+parents. See [ADR 0004](docs/decisions/0004-filesystem-journal.md).
