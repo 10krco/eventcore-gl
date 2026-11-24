@@ -14,6 +14,7 @@ start(Root, Sync) ->
         {ok, Pid} -> {ok, Pid};
         {error, {shutdown, store_locked}} -> {error, store_locked};
         {error, {shutdown, lock_executable_missing}} -> {error, lock_executable_missing};
+        {error, {shutdown, conflicting_history}} -> {error, conflicting_history};
         {error, _} -> {error, cannot_open}
     end.
 
@@ -39,7 +40,7 @@ init({Owner, RequestedRoot, Sync}) ->
     process_flag(trap_exit, true),
     Root = filename:absname(RequestedRoot),
     Directory = filename:join(Root, <<"events">>),
-    case filelib:ensure_dir(filename:join(Directory, <<"placeholder">>)) of
+    case ensure_directory(Directory, Sync) of
         ok ->
             case acquire_lock(filename:join(Root, <<".lock">>)) of
                 {ok, Lock} ->
@@ -54,6 +55,28 @@ init({Owner, RequestedRoot, Sync}) ->
                 {error, Reason} -> {stop, {shutdown, Reason}}
             end;
         {error, Reason} -> {stop, {shutdown, Reason}}
+    end.
+
+ensure_directory(Path, Sync) ->
+    case filelib:is_dir(Path) of
+        true -> ok;
+        false ->
+            Parent = filename:dirname(Path),
+            case ensure_directory(Parent, Sync) of
+                ok -> create_directory(Path, Parent, Sync);
+                Error -> Error
+            end
+    end.
+
+create_directory(Path, Parent, Sync) ->
+    case file:make_dir(Path) of
+        ok -> sync_directory(Parent, Sync);
+        {error, eexist} ->
+            case filelib:is_dir(Path) of
+                true -> sync_directory(Parent, Sync);
+                false -> {error, enotdir}
+            end;
+        Error -> Error
     end.
 
 prepare(Root, #state{sync = Sync} = State) ->
@@ -206,7 +229,7 @@ scan(#state{directory = Directory} = State) ->
     case file:list_dir(Directory) of
         {ok, Files} ->
             case scan_files(lists:sort(Files), Directory, #{}, []) of
-                {ok, Transactions, Failures} -> {ok, rebuild(Transactions, Failures, State)};
+                {ok, Transactions, Failures} -> rebuild(Transactions, Failures, State);
                 Error -> Error
             end;
         Error -> Error
@@ -239,9 +262,9 @@ decode_transaction(Id, Bytes) ->
                   when Used =:= byte_size(Bytes), is_integer(Time),
                        is_binary(Nonce), byte_size(Nonce) =:= 16,
                        is_list(Parents), is_list(Bases), is_list(Events) ->
-                    case lists:all(fun valid_id/1, Parents) andalso
-                         lists:all(fun valid_base/1, Bases) andalso
-                         lists:all(fun valid_event/1, Events) of
+                    case valid_list(fun valid_id/1, Parents) andalso
+                         valid_list(fun valid_base/1, Bases) andalso
+                         valid_list(fun valid_event/1, Events) of
                         true -> {ok, Transaction};
                         false -> error
                     end;
@@ -250,6 +273,10 @@ decode_transaction(Id, Bytes) ->
                 error:badarg -> error
             end
     end.
+
+valid_list(_Check, []) -> true;
+valid_list(Check, [Item | Rest]) -> Check(Item) andalso valid_list(Check, Rest);
+valid_list(_Check, _ImproperTail) -> false.
 
 valid_id(Id) -> is_binary(Id) andalso byte_size(Id) =:= 64.
 valid_base({{id, Name}, {version, Version}}) ->
@@ -268,9 +295,6 @@ rebuild(Transactions, Failures, State) ->
             {1, Time, Nonce, _, _, Events} = maps:get(Id, Transactions),
             {{Depth, Time, Nonce, Id, Events}, Updated}
         end, #{}, Ids),
-    Streams = lists:foldl(
-        fun({_, _, _, _, Events}, Index) -> index_events(Events, Index) end,
-        #{}, lists:sort(Ranked)),
     Dangling = lists:filtermap(
         fun(Id) ->
             {1, _, _, Parents, _, _} = maps:get(Id, Transactions),
@@ -284,8 +308,20 @@ rebuild(Transactions, Failures, State) ->
             lists:foldl(fun(Id, Acc) -> Acc#{Id => true} end, Set, Parents)
         end, #{}, Transactions),
     Tips = [Id || Id <- Ids, not maps:is_key(Id, Referenced)],
-    State#state{streams = Streams, tips = Tips, dangling = Dangling,
-                integrity_failures = Failures}.
+    case rebuild_streams(lists:sort(Ranked), Transactions, Dangling =:= [], #{}) of
+        {ok, Streams} ->
+            {ok, State#state{streams = Streams, tips = Tips, dangling = Dangling,
+                             integrity_failures = Failures}};
+        Error -> Error
+    end.
+
+rebuild_streams([], _, _, Streams) -> {ok, Streams};
+rebuild_streams([{_, _, _, Id, Events} | Rest], Transactions, Complete, Streams) ->
+    {1, _, _, _, Bases, _} = maps:get(Id, Transactions),
+    case Complete andalso check_versions(Bases, Streams) =/= ok of
+        true -> {error, conflicting_history};
+        false -> rebuild_streams(Rest, Transactions, Complete, index_events(Events, Streams))
+    end.
 
 depth(Id, Transactions, Depths) ->
     case maps:find(Id, Depths) of

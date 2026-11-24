@@ -98,3 +98,54 @@ pub fn corrupt_and_dangling_transactions_have_distinct_status_test() {
   assert filesystem.close(journal) == Ok(Nil)
   remove_root(root)
 }
+
+@external(erlang, "eventcore_filesystem_test_ffi", "copy_transactions")
+fn copy_transactions(source: String, destination: String) -> Nil
+
+@external(erlang, "eventcore_filesystem_test_ffi", "add_malformed_transaction")
+fn add_malformed_transaction(root: String, path: String) -> String
+
+pub fn recovery_reports_malformed_records_and_preserves_healthy_events_test() {
+  let parent = temp_root()
+  let root = parent <> "/new/journal"
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let assert Ok(id) = stream.id("healthy")
+  let event = store.Event(id, "added", 42)
+  let assert Ok(writes) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(writes) = store.append(writes, event)
+  assert filesystem.as_store(journal).append_events(writes) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+  let assert [#(_, path)] = transaction_paths(root)
+  let malformed = add_malformed_transaction(root, path)
+
+  let assert Ok(journal) = filesystem.open(root, codec())
+  assert filesystem.status(journal) == Ok(filesystem.Status([malformed], []))
+  let assert Ok(events) = store.read_stream(filesystem.as_store(journal), id)
+  assert store.collect(events) == Ok([event])
+  assert filesystem.close(journal) == Ok(Nil)
+  remove_root(parent)
+}
+
+pub fn incompatible_transaction_histories_require_reconciliation_test() {
+  let left = temp_root()
+  let right = temp_root()
+  let assert Ok(id) = stream.id("contested")
+  let assert Ok(base) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(journal) = filesystem.open(left, codec())
+  let assert Ok(writes) = store.append(base, store.Event(id, "added", 1))
+  assert filesystem.as_store(journal).append_events(writes) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+
+  let assert Ok(journal) = filesystem.open(right, codec())
+  let assert Ok(writes) = store.append(base, store.Event(id, "added", 2))
+  assert filesystem.as_store(journal).append_events(writes) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+
+  copy_transactions(right, left)
+  let assert Error(filesystem.ConflictingHistory) =
+    filesystem.open(left, codec())
+  remove_root(left)
+  remove_root(right)
+}

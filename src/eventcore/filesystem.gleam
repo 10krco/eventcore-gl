@@ -29,6 +29,7 @@ pub type Codec(payload) {
 pub type OpenError {
   StoreLocked
   LockExecutableMissing
+  ConflictingHistory
   CannotOpen
 }
 

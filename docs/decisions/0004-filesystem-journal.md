@@ -11,7 +11,8 @@ transactions into a shared directory.
 
 Write each batch as a versioned Erlang term in a temporary file next to its
 final SHA-256-named path. Publish it with one rename. Full sync flushes
-the file before rename and the directory afterward. Callers provide codecs
+the file before rename and the directory afterward. When opening a new
+journal, it also flushes the parent entries for newly created directories. Callers provide codecs
 for event payloads. The journal rebuilds its index on open and verifies every
 transaction checksum before reading its contents.
 
@@ -24,5 +25,6 @@ metadata keeps local locks and staging files out of Git.
 The file format belongs to this adapter. Reopening requires a graph scan.
 Damaged transactions are excluded from the reconstructed history and reported
 by status. Transactions with missing parents remain readable and status names
-the missing parents. A directory sync error after rename returns an append
+the missing parents. A complete graph with incompatible stream versions
+requires reconciliation before it can open. A directory sync error after rename returns an append
 error while retaining the newly visible transaction in memory.
