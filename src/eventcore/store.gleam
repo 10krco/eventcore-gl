@@ -14,6 +14,8 @@ pub type Operation {
   ReadStream
   AppendEvents
   CloseStore
+  LoadSnapshot
+  SaveSnapshot
 }
 
 pub type StoreError {
@@ -24,6 +26,7 @@ pub type StoreError {
   StoreFailure(operation: Operation)
   VersionConflict(stream: Id, expected: Version, actual: Version)
   UnresolvedStreamFork(stream: Id)
+  JournalHistoryChanged
 }
 
 pub opaque type Writes(payload) {

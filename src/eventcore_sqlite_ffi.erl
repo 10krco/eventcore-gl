@@ -2,7 +2,7 @@
 -behaviour(gen_server).
 
 -export([start_file/2, start_memory/0, start_supplied/1, stop/1, migrate/2,
-         read/3, append/3, checkpoint/2, save_checkpoint/3, reset_checkpoint/2]).
+         read/3, append/3, load_snapshot/2, save_snapshot/4, checkpoint/2, save_checkpoint/3, reset_checkpoint/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_file(Path, Encryption) -> start({file, Path, Encryption}).
@@ -21,6 +21,10 @@ migrate(Server, Mode) -> call(Server, {migrate, Mode}, {error, migration_failed}
 read(Server, Stream, After) -> call(Server, {read, Stream, After}, {error, nil}).
 append(Server, Expected, Events) ->
     call(Server, {append, Expected, Events}, {error, {store_failure, append_events}}).
+load_snapshot(Server, Name) ->
+    call(Server, {load_snapshot, Name}, {error, nil}).
+save_snapshot(Server, Name, Observed, Value) ->
+    call(Server, {save_snapshot, Name, Observed, Value}, {error, nil}).
 checkpoint(Server, Name) ->
     call(Server, {checkpoint, Name}, {error, checkpoint_failed}).
 save_checkpoint(Server, Name, Position) ->
@@ -110,6 +114,13 @@ handle_call({append, Expected, Events}, _From, {Connection, _} = State) ->
         end
     end, {error, {store_failure, append_events}}),
     reply_or_stop(Reply, State);
+handle_call({load_snapshot, Name}, _From, {Connection, _} = State) ->
+    Reply = guard_query(fun() -> read_snapshot(Connection, Name) end, {error, nil}),
+    {reply, Reply, State};
+handle_call({save_snapshot, Name, Observed, Value}, _From, {Connection, _} = State) ->
+    Reply = transaction(Connection, fun() -> write_snapshot(Connection, Name, Observed, Value) end,
+                        {error, nil}),
+    reply_or_stop(Reply, State);
 handle_call({checkpoint, Name}, _From, {Connection, _} = State) ->
     Reply = guard_query(fun() ->
         case sqlite:query(Connection, "SELECT position FROM eventcore_checkpoints WHERE name = ?", [Name]) of
@@ -175,10 +186,38 @@ create_tables(Connection, event_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_events ("
         "position INTEGER PRIMARY KEY, stream TEXT NOT NULL, version INTEGER NOT NULL, "
         "kind TEXT NOT NULL, payload BLOB NOT NULL, UNIQUE(stream, version))"),
+    [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_command_snapshots ("
+        "name TEXT PRIMARY KEY NOT NULL, body BLOB NOT NULL)"),
     create_tables(Connection, checkpoint_schema);
 create_tables(Connection, checkpoint_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_checkpoints ("
         "name TEXT PRIMARY KEY NOT NULL, position INTEGER NOT NULL CHECK(position >= 0))"),
+    {ok, nil}.
+
+read_snapshot(Connection, Name) ->
+    case sqlite:query(Connection, "SELECT body FROM eventcore_command_snapshots WHERE name = ?", [Name]) of
+        [] -> {ok, none};
+        [{Body}] ->
+            case eventcore_snapshot_wire:decode(Body) of
+                {ok, Value} -> {ok, {some, Value}};
+                Error -> Error
+            end
+    end.
+
+write_snapshot(Connection, Name, Observed, Value) ->
+    case read_snapshot(Connection, Name) of
+        {ok, Current} ->
+            case eventcore@snapshot:can_replace(Current, Observed, Value) of
+                true -> replace_snapshot(Connection, Name, Value);
+                false -> {ok, nil}
+            end;
+        Error -> Error
+    end.
+
+replace_snapshot(Connection, Name, Value) ->
+    Body = eventcore_snapshot_wire:encode(Value),
+    ok = write_one(Connection, "INSERT INTO eventcore_command_snapshots(name, body) VALUES(?, ?) "
+                     "ON CONFLICT(name) DO UPDATE SET body = excluded.body", [Name, {blob, Body}]),
     {ok, nil}.
 
 read_events(Connection, {id, Name} = Stream, After) ->

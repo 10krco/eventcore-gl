@@ -1,7 +1,8 @@
 //// Reconstruct state from participating streams and commit a command atomically.
 
+import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError, type Writes}
-import eventcore/stream.{type Id}
+import eventcore/stream.{type Id, type Version}
 import gleam/float
 import gleam/int
 import gleam/list
@@ -56,6 +57,7 @@ pub type CommandError(domain_error) {
   Rejected(Rejection(domain_error))
   StorageError(StoreError)
   ConcurrencyError(max_retries: Int)
+  InvalidSnapshot(detail: String)
 }
 
 pub type Command(state, payload, domain_error) {
@@ -142,30 +144,98 @@ pub fn execute(
   command: Command(state, payload, domain_error),
   policy: RetryPolicy,
 ) -> Result(Execution, CommandError(domain_error)) {
+  let Declarations(streams) = command.streams
+  run(storage, command, policy, fn() {
+    replay(
+      storage,
+      command,
+      ReplayQueue(streams, [], set.from_list(streams)),
+      command.initial_state(),
+      store.writes(),
+      [],
+    )
+    |> result.map_error(StorageError)
+  })
+}
+
+/// Reuse a durable projection of this command's replay state. Include every
+/// command and state-schema dimension that affects reconstruction in the key.
+pub fn execute_with_snapshot(
+  storage: Store(payload),
+  command: Command(state, payload, domain_error),
+  policy: RetryPolicy,
+  repository: snapshot.Repository,
+  key: snapshot.Key,
+  codec: snapshot.Codec(state),
+) -> Result(Execution, CommandError(domain_error)) {
+  run(storage, command, policy, fn() {
+    use stored <- result.try(
+      repository.load(key) |> result.map_error(StorageError),
+    )
+    let Declarations(streams) = command.streams
+    let queue = ReplayQueue(streams, [], set.from_list(streams))
+    use checkpoints <- result.try(case stored {
+      None -> Ok(None)
+      Some(snapshot.Snapshot(checkpoints)) ->
+        validate_checkpoints(queue, checkpoints, command.discover, codec)
+    })
+    use restored <- result.try(replay_snapshot(
+      storage,
+      command,
+      queue,
+      SnapshotReplay(command.initial_state(), store.writes(), [], 0, False),
+      option.unwrap(checkpoints, []),
+    ))
+    let refresh = case checkpoints {
+      Some(_) -> restored.advanced
+      None -> restored.count >= 100
+    }
+    let ordered = list.reverse(restored.checkpoints)
+    use _ <- result.try(case refresh {
+      True -> {
+        use encoded <- result.try(
+          list.try_map(ordered, fn(checkpoint) {
+            use bytes <- result.try(case checkpoint.encoded {
+              Some(bytes) -> Ok(bytes)
+              None ->
+                codec.encode(checkpoint.state)
+                |> result.map_error(InvalidSnapshot)
+            })
+            Ok(snapshot.Checkpoint(checkpoint.stream, checkpoint.version, bytes))
+          }),
+        )
+        repository.save(key, stored, snapshot.Snapshot(encoded))
+        |> result.map_error(StorageError)
+      }
+      False -> Ok(Nil)
+    })
+    let participants = list.map(ordered, fn(c) { c.stream })
+    Ok(#(restored.state, restored.writes, participants))
+  })
+}
+
+fn run(
+  storage: Store(payload),
+  command: Command(state, payload, domain_error),
+  policy: RetryPolicy,
+  reconstruct: fn() ->
+    Result(#(state, Writes(payload), List(Id)), CommandError(domain_error)),
+) -> Result(Execution, CommandError(domain_error)) {
   policy.trace(ExecutionStarted)
-  execute_attempt(storage, command, policy, 1)
+  execute_attempt(storage, command, policy, reconstruct, 1)
 }
 
 fn execute_attempt(
   storage: Store(payload),
   command: Command(state, payload, domain_error),
   policy: RetryPolicy,
+  reconstruct: fn() ->
+    Result(#(state, Writes(payload), List(Id)), CommandError(domain_error)),
   attempt: Int,
 ) -> Result(Execution, CommandError(domain_error)) {
-  let Declarations(streams) = command.streams
-  let replayed =
-    replay(
-      storage,
-      command,
-      streams,
-      [],
-      set.from_list(streams),
-      command.initial_state(),
-      store.writes(),
-      [],
-    )
+  let replayed = reconstruct()
   case replayed {
-    Error(error) -> fail(policy, StorageError(error))
+    Error(error) -> fail(policy, error)
     Ok(#(state, writes, participants)) -> {
       let prepared =
         command.handle(state)
@@ -193,7 +263,13 @@ fn execute_attempt(
                 None -> Nil
               }
               sleep(delay)
-              execute_attempt(storage, command, policy, attempt + 1)
+              execute_attempt(
+                storage,
+                command,
+                policy,
+                reconstruct,
+                attempt + 1,
+              )
             }
             Error(store.VersionConflict(_, _, _)) -> {
               policy.trace(RetriesExhausted(participants, policy.max_retries))
@@ -217,27 +293,14 @@ fn fail(
 fn replay(
   storage: Store(payload),
   command: Command(state, payload, domain_error),
-  remaining: List(Id),
-  pending: List(Id),
-  scheduled: Set(Id),
+  queue: ReplayQueue,
   state: state,
   writes: Writes(payload),
   visited: List(Id),
 ) -> Result(#(state, Writes(payload), List(Id)), StoreError) {
-  case remaining, pending {
-    [], [] -> Ok(#(state, writes, list.reverse(visited)))
-    [], _ ->
-      replay(
-        storage,
-        command,
-        list.reverse(pending),
-        [],
-        scheduled,
-        state,
-        writes,
-        visited,
-      )
-    [id, ..remaining], _ -> {
+  case pop(queue) {
+    None -> Ok(#(state, writes, list.reverse(visited)))
+    Some(#(id, queue)) -> {
       use events <- result.try(store.read_stream(storage, id))
       use #(state, version) <- result.try(
         store.fold(events, #(state, stream.initial_version), fn(acc, event) {
@@ -245,17 +308,150 @@ fn replay(
         }),
       )
       use writes <- result.try(store.register(writes, id, version))
-      let #(scheduled, pending) =
-        list.fold(command.discover(state), #(scheduled, pending), fn(acc, id) {
-          case set.contains(acc.0, id) {
-            True -> acc
-            False -> #(set.insert(acc.0, id), [id, ..acc.1])
-          }
+      replay(
+        storage,
+        command,
+        enqueue(queue, command.discover(state)),
+        state,
+        writes,
+        [id, ..visited],
+      )
+    }
+  }
+}
+
+type ReplayQueue {
+  ReplayQueue(remaining: List(Id), pending: List(Id), scheduled: Set(Id))
+}
+
+fn pop(queue: ReplayQueue) -> Option(#(Id, ReplayQueue)) {
+  case queue.remaining, queue.pending {
+    [id, ..rest], _ -> Some(#(id, ReplayQueue(..queue, remaining: rest)))
+    [], [] -> None
+    [], pending ->
+      pop(ReplayQueue(..queue, remaining: list.reverse(pending), pending: []))
+  }
+}
+
+fn enqueue(queue: ReplayQueue, related: List(Id)) -> ReplayQueue {
+  list.fold(related, queue, fn(queue, id) {
+    case set.contains(queue.scheduled, id) {
+      True -> queue
+      False ->
+        ReplayQueue(
+          ..queue,
+          pending: [id, ..queue.pending],
+          scheduled: set.insert(queue.scheduled, id),
+        )
+    }
+  })
+}
+
+fn validate_checkpoints(
+  queue: ReplayQueue,
+  checkpoints: List(snapshot.Checkpoint),
+  discover: fn(state) -> List(Id),
+  codec: snapshot.Codec(state),
+) -> Result(
+  Option(List(#(snapshot.Checkpoint, state))),
+  CommandError(domain_error),
+) {
+  case pop(queue), checkpoints {
+    None, [] -> Ok(Some([]))
+    Some(#(id, queue)), [checkpoint, ..tail] if id == checkpoint.stream -> {
+      use state <- result.try(
+        codec.decode(checkpoint.state) |> result.map_error(InvalidSnapshot),
+      )
+      validate_checkpoints(
+        enqueue(queue, discover(state)),
+        tail,
+        discover,
+        codec,
+      )
+      |> result.map(option.map(_, fn(tail) { [#(checkpoint, state), ..tail] }))
+    }
+    _, _ -> Ok(None)
+  }
+}
+
+type ReplayCheckpoint(state) {
+  ReplayCheckpoint(
+    stream: Id,
+    version: Version,
+    state: state,
+    encoded: Option(BitArray),
+  )
+}
+
+type SnapshotReplay(state, payload) {
+  SnapshotReplay(
+    state: state,
+    writes: Writes(payload),
+    checkpoints: List(ReplayCheckpoint(state)),
+    count: Int,
+    advanced: Bool,
+  )
+}
+
+fn replay_snapshot(
+  storage: Store(payload),
+  command: Command(state, payload, domain_error),
+  queue: ReplayQueue,
+  progress: SnapshotReplay(state, payload),
+  cached: List(#(snapshot.Checkpoint, state)),
+) -> Result(SnapshotReplay(state, payload), CommandError(domain_error)) {
+  case pop(queue) {
+    None -> Ok(progress)
+    Some(#(id, queue)) -> {
+      let #(base, version, encoded, cached) = case cached {
+        [#(checkpoint, state), ..rest] -> #(
+          state,
+          checkpoint.version,
+          Some(checkpoint.state),
+          rest,
+        )
+        [] -> #(progress.state, stream.initial_version, None, [])
+      }
+      use events <- result.try(
+        storage.read_after(id, version) |> result.map_error(StorageError),
+      )
+      use #(state, current) <- result.try(
+        store.fold(events, #(base, version), fn(acc, event) {
+          #(command.apply(acc.0, event), stream.next_version(acc.1))
         })
-      replay(storage, command, remaining, pending, scheduled, state, writes, [
-        id,
-        ..visited
-      ])
+        |> result.map_error(StorageError),
+      )
+      let changed = current != version
+      let encoded = case changed {
+        True -> None
+        False -> encoded
+      }
+      use writes <- result.try(
+        store.register(progress.writes, id, current)
+        |> result.map_error(StorageError),
+      )
+      let progress =
+        SnapshotReplay(
+          state,
+          writes,
+          [
+            ReplayCheckpoint(id, current, state, encoded),
+            ..progress.checkpoints
+          ],
+          progress.count + stream.event_count(current),
+          progress.advanced || changed,
+        )
+      let cached = case changed {
+        True -> []
+        False -> cached
+      }
+      replay_snapshot(
+        storage,
+        command,
+        enqueue(queue, command.discover(state)),
+        progress,
+        cached,
+      )
     }
   }
 }

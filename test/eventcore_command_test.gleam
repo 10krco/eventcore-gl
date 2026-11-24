@@ -1,8 +1,11 @@
 import eventcore/command
 import eventcore/memory
+import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
 import gleam/dict
+import gleam/list
+import gleam/option.{None, Some}
 
 type Notifications(value)
 
@@ -235,5 +238,248 @@ pub fn returns_first_attempt_and_validates_retry_options_test() {
   assert store.collect(events) == Ok([opening])
   let assert Error(Nil) = command.retry_policy(-1, command.Fixed(0))
   let assert Error(Nil) = command.retry_policy(0, command.Exponential(-1))
+  assert memory.close(pid) == Ok(Nil)
+}
+
+pub fn saved_command_state_replays_later_streams_after_an_earlier_tail_test() {
+  let assert Ok(pid) = memory.start()
+  let storage = memory.as_store(pid)
+  let assert Ok(first) = stream.id("first")
+  let assert Ok(later) = stream.id("later")
+  let assert Ok(replacement) = stream.id("replacement")
+  let zero = stream.initial_version
+  let assert Ok(version_100) = stream.version(100)
+  let assert Ok(seed) = store.register(store.writes(), first, zero)
+  let assert Ok(seed) = store.register(seed, later, zero)
+  let assert Ok(seed) = store.register(seed, replacement, zero)
+  let assert Ok(seed) =
+    list.try_fold(list.repeat(1, 100), seed, fn(writes, value) {
+      store.append(writes, store.Event(first, "first", value))
+    })
+  let assert Ok(seed) = store.append(seed, store.Event(later, "later", 2))
+  let assert Ok(seed) =
+    store.append(seed, store.Event(replacement, "replacement", 4))
+  let assert Ok(Nil) = storage.append_events(seed)
+
+  let reads = notifications()
+  let saves = notifications()
+  let handled = notifications()
+  let traced =
+    store.Store(
+      fn(id, version) {
+        record(reads, #(id, version))
+        storage.read_after(id, version)
+      },
+      storage.append_events,
+    )
+  let assert Ok(key) = snapshot.key("snapshot-fixture")
+  let codec =
+    snapshot.Codec(fn(state) { Ok(<<state:32>>) }, fn(bytes) {
+      case bytes {
+        <<state:32>> -> Ok(state)
+        _ -> Error("invalid fixture state")
+      }
+    })
+  let command =
+    command.Command(
+      streams: command.single(first),
+      initial_state: fn() { 0 },
+      apply: fn(state, event) {
+        case event.kind {
+          "first" -> state + event.payload
+          "tail" -> state + event.payload
+          _ -> state * 10 + event.payload
+        }
+      },
+      discover: fn(state) {
+        case state {
+          100 -> [later]
+          103 -> [replacement]
+          _ -> []
+        }
+      },
+      handle: fn(state) {
+        record(handled, state)
+        let events: Result(List(store.Event(Int)), command.Rejection(Nil)) =
+          Ok([])
+        events
+      },
+    )
+  let repository = memory.snapshots(pid)
+  let cached =
+    snapshot.Repository(repository.load, fn(key, observed, saved) {
+      record(saves, saved)
+      repository.save(key, observed, saved)
+    })
+  let assert Ok(_) =
+    command.execute_with_snapshot(
+      traced,
+      command,
+      command.default_policy(),
+      cached,
+      key,
+      codec,
+    )
+  assert drain(handled) == [1002]
+  assert drain(reads) == [#(first, zero), #(later, zero)]
+  let assert [_] = drain(saves)
+  let assert Ok(_) =
+    command.execute_with_snapshot(
+      traced,
+      command,
+      command.default_policy(),
+      cached,
+      key,
+      codec,
+    )
+  assert drain(handled) == [1002]
+  assert drain(reads)
+    == [#(first, version_100), #(later, stream.next_version(zero))]
+  assert drain(saves) == []
+
+  let assert Ok(tail) = store.register(store.writes(), first, version_100)
+  let assert Ok(tail) = store.append(tail, store.Event(first, "tail", 3))
+  let assert Ok(Nil) = storage.append_events(tail)
+  let assert Ok(_) =
+    command.execute_with_snapshot(
+      traced,
+      command,
+      command.default_policy(),
+      cached,
+      key,
+      codec,
+    )
+  assert drain(handled) == [1034]
+  assert drain(reads) == [#(first, version_100), #(replacement, zero)]
+  let assert [snapshot.Snapshot([_, checkpoint])] = drain(saves)
+  assert checkpoint.stream == replacement
+  let assert Ok(_) =
+    command.execute_with_snapshot(
+      traced,
+      command,
+      command.default_policy(),
+      cached,
+      key,
+      codec,
+    )
+  assert drain(handled) == [1034]
+  assert drain(reads)
+    == [
+      #(first, stream.next_version(version_100)),
+      #(replacement, stream.next_version(zero)),
+    ]
+  assert drain(saves) == []
+  let assert Ok(Nil) = memory.close(pid)
+}
+
+pub fn memory_snapshot_rejects_a_regressing_version_vector_test() {
+  let assert Ok(pid) = memory.start()
+  let snapshots = memory.snapshots(pid)
+  let assert Ok(key) = snapshot.key("  stable-key ")
+  assert snapshot.name(key) == "stable-key"
+  let assert Ok(first) = stream.id("first")
+  let assert Ok(second) = stream.id("second")
+  let zero = stream.initial_version
+  let one = stream.next_version(zero)
+  let two = stream.next_version(one)
+  let original =
+    snapshot.Snapshot([
+      snapshot.Checkpoint(first, one, <<1>>),
+      snapshot.Checkpoint(second, one, <<2>>),
+    ])
+  let regressing =
+    snapshot.Snapshot([
+      snapshot.Checkpoint(first, two, <<3>>),
+      snapshot.Checkpoint(second, zero, <<4>>),
+    ])
+  let covering =
+    snapshot.Snapshot([
+      snapshot.Checkpoint(first, two, <<5>>),
+      snapshot.Checkpoint(second, one, <<6>>),
+    ])
+  assert snapshots.load(key) == Ok(None)
+  assert snapshots.save(key, None, original) == Ok(Nil)
+  assert snapshots.save(key, Some(original), regressing) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(original))
+  assert snapshots.save(key, Some(original), covering) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(covering))
+
+  let without_second =
+    snapshot.Snapshot([snapshot.Checkpoint(first, two, <<7>>)])
+  assert snapshots.save(key, Some(original), without_second) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(covering))
+  assert snapshots.save(key, Some(covering), without_second) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(without_second))
+  let assert Ok(Nil) = memory.close(pid)
+}
+
+pub fn snapshot_refresh_threshold_applies_before_a_command_rejection_test() {
+  let assert Ok(pid) = memory.start()
+  let storage = memory.as_store(pid)
+  let snapshots = memory.snapshots(pid)
+  let assert Ok(key) = snapshot.key("threshold")
+  let assert Ok(id) = stream.id("threshold")
+  let assert Ok(version_99) = stream.version(99)
+  let assert Ok(version_100) = stream.version(100)
+  let assert Ok(seed) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(seed) =
+    list.try_fold(list.repeat(Nil, 99), seed, fn(writes, _) {
+      store.append(writes, store.Event(id, "added", Nil))
+    })
+  assert storage.append_events(seed) == Ok(Nil)
+  let codec =
+    snapshot.Codec(fn(state) { Ok(<<state:32>>) }, fn(bytes) {
+      case bytes {
+        <<state:32>> -> Ok(state)
+        _ -> Error("invalid count")
+      }
+    })
+  let reject =
+    command.Command(
+      streams: command.single(id),
+      initial_state: fn() { 0 },
+      apply: fn(count, _) { count + 1 },
+      discover: fn(_) { [] },
+      handle: fn(_) { Error(command.BusinessRule("declined")) },
+    )
+  let run = fn() {
+    command.execute_with_snapshot(
+      storage,
+      reject,
+      command.default_policy(),
+      snapshots,
+      key,
+      codec,
+    )
+  }
+  let fail_encode =
+    snapshot.Codec(
+      fn(_) { Error("encoder called below threshold") },
+      codec.decode,
+    )
+  assert command.execute_with_snapshot(
+      storage,
+      reject,
+      command.default_policy(),
+      snapshots,
+      key,
+      fail_encode,
+    )
+    == Error(command.Rejected(command.BusinessRule("declined")))
+  assert snapshots.load(key) == Ok(None)
+
+  let assert Ok(tail) = store.register(store.writes(), id, version_99)
+  let assert Ok(tail) = store.append(tail, store.Event(id, "added", Nil))
+  assert storage.append_events(tail) == Ok(Nil)
+  assert run() == Error(command.Rejected(command.BusinessRule("declined")))
+  assert snapshots.load(key)
+    == Ok(
+      Some(
+        snapshot.Snapshot([
+          snapshot.Checkpoint(id, version_100, <<100:32>>),
+        ]),
+      ),
+    )
   assert memory.close(pid) == Ok(Nil)
 }
