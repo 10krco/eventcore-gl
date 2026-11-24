@@ -18,7 +18,8 @@ The in-memory store records global append order in the same OTP state
 transition as its stream histories. Reads walk that sequence after the
 cursor up to the position observed at the start of the page. The caller
 fetches chunks of at most 128 events and filters them outside the OTP server.
-The page stops at the requested number of matches or the observed frontier. Checkpoints share the lifetime of the in-memory store.
+The page stops at the requested number of matches or the observed frontier.
+Checkpoints share the lifetime of the in-memory store.
 
 Filter patterns operate on Unicode code points. Literal prefixes reject glob
 syntax, and validated globs match the entire stream name. A suffix matcher

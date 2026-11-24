@@ -40,6 +40,7 @@ pub fn memory_filtered_read_resumes_in_append_order_test() {
     |> result.try(store.append(_, debit_event))
     |> result.try(store.append(_, store.Event(debit, "skipped", 11)))
     |> result.try(store.append(_, credit_event))
+    |> result.try(store.append(_, store.Event(credit, "skipped", 21)))
   assert events.append_events(writes) == Ok(Nil)
 
   let read = memory.projection_reader(memory)
@@ -67,7 +68,14 @@ pub fn memory_filtered_read_resumes_in_append_order_test() {
   assert second == credit_event
   assert projection.sequence(cursor) == 4
   let assert Ok(drained) = projection.page(Some(cursor), 1)
-  assert read(filter, drained) == Ok(projection.PageResult([], Some(cursor)))
+  let assert Ok(frontier) = projection.position(5)
+  assert read(filter, drained) == Ok(projection.PageResult([], Some(frontier)))
+  let assert Ok(first_with_room) = projection.page(None, 3)
+  let assert Ok(projection.PageResult([debit, credit], Some(scanned))) =
+    read(filter, first_with_room)
+  assert debit.event == debit_event
+  assert credit.event == credit_event
+  assert scanned == frontier
   assert memory.close(memory) == Ok(Nil)
 }
 

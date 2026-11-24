@@ -57,6 +57,9 @@ pub type PageResult(payload) {
   )
 }
 
+/// Returns deliveries in increasing order, strictly after the input cursor.
+/// The scanned cursor includes the final delivery and may include a tail of
+/// filtered events. An empty scan preserves the input cursor.
 pub type Reader(payload) =
   fn(Filter, Page) -> Result(PageResult(payload), StoreError)
 
