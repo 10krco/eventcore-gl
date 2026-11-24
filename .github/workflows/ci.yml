@@ -1,0 +1,21 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Gleam checks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31
+      - run: nix develop --no-update-lock-file -c gleam format --check
+      - run: nix develop --no-update-lock-file -c gleam build --warnings-as-errors
+      - run: nix develop --no-update-lock-file -c gleam test

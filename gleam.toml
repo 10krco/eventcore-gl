@@ -1,0 +1,9 @@
+name = "eventcore"
+version = "0.1.0"
+target = "erlang"
+description = "Gleam port of the EventCore multi-stream event sourcing library"
+licences = ["MIT"]
+repository = { type = "github", user = "10krco", repo = "eventcore-gl" }
+
+[dev-dependencies]
+gleeunit = ">= 1.0.0 and < 2.0.0"
