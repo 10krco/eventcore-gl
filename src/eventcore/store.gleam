@@ -12,6 +12,9 @@ pub type Event(payload) {
 pub type Operation {
   StartStore
   ReadStream
+  ReadProjection
+  LoadCheckpoint
+  SaveCheckpoint
   AppendEvents
   CloseStore
   LoadSnapshot
