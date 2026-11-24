@@ -212,14 +212,16 @@ handle_call({resolve, Revision, _, _}, _From, #state{revision = Current} = State
 handle_call({resolve, _, _, _}, _From, #state{dangling = [_ | _]} = State) ->
     {reply, {error, journal_unavailable}, State};
 handle_call({resolve, _, {fork, Stream, Base, Heads} = Fork, Events}, _From,
-            #state{streams = Streams, contested = Contested} = State) ->
+            #state{streams = Streams, contested = Contested, transactions = Transactions} = State) ->
     case fork_contexts(State) of
         {ok, Contexts} ->
             case lists:keymember(Fork, 1, Contexts) of
                 false -> {reply, {error, reconciliation_changed}, State};
                 true ->
-                    Parents = lists:usort(Heads ++ latest_local_transaction(State)),
                     Bases = resolution_bases(Events, Streams),
+                    OtherStreams = maps:from_keys([Id || {Id, _} <- Bases, Id =/= Stream], true),
+                    Dependencies = writing_transactions(OtherStreams, Transactions),
+                    Parents = lists:usort(Heads ++ Dependencies ++ latest_local_transaction(State)),
                     OtherContested = maps:remove(Stream, Contested),
                     case check_contested(Events, OtherContested) of
                         ok -> reply_to_resolution(persist(Bases, Events, Parents, {{Stream, Base}, Heads}, State));
@@ -272,6 +274,11 @@ check_versions([{Id, {version, Expected}} | Rest], Streams) ->
         {Expected, _} -> check_versions(Rest, Streams);
         {Actual, _} -> {version_conflict, Id, {version, Expected}, {version, Actual}}
     end.
+
+writing_transactions(Streams, _Transactions) when map_size(Streams) =:= 0 -> [];
+writing_transactions(Streams, Transactions) ->
+    [Id || Id := #{events := Events} <- Transactions,
+           lists:any(fun({event, Stream, _, _}) -> maps:is_key(Stream, Streams) end, Events)].
 
 resolution_bases(Events, Streams) ->
     Ids = lists:usort([Id || {event, Id, _, _} <- Events]),

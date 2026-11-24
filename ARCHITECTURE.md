@@ -43,7 +43,9 @@ On reopen, ancestor depth and stable transaction fields determine canonical
 order. The journal compares branch ancestry to detect forks and replica
 identity collisions. Callers can inspect complete branch histories and submit
 a resolution against the graph revision they read. Each resolution records
-the stream, base and heads it joins. It descends from those heads and the
-most recent local publication. Projections can compare an event-prefix
+the stream, base and heads it joins. Its ancestry includes those heads, the
+latest local publication, and the history of any other stream it writes.
+Later imports can reopen a fork, and resolvers can inspect the evidence
+accepted by earlier resolutions. Projections can compare an event-prefix
 fingerprint after importing history and rebuild when the consumed prefix
 changes. See [ADR 0005](docs/decisions/0005-filesystem-reconciliation.md).

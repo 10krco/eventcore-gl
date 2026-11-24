@@ -24,12 +24,16 @@ any import.
 A domain resolver receives all typed stream events on each branch from
 divergence to its head. A resolution records the stream, base version and
 heads it joins alongside its events, which may be empty. Ordinary appends
-to an unresolved stream fail until a resolver makes a decision. Other
+to an unresolved stream fail until a resolver makes a decision. Later imports
+can reopen a fork when a resolution did not cover the imported branch head.
+Previously accepted events remain available to a subsequent resolver. Other
 streams can advance while a fork remains open.
 
 Run the resolver in the caller. Recheck the graph revision in the journal
 server when committing a resolution. Include the latest local publication
-as a causal parent and refresh the remaining forks after each resolution.
+as a causal parent. When a resolution writes another stream, its parents
+include the transactions that contributed that stream's current version.
+Refresh the remaining forks after each resolution.
 Report a concurrent revision change so the caller can inspect current
 branches again.
 

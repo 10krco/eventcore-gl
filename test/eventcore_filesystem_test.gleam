@@ -534,3 +534,106 @@ pub fn missing_intermediate_parent_does_not_create_a_replica_collision_test() {
   assert filesystem.close(a) == Ok(Nil)
   remove_root(root)
 }
+
+pub fn late_imports_reopen_forks_with_complete_resolution_evidence_test() {
+  let left = temp_root()
+  let right = temp_root()
+  let third = temp_root()
+  let assert Ok(id) = stream.id("late-fork")
+  let zero = stream.initial_version
+  let one = stream.next_version(zero)
+  let assert Ok(a) = filesystem.open(left, codec())
+  let assert Ok(b) = filesystem.open(right, codec())
+  let assert Ok(c) = filesystem.open(third, codec())
+  append_value(a, id, zero, 1)
+  append_value(b, id, zero, 2)
+  append_value(c, id, zero, 4)
+  assert filesystem.close(a) == Ok(Nil)
+  assert filesystem.close(b) == Ok(Nil)
+  assert filesystem.close(c) == Ok(Nil)
+  copy_transactions(right, left)
+
+  let assert Ok(a) = filesystem.open(left, codec())
+  assert filesystem.reconcile(a, fn(_) { filesystem.Resolve([]) })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert filesystem.detect_forks(a) == Ok([])
+  assert filesystem.close(a) == Ok(Nil)
+
+  let assert Ok(b) = filesystem.open(right, codec())
+  append_value(b, id, one, 3)
+  assert filesystem.close(b) == Ok(Nil)
+  copy_transactions(right, left)
+  let assert Ok(a) = filesystem.open(left, codec())
+  let assert Ok([filesystem.Fork(_, _, [_, _])]) = filesystem.detect_forks(a)
+  assert filesystem.reconcile(a, fn(context) {
+      let values =
+        list.map(context.branches, fn(branch) {
+          list.sort(
+            list.map(branch.events, fn(event) { event.payload }),
+            int.compare,
+          )
+        })
+      assert values == [[1, 2], [2, 3]] || values == [[2, 3], [1, 2]]
+      filesystem.Resolve([])
+    })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert filesystem.close(a) == Ok(Nil)
+
+  copy_transactions(third, left)
+  let assert Ok(a) = filesystem.open(left, codec())
+  assert filesystem.reconcile(a, fn(context) {
+      let values =
+        list.map(context.branches, fn(branch) {
+          list.sort(
+            list.map(branch.events, fn(event) { event.payload }),
+            int.compare,
+          )
+        })
+      assert values == [[1, 2, 3], [4]] || values == [[4], [1, 2, 3]]
+      filesystem.Resolve([])
+    })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert filesystem.detect_forks(a) == Ok([])
+  assert filesystem.close(a) == Ok(Nil)
+  remove_root(left)
+  remove_root(right)
+  remove_root(third)
+}
+
+pub fn cross_stream_resolution_follows_the_imported_output_history_test() {
+  let left = temp_root()
+  let right = temp_root()
+  let third = temp_root()
+  let assert Ok(id) = stream.id("resolved")
+  let assert Ok(output) = stream.id("output")
+  let zero = stream.initial_version
+  let one = stream.next_version(zero)
+  let two = stream.next_version(one)
+  let assert Ok(a) = filesystem.open(left, codec())
+  let assert Ok(b) = filesystem.open(right, codec())
+  let assert Ok(c) = filesystem.open(third, codec())
+  append_value(a, id, zero, 10)
+  append_value(b, id, zero, 20)
+  append_value(c, output, zero, 1)
+  append_value(c, output, one, 2)
+  append_value(c, output, two, 3)
+  assert filesystem.close(a) == Ok(Nil)
+  assert filesystem.close(b) == Ok(Nil)
+  assert filesystem.close(c) == Ok(Nil)
+  copy_transactions(right, left)
+  copy_transactions(third, left)
+
+  let assert Ok(a) = filesystem.open(left, codec())
+  assert filesystem.reconcile(a, fn(_) {
+      filesystem.Resolve([store.Event(output, "resolution", 4)])
+    })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert read_values(a, output) == [1, 2, 3, 4]
+  assert filesystem.close(a) == Ok(Nil)
+  let assert Ok(a) = filesystem.open(left, codec())
+  assert read_values(a, output) == [1, 2, 3, 4]
+  assert filesystem.close(a) == Ok(Nil)
+  remove_root(left)
+  remove_root(right)
+  remove_root(third)
+}

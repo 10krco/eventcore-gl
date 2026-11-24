@@ -128,46 +128,74 @@ stream_forks(Transactions, Order) ->
     lists:filtermap(fun
         ({_, [_]}) -> false;
         ({{Stream, Version}, Claims}) ->
-            case unresolved_claims(Claims, Transactions) of
-                [] -> false;
-                [_] -> false;
-                Unresolved ->
-                    Branches = branches(Stream, Unresolved, Transactions, Order),
-                    {true, {{fork, Stream, Version, [Id || {Id, _} <- Branches]}, Branches}}
+            case branches(Stream, Claims, Transactions, Order) of
+                [_, _ | _] = Branches ->
+                    {true, {{fork, Stream, Version, [Id || {Id, _} <- Branches]}, Branches}};
+                _ -> false
             end
     end, lists:sort(maps:to_list(Groups))).
 
 add_claim(Key, Claim, Groups) ->
     maps:update_with(Key, fun(Claims) -> [Claim | Claims] end, [Claim], Groups).
 
-% Only an explicit resolution on this stream and base can supersede a claim.
-% Its other causal parents do not represent branches the resolver accepted.
-unresolved_claims(Claims, Transactions) ->
-    ResolvedBy = lists:append([Heads || {_, Heads} <- Claims]),
-    [Id || Id <- lists:usort([Claim || {Claim, _} <- Claims]),
-           not lists:any(fun(Head) -> covers(Id, Head, Transactions) end, ResolvedBy)].
-
-branches(Stream, Roots, Transactions, Order) ->
-    Histories = lists:foldl(fun(Id, Groups) ->
-        case [Root || Root <- Roots, covers(Root, Id, Transactions)] of
-            [Root] ->
-                Events = branch_events(Stream, Id, Transactions),
-                case Id =:= Root orelse Events =/= [] of
-                    true -> maps:update_with(Root, fun(History) -> [{Id, Events} | History] end,
-                                             [{Id, Events}], Groups);
-                    false -> Groups
-                end;
-            _ -> Groups
+branches(Stream, Claims, Transactions, Order) ->
+    ClaimMap = maps:from_list(Claims),
+    Owners = lists:foldl(fun(Id, Acc) ->
+        case branch_owner(Id, Stream, ClaimMap, Transactions) of
+            none -> Acc;
+            Owner -> Acc#{Id => Owner}
         end
     end, #{}, Order),
-    lists:sort(lists:append([branch_heads(History, Transactions)
-                            || History <- maps:values(Histories)])).
+    ByOwner = maps:groups_from_list(fun(Id) -> maps:get(Id, Owners) end, maps:keys(Owners)),
+    ResolvedBy = lists:append(maps:values(ClaimMap)),
+    Heads = lists:sort([Id || Members <- maps:values(ByOwner), Id <- Members,
+        not lists:any(fun(Other) -> ancestor(Id, Other, Transactions) end, Members),
+        not lists:any(fun(Head) -> covers(Id, Head, Transactions) end, ResolvedBy)]),
+    case Heads of
+        [_, _ | _] ->
+            [{Id, branch_history(Id, Stream, ClaimMap, Owners, ByOwner, Transactions, Order)}
+             || Id <- Heads];
+        _ -> []
+    end.
 
-branch_heads(History, Transactions) ->
-    [{Id, lists:append([Events || {Candidate, Events} <- lists:reverse(History),
-                                 covers(Candidate, Id, Transactions)])}
-     || {Id, _} <- History,
-        not lists:any(fun({Other, _}) -> ancestor(Id, Other, Transactions) end, History)].
+branch_owner(Id, Stream, Claims, Transactions) ->
+    case maps:is_key(Id, Claims) of
+        true -> Id;
+        false ->
+            case branch_events(Stream, Id, Transactions) of
+                [] -> none;
+                [_ | _] ->
+                    case branch_owners(Id, Claims, Transactions) of
+                        [Owner] -> Owner;
+                        _ -> none
+                    end
+            end
+    end.
+
+branch_history(Head, Stream, Claims, Owners, ByOwner, Transactions, Order) ->
+    Evidence = branch_evidence([Head], Claims, Owners, ByOwner, Transactions, #{}),
+    lists:append([branch_events(Stream, Id, Transactions)
+                  || Id <- Order, maps:is_key(Id, Evidence)]).
+
+branch_evidence([], _, _, _, _, Evidence) -> Evidence;
+branch_evidence([Head | Rest], Claims, Owners, ByOwner, Transactions, Evidence) ->
+    case {maps:is_key(Head, Evidence), maps:find(Head, Owners)} of
+        {false, {ok, Owner}} ->
+            Members = [Id || Id <- maps:get(Owner, ByOwner), covers(Id, Head, Transactions)],
+            Known = maps:merge(Evidence, maps:from_keys(Members, true)),
+            % A resolution carries only the explicitly accepted branch evidence.
+            Accepted = maps:get(Owner, Claims),
+            branch_evidence(Accepted ++ Rest, Claims, Owners, ByOwner, Transactions, Known);
+        _ -> branch_evidence(Rest, Claims, Owners, ByOwner, Transactions, Evidence)
+    end.
+
+% A resolution supersedes its accepted branches only for descendants that
+% actually observed it. Imported extensions can therefore reopen the fork.
+branch_owners(Id, Claims, Transactions) ->
+    Ancestors = [{Claim, Heads} || Claim := Heads <- Claims, ancestor(Claim, Id, Transactions)],
+    Accepted = lists:append([Heads || {_, Heads} <- Ancestors]),
+    [Claim || {Claim, _} <- Ancestors,
+              not lists:any(fun(Head) -> covers(Claim, Head, Transactions) end, Accepted)].
 
 covers(Id, Id, _) -> true;
 covers(Ancestor, Id, Transactions) -> ancestor(Ancestor, Id, Transactions).
