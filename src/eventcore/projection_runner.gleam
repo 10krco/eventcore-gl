@@ -13,6 +13,7 @@ import gleam/result
 pub type LeadershipError {
   AlreadyLeading
   CoordinatorUnavailable
+  RemoteHolder
 }
 
 pub type Lease {

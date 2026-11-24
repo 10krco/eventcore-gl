@@ -38,6 +38,8 @@ acquire(Pid, Name) ->
 init({Owner, Initial}) ->
     {ok, {erlang:monitor(process, Owner), Initial, #{}}}.
 
+handle_call({acquire, _}, {Holder, _}, State) when node(Holder) =/= node() ->
+    {reply, {error, remote_holder}, State};
 handle_call({acquire, Name}, {Holder, _}, {OwnerMonitor, State, Leases}) ->
     case live_lease(maps:find(Name, Leases)) of
         true -> {reply, {error, already_leading}, {OwnerMonitor, State, Leases}};
@@ -69,8 +71,6 @@ handle_info(_Message, State) -> {noreply, State}.
 
 
 live_lease(error) -> false;
-% The monitor also reports disconnection for a holder on another node.
-live_lease({ok, {Holder, _}}) when node(Holder) =/= node() -> true;
 live_lease({ok, {Holder, Token}}) ->
     case erlang:is_process_alive(Holder) of
         true -> true;

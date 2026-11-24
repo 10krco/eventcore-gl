@@ -12,7 +12,9 @@ event when its effect succeeds and its checkpoint write fails.
 Run a projector in the calling BEAM process with a backend reader,
 checkpoint repository, and per-name lease. Acquire leadership before
 loading progress. Release it whenever the run returns or raises. The memory
-backend monitors the lease holder and drops its lease on process exit.
+backend restricts acquisition to callers on the store's BEAM node so a network
+partition cannot leave an active remote handler after a lease is reclaimed.
+It monitors the holder and drops its lease on process exit.
 Lease releases carry an identity so a stale release cannot remove a newer
 holder.
 

@@ -292,7 +292,7 @@ pub fn projection_checkpoints(
   )
 }
 
-/// Uses a store-local lease for each named projector.
+/// Uses a lease on the store’s BEAM node for each named projector.
 pub fn projection_backend(
   memory: Memory(payload),
 ) -> projection_runner.Backend(payload) {
