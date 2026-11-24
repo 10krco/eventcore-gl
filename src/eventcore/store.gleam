@@ -23,6 +23,7 @@ pub type StoreError {
   DeserializationFailed(stream: Id, detail: String)
   StoreFailure(operation: Operation)
   VersionConflict(stream: Id, expected: Version, actual: Version)
+  UnresolvedStreamFork(stream: Id)
 }
 
 pub opaque type Writes(payload) {

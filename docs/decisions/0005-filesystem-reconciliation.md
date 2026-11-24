@@ -17,13 +17,21 @@ one transactions, which carry no replica identity.
 
 Derive a canonical event order from ancestor depth, timestamp, replica
 identity, and transaction nonce. Expose forks and a topology generation that
-counts transactions with multiple parents. A domain resolver receives each
-fork's typed branch events and can decline resolution or publish an immutable
-merge referencing the fork heads, including a merge with zero events.
+counts transactions with multiple parents. Expose a fingerprint of the
+consumed event prefix so a projection can detect reordered history after
+any import.
+
+A domain resolver receives all typed stream events on each branch from
+divergence to its head. A resolution records the stream, base version and
+heads it joins alongside its events, which may be empty. Ordinary appends
+to an unresolved stream fail until a resolver makes a decision. Other
+streams can advance while a fork remains open.
 
 Run the resolver in the caller. Recheck the graph revision in the journal
-server when committing a resolution. Report a revision change so the caller
-can inspect current branches again.
+server when committing a resolution. Include the latest local publication
+as a causal parent and refresh the remaining forks after each resolution.
+Report a concurrent revision change so the caller can inspect current
+branches again.
 
 ## Consequences
 
@@ -32,4 +40,5 @@ Independent merge transactions can create another fork that can be resolved
 with the same mechanism. Imported merges can reorder history behind a
 projection cursor. A reconcile call can commit earlier resolutions before a
 later resolution fails. Incomplete graphs remain readable and reject writes
-while a parent is missing.
+while a parent is missing. Replica collision detection requires complete
+ancestry for both transactions so recovery status can report missing parents.

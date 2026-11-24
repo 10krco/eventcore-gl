@@ -37,11 +37,13 @@ graph and reports damaged files and missing parents. Appends require all parents
 
 ## Filesystem replica reconciliation
 
-Version two transactions carry a replica identity that typically comes from
+New transactions carry a replica identity that typically comes from
 fingerprint-bound metadata under the journal's Git-ignored local directory.
 On reopen, ancestor depth and stable transaction fields determine canonical
 order. The journal compares branch ancestry to detect forks and replica
-identity collisions. Callers can inspect branches and submit a resolution
-against the graph revision they read. Each resolution is a transaction with
-the fork heads as parents. A projection can detect a topology generation
-change and rebuild its state. See [ADR 0005](docs/decisions/0005-filesystem-reconciliation.md).
+identity collisions. Callers can inspect complete branch histories and submit
+a resolution against the graph revision they read. Each resolution records
+the stream, base and heads it joins. It descends from those heads and the
+most recent local publication. Projections can compare an event-prefix
+fingerprint after importing history and rebuild when the consumed prefix
+changes. See [ADR 0005](docs/decisions/0005-filesystem-reconciliation.md).

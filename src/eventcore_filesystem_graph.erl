@@ -1,5 +1,6 @@
 -module(eventcore_filesystem_graph).
--export([order/1, tips/1, dangling/1, forks/2, fork_contexts/2, topology_generation/1]).
+-export([order/1, tips/1, dangling/1, forks/2, stream_forks/2,
+         topology_generation/1, event_prefix_token/3]).
 
 order(Transactions) ->
     {Ranked, _} = maps:fold(
@@ -47,17 +48,17 @@ topology_generation(Transactions) ->
     end, 0, Transactions).
 
 forks(Transactions, Order) ->
+    CollisionCandidates = case dangling(Transactions) of
+        [] -> Order;
+        _ -> [Id || Id <- Order, not incomplete_ancestry(Id, Transactions)]
+    end,
     Replicas = maps:groups_from_list(
-        fun(Id) -> maps:get(replica, maps:get(Id, Transactions)) end, Order),
+        fun(Id) -> maps:get(replica, maps:get(Id, Transactions)) end, CollisionCandidates),
     case replica_conflicts(lists:sort(maps:to_list(maps:remove(undefined, Replicas))),
                            Transactions) of
-        ok -> {ok, stream_forks(Transactions)};
+        ok -> {ok, stream_forks(Transactions, Order)};
         Conflict -> {error, Conflict}
     end.
-
-fork_contexts(Forks, Transactions) ->
-    [{Fork, [{Id, branch_events(Stream, Id, Transactions)} || Id <- Ids]}
-     || {fork, Stream, _, Ids} = Fork <- Forks].
 
 branch_events(Stream, Id, Transactions) ->
     #{events := Events} = maps:get(Id, Transactions),
@@ -79,30 +80,97 @@ first_unrelated([First, Second | Rest], Transactions) ->
     end;
 first_unrelated(_, _) -> none.
 
-stream_forks(Transactions) ->
-    Claims = [{Base, Id} || Id := #{bases := Bases} <- Transactions, Base <- Bases],
-    Groups = maps:groups_from_list(fun({Base, _}) -> Base end,
-                                   fun({_, Id}) -> Id end, Claims),
+incomplete_ancestry(Id, Transactions) ->
+    incomplete_ancestry([Id], Transactions, #{}).
+
+incomplete_ancestry([], _, _) -> false;
+incomplete_ancestry([Id | Rest], Transactions, Visited) ->
+    case {maps:is_key(Id, Visited), maps:find(Id, Transactions)} of
+        {false, error} -> true;
+        {false, {ok, #{parents := Parents}}} ->
+            incomplete_ancestry(Parents ++ Rest, Transactions, Visited#{Id => true});
+        {true, _} -> incomplete_ancestry(Rest, Transactions, Visited)
+    end.
+
+event_prefix_token(Count, Order, Transactions) when Count >= 0 ->
+    prefix(Count, Order, Transactions, crypto:hash_init(sha256)).
+
+prefix(0, _, _, Hash) ->
+    {ok, binary:encode_hex(crypto:hash_final(Hash), lowercase)};
+prefix(_, [], _, _) -> {error, invalid_event_prefix};
+prefix(Count, [Id | Rest], Transactions, Hash) ->
+    #{events := Events} = maps:get(Id, Transactions),
+    Taken = min(Count, length(Events)),
+    case Taken of
+        0 -> prefix(Count, Rest, Transactions, Hash);
+        _ ->
+            Next = crypto:hash_update(Hash, [Id, <<Taken:64/unsigned>>]),
+            prefix(Count - Taken, Rest, Transactions, Next)
+    end.
+
+stream_forks(Transactions, Order) ->
+    Groups = maps:fold(fun(Id, Record, Acc) ->
+        #{bases := Bases, events := Events, resolution := Resolution} = Record,
+        Written = maps:from_keys([Stream || {event, Stream, _, _} <- Events], true),
+        OrdinaryWrites = case Resolution of
+            none -> Written;
+            {{ResolvedStream, _}, _} -> maps:remove(ResolvedStream, Written)
+        end,
+        Claims = [Key || {Stream, _} = Key <- Bases, maps:is_key(Stream, OrdinaryWrites)],
+        WithWrites = lists:foldl(fun(Key, Groups) ->
+            add_claim(Key, {Id, []}, Groups)
+        end, Acc, Claims),
+        case Resolution of
+            none -> WithWrites;
+            {Key, Heads} -> add_claim(Key, {Id, Heads}, WithWrites)
+        end
+    end, #{}, Transactions),
     lists:filtermap(fun
         ({_, [_]}) -> false;
-        ({{Stream, Version}, Ids}) ->
-            case fork_heads(lists:usort(Ids), Transactions) of
+        ({{Stream, Version}, Claims}) ->
+            case unresolved_claims(Claims, Transactions) of
                 [] -> false;
                 [_] -> false;
-                Heads -> {true, {fork, Stream, Version, Heads}}
+                Unresolved ->
+                    Branches = branches(Stream, Unresolved, Transactions, Order),
+                    {true, {{fork, Stream, Version, [Id || {Id, _} <- Branches]}, Branches}}
             end
     end, lists:sort(maps:to_list(Groups))).
 
-fork_heads(Ids, Transactions) ->
-    Heads = [Id || Id <- Ids,
-                   not lists:any(fun(Other) -> ancestor(Id, Other, Transactions) end, Ids)],
-    case lists:any(
-        fun(Candidate) ->
-            lists:all(fun(Head) -> ancestor(Head, Candidate, Transactions) end, Heads)
-        end, maps:keys(Transactions)) of
-        true -> [];
-        false -> Heads
-    end.
+add_claim(Key, Claim, Groups) ->
+    maps:update_with(Key, fun(Claims) -> [Claim | Claims] end, [Claim], Groups).
+
+% Only an explicit resolution on this stream and base can supersede a claim.
+% Its other causal parents do not represent branches the resolver accepted.
+unresolved_claims(Claims, Transactions) ->
+    ResolvedBy = lists:append([Heads || {_, Heads} <- Claims]),
+    [Id || Id <- lists:usort([Claim || {Claim, _} <- Claims]),
+           not lists:any(fun(Head) -> covers(Id, Head, Transactions) end, ResolvedBy)].
+
+branches(Stream, Roots, Transactions, Order) ->
+    Histories = lists:foldl(fun(Id, Groups) ->
+        case [Root || Root <- Roots, covers(Root, Id, Transactions)] of
+            [Root] ->
+                Events = branch_events(Stream, Id, Transactions),
+                case Id =:= Root orelse Events =/= [] of
+                    true -> maps:update_with(Root, fun(History) -> [{Id, Events} | History] end,
+                                             [{Id, Events}], Groups);
+                    false -> Groups
+                end;
+            _ -> Groups
+        end
+    end, #{}, Order),
+    lists:sort(lists:append([branch_heads(History, Transactions)
+                            || History <- maps:values(Histories)])).
+
+branch_heads(History, Transactions) ->
+    [{Id, lists:append([Events || {Candidate, Events} <- lists:reverse(History),
+                                 covers(Candidate, Id, Transactions)])}
+     || {Id, _} <- History,
+        not lists:any(fun({Other, _}) -> ancestor(Id, Other, Transactions) end, History)].
+
+covers(Id, Id, _) -> true;
+covers(Ancestor, Id, Transactions) -> ancestor(Ancestor, Id, Transactions).
 
 ancestor(Id, Id, _Transactions) -> false;
 ancestor(Id, Descendant, Transactions) ->

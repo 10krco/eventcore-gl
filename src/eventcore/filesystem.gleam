@@ -72,6 +72,7 @@ pub type JournalError {
   JournalUnavailable
   ReplicaIdentityConflict(replica: String, first: String, second: String)
   ReconciliationChanged
+  InvalidEventPrefix
   JournalStoreError(StoreError)
 }
 
@@ -142,6 +143,18 @@ pub fn topology_generation(
   journal_topology_generation(filesystem.server)
 }
 
+/// Fingerprint the first count events in canonical journal order. Store the
+/// token with a projection checkpoint and compare it after importing history.
+pub fn event_prefix_token(
+  filesystem: Filesystem(payload),
+  count: Int,
+) -> Result(String, JournalError) {
+  case count < 0 {
+    True -> Error(InvalidEventPrefix)
+    False -> journal_event_prefix_token(filesystem.server, count)
+  }
+}
+
 /// The resolver runs in the caller. If the graph changes before a resolution
 /// can be recorded, reconcile returns ReconciliationChanged. Earlier
 /// resolutions in this call remain committed.
@@ -150,34 +163,84 @@ pub fn reconcile(
   resolver: fn(ForkContext(payload)) -> Resolution(payload),
 ) -> Result(ReconcileReport, JournalError) {
   use #(revision, contexts) <- result.try(fork_snapshot(filesystem.server))
-  use #(_, resolved, unresolved) <- result.try(
-    list.try_fold(contexts, #(revision, 0, []), fn(progress, entry) {
-      let #(revision, resolved, unresolved) = progress
-      let #(fork, encoded) = entry
-      use branches <- result.try(
-        list.try_map(encoded, fn(branch) {
-          store.collect(decode_events(branch.1, filesystem.codec))
-          |> result.map(Branch(branch.0, _))
-          |> result.map_error(JournalStoreError)
-        }),
-      )
-      case resolver(ForkContext(fork, branches)) {
-        Unresolvable(_) ->
-          Ok(#(revision, resolved, [fork.stream, ..unresolved]))
-        Resolve(events) -> {
-          use events <- result.try(
-            encode_events(events, filesystem.codec)
-            |> result.map_error(JournalStoreError),
+  reconcile_forks(filesystem, resolver, revision, contexts, 0, [])
+}
+
+type EncodedForkContext =
+  #(Fork, List(#(String, List(Event(BitArray)))))
+
+fn reconcile_forks(
+  filesystem: Filesystem(payload),
+  resolver: fn(ForkContext(payload)) -> Resolution(payload),
+  revision: Int,
+  contexts: List(EncodedForkContext),
+  resolved: Int,
+  declined: List(#(Id, Version)),
+) -> Result(ReconcileReport, JournalError) {
+  case contexts {
+    [] ->
+      Ok(ReconcileReport(
+        resolved,
+        list.reverse(declined) |> list.map(fn(fork) { fork.0 }),
+      ))
+    [#(fork, encoded), ..rest] -> {
+      let key = #(fork.stream, fork.base_version)
+      case list.contains(declined, key) {
+        True ->
+          reconcile_forks(
+            filesystem,
+            resolver,
+            revision,
+            rest,
+            resolved,
+            declined,
           )
-          resolve(filesystem.server, revision, fork, events)
-          |> result.map(fn(next_revision) {
-            #(next_revision, resolved + 1, unresolved)
-          })
+        False -> {
+          use branches <- result.try(
+            list.try_map(encoded, fn(branch) {
+              store.collect(decode_events(branch.1, filesystem.codec))
+              |> result.map(Branch(branch.0, _))
+              |> result.map_error(JournalStoreError)
+            }),
+          )
+          case resolver(ForkContext(fork, branches)) {
+            Unresolvable(_) ->
+              reconcile_forks(filesystem, resolver, revision, rest, resolved, [
+                key,
+                ..declined
+              ])
+            Resolve(events) -> {
+              use events <- result.try(
+                encode_events(events, filesystem.codec)
+                |> result.map_error(JournalStoreError),
+              )
+              use next <- result.try(resolve(
+                filesystem.server,
+                revision,
+                fork,
+                events,
+              ))
+              use #(current, refreshed) <- result.try(fork_snapshot(
+                filesystem.server,
+              ))
+              case current == next {
+                False -> Error(ReconciliationChanged)
+                True ->
+                  reconcile_forks(
+                    filesystem,
+                    resolver,
+                    next,
+                    refreshed,
+                    resolved + 1,
+                    declined,
+                  )
+              }
+            }
+          }
         }
       }
-    }),
-  )
-  Ok(ReconcileReport(resolved, list.reverse(unresolved)))
+    }
+  }
 }
 
 pub fn as_store(filesystem: Filesystem(payload)) -> Store(payload) {
@@ -263,13 +326,16 @@ fn journal_forks(server: Server) -> Result(List(Fork), JournalError)
 @external(erlang, "eventcore_filesystem_ffi", "topology_generation")
 fn journal_topology_generation(server: Server) -> Result(Int, JournalError)
 
+@external(erlang, "eventcore_filesystem_ffi", "event_prefix_token")
+fn journal_event_prefix_token(
+  server: Server,
+  count: Int,
+) -> Result(String, JournalError)
+
 @external(erlang, "eventcore_filesystem_ffi", "fork_snapshot")
 fn fork_snapshot(
   server: Server,
-) -> Result(
-  #(Int, List(#(Fork, List(#(String, List(Event(BitArray))))))),
-  JournalError,
-)
+) -> Result(#(Int, List(EncodedForkContext)), JournalError)
 
 @external(erlang, "eventcore_filesystem_ffi", "resolve")
 fn resolve(

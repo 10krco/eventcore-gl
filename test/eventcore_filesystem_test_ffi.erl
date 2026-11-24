@@ -36,7 +36,7 @@ copy_transactions(Source, Destination) ->
 
 add_malformed_transaction(Root, Path) ->
     {ok, Bytes} = file:read_file(Path),
-    {2, Time, Replica, Nonce, Parents, Bases, [Event]} = binary_to_term(Bytes, [safe]),
+    {3, Time, Replica, Nonce, Parents, Bases, [Event], none} = binary_to_term(Bytes, [safe]),
     Invalid = term_to_binary({2, Time, Replica, Nonce, Parents, Bases, [Event | 0]}),
     Id = binary:encode_hex(crypto:hash(sha256, Invalid), lowercase),
     Directory = filename:join(Root, <<"events">>),
@@ -63,7 +63,7 @@ copy_replica(Source, Destination) ->
 
 downgrade_transaction(Path) ->
     {ok, Bytes} = file:read_file(Path),
-    {2, Time, _, Nonce, Parents, Bases, Events} = binary_to_term(Bytes, [safe]),
+    {3, Time, _, Nonce, Parents, Bases, Events, none} = binary_to_term(Bytes, [safe]),
     Original = term_to_binary({1, Time, Nonce, Parents, Bases, Events}),
     Id = binary:encode_hex(crypto:hash(sha256, Original), lowercase),
     Destination = filename:join(filename:dirname(Path), <<Id/binary, ".txn">>),
