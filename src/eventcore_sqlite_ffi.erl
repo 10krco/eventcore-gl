@@ -217,9 +217,7 @@ insert_events(Connection, [{event, {id, Name} = Stream, Kind, Payload} | Rest], 
     insert_events(Connection, Rest, Versions#{Stream := Version}).
 
 write_one(Connection, Sql, Parameters) ->
-    ok = write_query(Connection, Sql, Parameters),
-    %% count_changes omits updates performed by UPSERT. changes() counts them.
-    [{1}] = sqlite:query(Connection, "SELECT changes()"),
+    [{1}] = sqlite:query(Connection, [Sql, " RETURNING 1"], Parameters),
     ok.
 
 write_query(Connection, Sql, Parameters) ->
