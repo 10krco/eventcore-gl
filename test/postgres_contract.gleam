@@ -4,6 +4,7 @@ import eventcore/postgres
 import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
+import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{None, Some}
 import gleam/result
@@ -41,6 +42,8 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   assert postgres.save_checkpoint(checkpoints, "ledger", 2) == Ok(Nil)
   assert postgres.load_checkpoint(second_checkpoints, "ledger") == Ok(Some(2))
 
+  check_suppressed_reset(first, second_checkpoints)
+  assert postgres.reset_checkpoint(second_checkpoints, "ledger") == Ok(Nil)
   assert postgres.reset_checkpoint(second_checkpoints, "ledger") == Ok(Nil)
   assert postgres.load_checkpoint(checkpoints, "ledger") == Ok(None)
 
@@ -67,17 +70,64 @@ fn check_competing_writers(first: store.Store(Int), second: store.Store(Int)) {
   let assert Ok(id) = stream.id("concurrent")
   let initial = stream.initial_version
   let after = stream.next_version(initial)
-  let assert Ok(batch) =
-    store.writes()
-    |> store.register(id, initial)
-    |> result.try(store.append(_, store.Event(id, "created", 7)))
   let replies = process.new_subject()
-  process.spawn(fn() { process.send(replies, first.append_events(batch)) })
-  process.spawn(fn() { process.send(replies, second.append_events(batch)) })
+  process.spawn(fn() {
+    let batch = single_event(id, initial, 7)
+    process.send(replies, #(first, 7, first.append_events(batch)))
+  })
+  process.spawn(fn() {
+    let batch = single_event(id, initial, 8)
+    process.send(replies, #(second, 8, second.append_events(batch)))
+  })
   let assert Ok(a) = process.receive(replies, 4000)
   let assert Ok(b) = process.receive(replies, 4000)
-  let conflict = Error(store.VersionConflict(id, initial, after))
-  assert a == Ok(Nil) && b == conflict || b == Ok(Nil) && a == conflict
+  let #(#(_, winner_value, won), #(loser, loser_value, lost)) = case a.2 {
+    Ok(Nil) -> #(a, b)
+    Error(_) -> #(b, a)
+  }
+  assert won == Ok(Nil)
+  let assert Error(store.VersionConflict(lost_id, expected, actual)) = lost
+  assert #(lost_id, expected, actual) == #(id, initial, after)
+  assert loser.append_events(single_event(id, actual, loser_value)) == Ok(Nil)
+  let assert Ok(events) = store.read_stream(first, id)
+  assert store.collect(events)
+    == Ok([
+      store.Event(id, "created", winner_value),
+      store.Event(id, "created", loser_value),
+    ])
+}
+
+fn single_event(id: stream.Id, version: stream.Version, value: Int) {
+  let assert Ok(batch) =
+    store.writes()
+    |> store.register(id, version)
+    |> result.try(store.append(_, store.Event(id, "created", value)))
+  batch
+}
+
+fn check_suppressed_reset(
+  pool: pog.Connection,
+  checkpoints: postgres.CheckpointStore,
+) -> Nil {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION eventcore_test_preserve() RETURNS trigger
+       LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+    )
+    |> pog.execute(pool)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER eventcore_test_preserve BEFORE DELETE ON eventcore_checkpoints
+       FOR EACH ROW EXECUTE FUNCTION eventcore_test_preserve()",
+    )
+    |> pog.execute(pool)
+  assert postgres.reset_checkpoint(checkpoints, "ledger")
+    == Error(postgres.CheckpointFailed)
+  assert postgres.load_checkpoint(checkpoints, "ledger") == Ok(Some(2))
+  let assert Ok(_) =
+    pog.query("DROP TRIGGER eventcore_test_preserve ON eventcore_checkpoints")
+    |> pog.execute(pool)
+  Nil
 }
 
 fn check_trigger_rollback(pool: pog.Connection, events: store.Store(Int)) {
@@ -96,6 +146,10 @@ fn check_trigger_rollback(pool: pog.Connection, events: store.Store(Int)) {
       FOR EACH ROW EXECUTE FUNCTION eventcore_test_ignore()",
     )
     |> pog.execute(pool)
+  let assert Ok(pog.Returned(rows: [last_position], ..)) =
+    pog.query("SELECT last_position FROM eventcore_positions WHERE singleton")
+    |> pog.returning(decode.at([0], decode.int))
+    |> pog.execute(pool)
   let assert Ok(id) = stream.id("rollback")
   let assert Ok(batch) =
     store.writes()
@@ -104,6 +158,24 @@ fn check_trigger_rollback(pool: pog.Connection, events: store.Store(Int)) {
     |> result.try(store.append(_, store.Event(id, "ignored", 2)))
   assert events.append_events(batch)
     == Error(store.StoreFailure(store.AppendEvents))
-  let assert Ok(events) = store.read_stream(events, id)
-  assert store.collect(events) == Ok([])
+  let assert Ok(empty) = store.read_stream(events, id)
+  assert store.collect(empty) == Ok([])
+  let assert Ok(batch) =
+    single_event(id, stream.initial_version, 1)
+    |> store.append(store.Event(id, "second", 2))
+  assert events.append_events(batch) == Ok(Nil)
+  let row = {
+    use position <- decode.field(0, decode.int)
+    use kind <- decode.field(1, decode.string)
+    decode.success(#(position, kind))
+  }
+  let assert Ok(pog.Returned(rows: positions, ..)) =
+    pog.query(
+      "SELECT position, kind FROM eventcore_events WHERE stream = $1 ORDER BY position",
+    )
+    |> pog.parameter(pog.text(stream.name(id)))
+    |> pog.returning(row)
+    |> pog.execute(pool)
+  assert positions
+    == [#(last_position + 1, "created"), #(last_position + 2, "second")]
 }

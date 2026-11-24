@@ -207,13 +207,28 @@ pub fn reset_checkpoint(
   checkpoints: CheckpointStore,
   name: String,
 ) -> Result(Nil, CheckpointError) {
-  execute(
-    checkpoints.pool,
-    "DELETE FROM eventcore_checkpoints WHERE name = $1",
-    [
-      pog.text(name),
-    ],
-  )
+  pog.transaction(checkpoints.pool, fn(tx) {
+    use Nil <- result.try(read_committed(tx) |> result.replace_error(Nil))
+    let parameters = [pog.text(name)]
+    use existing <- result.try(
+      query(
+        tx,
+        "SELECT 1 FROM eventcore_checkpoints WHERE name = $1 FOR UPDATE",
+        parameters,
+      )
+      |> result.replace_error(Nil),
+    )
+    case existing.count {
+      0 -> Ok(Nil)
+      1 ->
+        execute_one(
+          tx,
+          "DELETE FROM eventcore_checkpoints WHERE name = $1",
+          parameters,
+        )
+      _ -> Error(Nil)
+    }
+  })
   |> result.replace_error(CheckpointFailed)
 }
 
