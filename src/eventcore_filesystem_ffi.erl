@@ -1,13 +1,13 @@
 -module(eventcore_filesystem_ffi).
 -behaviour(gen_server).
 -export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
-         event_prefix_token/2,
+         event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/4,
          replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
-    owner, lock, directory, sync, replica,
-    transactions = #{}, ordered = [], revision = 0,
+    owner, lock, directory, snapshot_directory, sync, replica,
+    transactions = #{}, ordered = [], revision = 0, history_revision = 0,
     streams = #{}, tips = [], contested = #{},
     integrity_failures = [], dangling = []
 }).
@@ -45,9 +45,28 @@ event_prefix_token(Pid, Count) -> call(Pid, {event_prefix_token, Count}, {error,
 fork_snapshot(Pid) -> call(Pid, fork_snapshot, {error, journal_unavailable}).
 resolve(Pid, Revision, Fork, Events) ->
     call(Pid, {resolve, Revision, Fork, Events}, {error, journal_unavailable}).
-read(Pid, Id, After) -> call(Pid, {read, Id, After}, {error, nil}).
-append(Pid, Expected, Events) ->
-    call(Pid, {append, Expected, Events}, {error, {store_failure, append_events}}).
+history_revision(Pid) -> call(Pid, history_revision, {error, {store_failure, read_stream}}).
+
+read(Pid, Id, After) -> read(Pid, none, Id, After).
+read(Pid, Revision, Id, After) ->
+    guarded_call(Pid, Revision, {read, Id, After}, read_stream).
+
+append(Pid, Expected, Events) -> append(Pid, none, Expected, Events).
+append(Pid, Revision, Expected, Events) ->
+    guarded_call(Pid, Revision, {append, Expected, Events}, append_events).
+
+load_snapshot(Pid, Revision, Name) ->
+    guarded_call(Pid, Revision, {load_snapshot, Name}, load_snapshot).
+
+save_snapshot(Pid, Revision, Name, Value) ->
+    guarded_call(Pid, Revision, {save_snapshot, Name, Value}, save_snapshot).
+
+guarded_call(Pid, Revision, Request, Operation) ->
+    Reply = call(Pid, {with_history, Revision, Request}, {error, {store_failure, Operation}}),
+    case Reply of
+        {error, nil} -> {error, {store_failure, Operation}};
+        _ -> Reply
+    end.
 
 call(Pid, Request, Failure) ->
     try gen_server:call(Pid, Request, infinity)
@@ -64,7 +83,8 @@ init({Owner, RequestedRoot, Sync, Replica, SyncAncestor}) ->
             case acquire_lock(filename:join(Root, <<".lock">>)) of
                 {ok, Lock} ->
                     State = #state{owner = monitor(process, Owner), lock = Lock,
-                                   directory = Directory, sync = Sync},
+                                   directory = Directory, sync = Sync,
+                                   snapshot_directory = filename:join([Root, <<".eventcore">>, <<"snapshots">>])},
                     case prepare(Root, Replica, State) of
                         {ok, Loaded} -> {ok, Loaded};
                         {error, Reason} ->
@@ -230,6 +250,17 @@ handle_call({resolve, _, {fork, Stream, Base, Heads} = Fork, Events}, _From,
             end;
         Error -> {reply, Error, State}
     end;
+handle_call(history_revision, _From, #state{history_revision = Revision} = State) ->
+    {reply, {ok, Revision}, State};
+handle_call({with_history, {some, Revision}, _}, _From, #state{history_revision = Current} = State)
+  when Revision =/= Current ->
+    {reply, {error, journal_history_changed}, State};
+handle_call({with_history, _, Request}, From, State) ->
+    handle_call(Request, From, State);
+handle_call({load_snapshot, Name}, _From, State) ->
+    {reply, read_snapshot(snapshot_path(Name, State), State), State};
+handle_call({save_snapshot, Name, Value}, _From, State) ->
+    {reply, persist_snapshot(snapshot_path(Name, State), Value, State), State};
 handle_call({read, Id, After}, _From, #state{streams = Streams} = State) ->
     {Version, Reversed} = maps:get(Id, Streams, {0, []}),
     Tail = lists:reverse(lists:sublist(Reversed, max(0, Version - After))),
@@ -317,6 +348,63 @@ persist(Expected, Events, Parents, Resolution, #state{directory = Directory, syn
                 {error, _} -> {Failure, Updated}
             end;
         {error, _} -> {Failure, State}
+    end.
+
+snapshot_path(Name, #state{snapshot_directory = Directory}) ->
+    filename:join(Directory, <<(checksum(Name))/binary, ".snapshot">>).
+
+read_snapshot(Path, State) ->
+    case file:read_file(Path) of
+        {ok, <<Count:64/unsigned, Token:64/binary, Bytes/binary>>} ->
+            case snapshot_prefix(State, Count) of
+                {ok, Token} ->
+                    case eventcore_snapshot_wire:decode(Bytes) of
+                        {ok, Value} -> {ok, {some, Value}};
+                        Error -> Error
+                    end;
+                _ -> {ok, none}
+            end;
+        {ok, _} -> {error, nil};
+        {error, enoent} -> {ok, none};
+        {error, _} -> {error, nil}
+    end.
+
+snapshot_prefix(#state{transactions = Transactions, ordered = Reversed}, Count) ->
+    eventcore_filesystem_graph:event_prefix_token(Count, lists:reverse(Reversed), Transactions).
+
+persist_snapshot(Path, Value, #state{snapshot_directory = Directory, sync = Sync,
+                                     streams = Streams} = State) ->
+    Replace = case read_snapshot(Path, State) of
+        {ok, none} -> true;
+        {ok, {some, Previous}} -> eventcore@snapshot:covers(Value, Previous);
+        {error, nil} -> error
+    end,
+    case Replace of
+        false -> {ok, nil};
+        error -> {error, nil};
+        true ->
+            Count = maps:fold(fun(_, {Version, _}, Sum) -> Sum + Version end, 0, Streams),
+            case snapshot_prefix(State, Count) of
+                {ok, Token} ->
+                    Body = eventcore_snapshot_wire:encode(Value),
+                    Bytes = <<Count:64/unsigned, Token/binary, Body/binary>>,
+                    publish_snapshot(Directory, Path, Bytes, Sync);
+                _ -> {error, nil}
+            end
+    end.
+
+publish_snapshot(Directory, Path, Bytes, Sync) ->
+    case ensure_directory(Directory, Sync, fun(Parent) -> sync_directory(Parent, Sync) end) of
+        ok ->
+            case publish_identity(Path, Bytes, Sync) of
+                ok ->
+                    case sync_directory(Directory, Sync) of
+                        ok -> {ok, nil};
+                        _ -> {error, nil}
+                    end;
+                _ -> {error, nil}
+            end;
+        _ -> {error, nil}
     end.
 
 write_transaction(Temp, Path, Bytes, Sync) ->
@@ -444,7 +532,7 @@ index_new_transaction(Id, #{parents := Tips, events := Events, resolution := non
     State#state{transactions = Transactions, revision = map_size(Transactions),
                 ordered = [Id | Reversed], tips = [Id], streams = index_events(Events, Streams)};
 index_new_transaction(_Id, _Record, Transactions, State) ->
-    index_transactions(Transactions, State).
+    index_transactions(Transactions, State#state{history_revision = State#state.history_revision + 1}).
 
 index_transactions(Transactions, State) ->
     Ordered = eventcore_filesystem_graph:order(Transactions),

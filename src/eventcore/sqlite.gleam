@@ -1,5 +1,6 @@
 //// SQLite event and projection checkpoint stores.
 
+import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError}
 import eventcore/stream.{type Id, type Version}
 import gleam/dict
@@ -148,6 +149,19 @@ pub fn reset_checkpoint(
   reset(checkpoints.server, name)
 }
 
+pub fn snapshots(events: EventStore(payload)) -> snapshot.Repository {
+  snapshot.Repository(
+    load: fn(key) {
+      load_snapshot(events.server, snapshot.name(key))
+      |> result.replace_error(store.StoreFailure(store.LoadSnapshot))
+    },
+    save: fn(key, value) {
+      save_snapshot(events.server, snapshot.name(key), value)
+      |> result.replace_error(store.StoreFailure(store.SaveSnapshot))
+    },
+  )
+}
+
 pub fn as_store(events: EventStore(payload)) -> Store(payload) {
   store.Store(
     fn(id, version) {
@@ -238,3 +252,16 @@ fn save(
 
 @external(erlang, "eventcore_sqlite_ffi", "reset_checkpoint")
 fn reset(server: Server, name: String) -> Result(Nil, CheckpointError)
+
+@external(erlang, "eventcore_sqlite_ffi", "load_snapshot")
+fn load_snapshot(
+  server: Server,
+  name: String,
+) -> Result(Option(snapshot.Snapshot), Nil)
+
+@external(erlang, "eventcore_sqlite_ffi", "save_snapshot")
+fn save_snapshot(
+  server: Server,
+  name: String,
+  value: snapshot.Snapshot,
+) -> Result(Nil, Nil)

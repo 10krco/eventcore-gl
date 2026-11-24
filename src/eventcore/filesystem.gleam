@@ -1,6 +1,7 @@
 //// Filesystem store with immutable checksummed transactions.
 //// The host must provide the util-linux flock executable on PATH.
 
+import eventcore/snapshot
 import eventcore/store.{
   type Event, type EventStream, type Store, type StoreError,
 }
@@ -243,21 +244,53 @@ fn reconcile_forks(
   }
 }
 
-pub fn as_store(filesystem: Filesystem(payload)) -> Store(payload) {
-  store.Store(
-    fn(id, version) { read_after(filesystem, id, version) },
-    append_events(filesystem, _),
+/// Command checkpoints live in Git-ignored local journal state.
+pub fn snapshots(filesystem: Filesystem(payload)) -> snapshot.Repository {
+  snapshot_repository(filesystem, None)
+}
+
+/// Acquire a store and repository for one command execution. Ordinary appends
+/// retain the view and still use optimistic stream versions. Reconciliation
+/// invalidates it, in which case acquire a fresh view and reconstruct again.
+pub fn command_view(
+  filesystem: Filesystem(payload),
+) -> Result(#(Store(payload), snapshot.Repository), StoreError) {
+  use revision <- result.try(history_revision(filesystem.server))
+  Ok(#(
+    event_store(filesystem, Some(revision)),
+    snapshot_repository(filesystem, Some(revision)),
+  ))
+}
+
+fn snapshot_repository(
+  filesystem: Filesystem(payload),
+  revision: Option(Int),
+) -> snapshot.Repository {
+  snapshot.Repository(
+    load: fn(key) {
+      load_snapshot(filesystem.server, revision, snapshot.name(key))
+    },
+    save: fn(key, value) {
+      save_snapshot(filesystem.server, revision, snapshot.name(key), value)
+    },
   )
 }
 
-fn read_after(
+pub fn as_store(filesystem: Filesystem(payload)) -> Store(payload) {
+  event_store(filesystem, None)
+}
+
+fn event_store(
   filesystem: Filesystem(payload),
-  id: Id,
-  after: Version,
-) -> Result(EventStream(payload), StoreError) {
-  read(filesystem.server, id, stream.event_count(after))
-  |> result.replace_error(store.StoreFailure(store.ReadStream))
-  |> result.map(fn(events) { decode_events(events, filesystem.codec) })
+  revision: Option(Int),
+) -> Store(payload) {
+  store.Store(
+    fn(id, version) {
+      read(filesystem.server, revision, id, stream.event_count(version))
+      |> result.map(fn(events) { decode_events(events, filesystem.codec) })
+    },
+    append_events(filesystem, revision, _),
+  )
 }
 
 fn decode_events(
@@ -283,6 +316,7 @@ fn decode_events(
 
 fn append_events(
   filesystem: Filesystem(payload),
+  revision: Option(Int),
   writes: store.Writes(payload),
 ) -> Result(Nil, StoreError) {
   use events <- result.try(encode_events(
@@ -290,7 +324,7 @@ fn append_events(
     filesystem.codec,
   ))
   let expected = dict.to_list(store.expected_versions(writes))
-  append(filesystem.server, expected, events)
+  append(filesystem.server, revision, expected, events)
 }
 
 fn encode_events(
@@ -348,13 +382,33 @@ fn resolve(
 @external(erlang, "eventcore_filesystem_ffi", "read")
 fn read(
   server: Server,
+  revision: Option(Int),
   id: Id,
   after: Int,
-) -> Result(List(Event(BitArray)), Nil)
+) -> Result(List(Event(BitArray)), StoreError)
 
 @external(erlang, "eventcore_filesystem_ffi", "append")
 fn append(
   server: Server,
+  revision: Option(Int),
   expected: List(#(Id, Version)),
   events: List(Event(BitArray)),
 ) -> Result(Nil, StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "load_snapshot")
+fn load_snapshot(
+  server: Server,
+  revision: Option(Int),
+  name: String,
+) -> Result(Option(snapshot.Snapshot), StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "save_snapshot")
+fn save_snapshot(
+  server: Server,
+  revision: Option(Int),
+  name: String,
+  value: snapshot.Snapshot,
+) -> Result(Nil, StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "history_revision")
+fn history_revision(server: Server) -> Result(Int, StoreError)

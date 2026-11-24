@@ -1,3 +1,4 @@
+import eventcore/snapshot
 import eventcore/sqlite
 import eventcore/store
 import eventcore/stream
@@ -230,3 +231,32 @@ fn ignore_kind(connection: sqlite.Connection) -> Nil
 
 @external(erlang, "eventcore_sqlite_test_ffi", "disable_count_changes")
 fn disable_count_changes(connection: sqlite.Connection) -> Nil
+
+pub fn command_snapshot_reopens_and_prevents_regression_test() {
+  let path = temp_database()
+  let key = case sqlite_test_backend() {
+    "sqlcipher" -> Some("snapshot password")
+    _ -> None
+  }
+  let assert Ok(name) = snapshot.key("command-state")
+  let assert Ok(id) = stream.id("account")
+  let zero = stream.initial_version
+  let one = stream.next_version(zero)
+  let newest = snapshot.Snapshot([snapshot.Checkpoint(id, one, <<5:3>>)])
+  let stale = snapshot.Snapshot([snapshot.Checkpoint(id, zero, <<0>>)])
+  let assert Ok(db) = sqlite.open_file(path, key, binary_codec())
+  assert sqlite.migrate(db) == Ok(Nil)
+  let snapshots = sqlite.snapshots(db)
+  assert snapshots.load(name) == Ok(None)
+  assert snapshots.save(name, newest) == Ok(Nil)
+  assert sqlite.close(db) == Ok(Nil)
+
+  let assert Ok(db) = sqlite.open_file(path, key, binary_codec())
+  let assert Ok(other) = sqlite.open_file(path, key, binary_codec())
+  let snapshots = sqlite.snapshots(db)
+  assert sqlite.snapshots(other).save(name, stale) == Ok(Nil)
+  assert snapshots.load(name) == Ok(Some(newest))
+  assert sqlite.close(other) == Ok(Nil)
+  assert sqlite.close(db) == Ok(Nil)
+  assert delete_database(path) == Nil
+}

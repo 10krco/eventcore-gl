@@ -1,9 +1,12 @@
+import eventcore/command
 import eventcore/filesystem
+import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
 import gleam/bit_array
 import gleam/int
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/result
 import store_contract
 
@@ -699,4 +702,128 @@ pub fn cross_stream_resolution_observes_imported_empty_decisions_test() {
     [left, right, first_output, second_output, late_output],
     remove_root,
   )
+}
+
+pub fn command_snapshot_survives_filesystem_reopen_test() {
+  let root = temp_root()
+  let assert Ok(key) = snapshot.key("account/v1")
+  let assert Ok(id) = stream.id("account")
+  let zero = stream.initial_version
+  let checkpoint =
+    snapshot.Snapshot([
+      snapshot.Checkpoint(id, stream.next_version(zero), <<5:3>>),
+    ])
+  let old = snapshot.Snapshot([snapshot.Checkpoint(id, zero, <<0:3>>)])
+
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let snapshots = filesystem.snapshots(journal)
+  assert snapshots.load(key) == Ok(None)
+  assert snapshots.save(key, checkpoint) == Ok(Nil)
+  let assert Ok(Nil) = filesystem.close(journal)
+
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let snapshots = filesystem.snapshots(journal)
+  assert snapshots.load(key) == Ok(Some(checkpoint))
+  assert snapshots.save(key, old) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(checkpoint))
+  let assert Ok(Nil) = filesystem.close(journal)
+  remove_root(root)
+}
+
+pub fn command_snapshot_invalidates_when_an_import_reorders_its_prefix_test() {
+  let local = temp_root()
+  let upstream = temp_root()
+  let assert Ok(id) = stream.id("account")
+  let assert Ok(other) = stream.id("older")
+  let assert Ok(key) = snapshot.key("account/v1")
+  let zero = stream.initial_version
+  let one = stream.next_version(zero)
+  let assert Ok(journal) = filesystem.open(upstream, codec())
+  let assert Ok(writes) = store.register(store.writes(), other, zero)
+  let assert Ok(writes) = store.append(writes, store.Event(other, "added", 0))
+  assert filesystem.as_store(journal).append_events(writes) == Ok(Nil)
+  assert filesystem.close(journal) == Ok(Nil)
+
+  let assert Ok(journal) = filesystem.open(local, codec())
+  let storage = filesystem.as_store(journal)
+  let assert Ok(writes) = store.register(store.writes(), id, zero)
+  let assert Ok(writes) = store.append(writes, store.Event(id, "added", 1))
+  assert storage.append_events(writes) == Ok(Nil)
+  let checkpoint = snapshot.Snapshot([snapshot.Checkpoint(id, one, <<1>>)])
+  let snapshots = filesystem.snapshots(journal)
+  assert snapshots.save(key, checkpoint) == Ok(Nil)
+  let assert Ok(writes) = store.register(store.writes(), id, one)
+  let assert Ok(writes) = store.append(writes, store.Event(id, "added", 2))
+  assert storage.append_events(writes) == Ok(Nil)
+  assert snapshots.load(key) == Ok(Some(checkpoint))
+  assert filesystem.close(journal) == Ok(Nil)
+
+  copy_transactions(upstream, local)
+  let assert Ok(journal) = filesystem.open(local, codec())
+  assert filesystem.snapshots(journal).load(key) == Ok(None)
+  assert filesystem.close(journal) == Ok(Nil)
+  remove_root(local)
+  remove_root(upstream)
+}
+
+pub fn command_view_rejects_a_commit_after_reconciliation_test() {
+  let left = temp_root()
+  let right = temp_root()
+  let assert Ok(forked) = stream.id("forked")
+  let assert Ok(output) = stream.id("output")
+  let assert Ok(key) = snapshot.key("reconciled")
+  let zero = stream.initial_version
+  let assert Ok(a) = filesystem.open(left, codec())
+  let assert Ok(b) = filesystem.open(right, codec())
+  append_value(a, forked, zero, 1)
+  append_value(b, forked, zero, 2)
+  assert filesystem.close(a) == Ok(Nil)
+  assert filesystem.close(b) == Ok(Nil)
+  copy_transactions(right, left)
+
+  let assert Ok(a) = filesystem.open(left, codec())
+  let assert Ok(#(storage, snapshots)) = filesystem.command_view(a)
+  append_value(a, output, zero, 3)
+  let assert Ok(tail) = storage.read_after(output, zero)
+  assert store.collect(tail) == Ok([store.Event(output, "added", 3)])
+  let snapshot_codec =
+    snapshot.Codec(fn(total) { Ok(<<total:32>>) }, fn(bytes) {
+      case bytes {
+        <<total:32>> -> Ok(total)
+        _ -> Error("invalid total")
+      }
+    })
+  let logic =
+    command.Command(
+      streams: command.single(output),
+      initial_state: fn() { 0 },
+      apply: fn(total, event) { total + event.payload },
+      discover: fn(_) { [] },
+      handle: fn(total) {
+        assert filesystem.reconcile(a, fn(_) { filesystem.Resolve([]) })
+          == Ok(filesystem.ReconcileReport(1, []))
+        Ok([store.Event(output, "added", total)])
+      },
+    )
+  assert command.execute_with_snapshot(
+      storage,
+      logic,
+      command.default_policy(),
+      snapshots,
+      key,
+      snapshot_codec,
+    )
+    == Error(command.StorageError(store.JournalHistoryChanged))
+  assert snapshots.load(key) == Error(store.JournalHistoryChanged)
+  assert snapshots.save(key, snapshot.Snapshot([]))
+    == Error(store.JournalHistoryChanged)
+  let assert Error(store.JournalHistoryChanged) =
+    storage.read_after(output, zero)
+
+  let assert Ok(#(fresh, _)) = filesystem.command_view(a)
+  let assert Ok(tail) = fresh.read_after(output, zero)
+  assert store.collect(tail) == Ok([store.Event(output, "added", 3)])
+  assert filesystem.close(a) == Ok(Nil)
+  remove_root(left)
+  remove_root(right)
 }
