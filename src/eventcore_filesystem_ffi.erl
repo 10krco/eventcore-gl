@@ -1,24 +1,31 @@
 -module(eventcore_filesystem_ffi).
 -behaviour(gen_server).
--export([start/2, start/3, stop/1, status/1, read/3, append/3]).
+-export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
+         replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
-    owner, lock, directory, sync,
+    owner, lock, directory, sync, replica,
+    transactions = #{}, ordered = [], revision = 0,
     streams = #{}, tips = [],
     integrity_failures = [], dangling = []
 }).
 
 start(Root, Sync) ->
-    start(Root, Sync, fun(Directory) -> sync_directory(Directory, Sync) end).
+    start_with_replica(Root, Sync, none).
+
+start_with_replica(Root, Sync, Replica) ->
+    start_server(Root, Sync, Replica, fun(Directory) -> sync_directory(Directory, Sync) end).
 
 % Accept a sync function to exercise open failures in the Erlang tests.
 start(Root, Sync, SyncAncestor) ->
-    case gen_server:start(?MODULE, {self(), Root, Sync, SyncAncestor}, []) of
+    start_server(Root, Sync, none, SyncAncestor).
+
+start_server(Root, Sync, Replica, SyncAncestor) ->
+    case gen_server:start(?MODULE, {self(), Root, Sync, Replica, SyncAncestor}, []) of
         {ok, Pid} -> {ok, Pid};
         {error, {shutdown, store_locked}} -> {error, store_locked};
         {error, {shutdown, lock_executable_missing}} -> {error, lock_executable_missing};
-        {error, {shutdown, conflicting_history}} -> {error, conflicting_history};
         {error, _} -> {error, cannot_open}
     end.
 
@@ -29,7 +36,13 @@ stop(Pid) ->
         exit:_ -> {error, nil}
     end.
 
-status(Pid) -> call(Pid, status, {error, nil}).
+status(Pid) -> call(Pid, status, {error, journal_unavailable}).
+replica_id(Pid) -> call(Pid, replica_id, {error, journal_unavailable}).
+forks(Pid) -> call(Pid, forks, {error, journal_unavailable}).
+topology_generation(Pid) -> call(Pid, topology_generation, {error, journal_unavailable}).
+fork_snapshot(Pid) -> call(Pid, fork_snapshot, {error, journal_unavailable}).
+resolve(Pid, Revision, Fork, Events) ->
+    call(Pid, {resolve, Revision, Fork, Events}, {error, journal_unavailable}).
 read(Pid, Id, After) -> call(Pid, {read, Id, After}, {error, nil}).
 append(Pid, Expected, Events) ->
     call(Pid, {append, Expected, Events}, {error, {store_failure, append_events}}).
@@ -40,7 +53,7 @@ call(Pid, Request, Failure) ->
         exit:_ -> Failure
     end.
 
-init({Owner, RequestedRoot, Sync, SyncAncestor}) ->
+init({Owner, RequestedRoot, Sync, Replica, SyncAncestor}) ->
     process_flag(trap_exit, true),
     Root = filename:absname(RequestedRoot),
     Directory = filename:join(Root, <<"events">>),
@@ -50,7 +63,7 @@ init({Owner, RequestedRoot, Sync, SyncAncestor}) ->
                 {ok, Lock} ->
                     State = #state{owner = monitor(process, Owner), lock = Lock,
                                    directory = Directory, sync = Sync},
-                    case prepare(Root, State) of
+                    case prepare(Root, Replica, State) of
                         {ok, Loaded} -> {ok, Loaded};
                         {error, Reason} ->
                             release_lock(Lock),
@@ -80,13 +93,30 @@ sync_ancestors(Path, SyncAncestor) ->
             end
     end.
 
-prepare(Root, #state{sync = Sync} = State) ->
+prepare(Root, Replica, #state{sync = Sync} = State) ->
     case create_metadata(Root) of
         ok ->
-            case sync_directory(Root, Sync) of
-                ok -> scan(State);
+            Publish = fun(Path, Bytes) -> publish_identity(Path, Bytes, Sync) end,
+            case eventcore_filesystem_replica:load(Root, Replica, Publish) of
+                {ok, Id} ->
+                    case sync_metadata(Root, Replica, Sync) of
+                        ok -> scan(State#state{replica = Id});
+                        Error -> Error
+                    end;
                 Error -> Error
             end;
+        Error -> Error
+    end.
+
+publish_identity(Path, Bytes, Sync) ->
+    Nonce = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
+    Temp = <<Path/binary, ".", Nonce/binary, ".tmp">>,
+    write_transaction(Temp, Path, Bytes, Sync).
+
+sync_metadata(Root, {some, _}, Sync) -> sync_directory(Root, Sync);
+sync_metadata(Root, none, Sync) ->
+    case sync_directory(filename:join(Root, <<".eventcore">>), Sync) of
+        ok -> sync_directory(Root, Sync);
         Error -> Error
     end.
 
@@ -149,18 +179,47 @@ handle_info({'EXIT', Port, _}, #state{lock = Port} = State) ->
 handle_info(_Info, State) -> {noreply, State}.
 
 handle_call(status, _From, #state{integrity_failures = Bad, dangling = Dangling} = State) ->
-    {reply, {ok, {status, Bad, Dangling}}, State};
+    Reply = case detected_forks(State) of
+        {ok, Forks} -> {ok, {status, Bad, Dangling, Forks}};
+        Error -> Error
+    end,
+    {reply, Reply, State};
+handle_call(replica_id, _From, #state{replica = Replica} = State) ->
+    {reply, {ok, Replica}, State};
+handle_call(forks, _From, State) ->
+    {reply, detected_forks(State), State};
+handle_call(topology_generation, _From, #state{transactions = Transactions} = State) ->
+    {reply, {ok, eventcore_filesystem_graph:topology_generation(Transactions)}, State};
+handle_call(fork_snapshot, _From, #state{transactions = Transactions, revision = Revision} = State) ->
+    Reply = case detected_forks(State) of
+        {ok, Forks} -> {ok, {Revision, eventcore_filesystem_graph:fork_contexts(Forks, Transactions)}};
+        Error -> Error
+    end,
+    {reply, Reply, State};
+handle_call({resolve, Revision, _, _}, _From, #state{revision = Current} = State)
+  when Revision =/= Current ->
+    {reply, {error, reconciliation_changed}, State};
+handle_call({resolve, _, _, _}, _From, #state{dangling = [_ | _]} = State) ->
+    {reply, {error, journal_unavailable}, State};
+handle_call({resolve, _, {fork, _, _, Parents}, Events}, _From,
+            #state{streams = Streams} = State) ->
+    Bases = resolution_bases(Events, Streams),
+    case persist(Bases, Events, Parents, State) of
+        {{ok, nil}, Updated} -> {reply, {ok, Updated#state.revision}, Updated};
+        {{error, Failure}, Updated} -> {reply, {error, {journal_store_error, Failure}}, Updated}
+    end;
 handle_call({read, Id, After}, _From, #state{streams = Streams} = State) ->
     {Version, Reversed} = maps:get(Id, Streams, {0, []}),
     Tail = lists:reverse(lists:sublist(Reversed, max(0, Version - After))),
     {reply, {ok, Tail}, State};
 handle_call({append, _, _}, _From, #state{dangling = [_ | _]} = State) ->
     {reply, {error, {store_failure, append_events}}, State};
-handle_call({append, Expected, Events}, _From, #state{streams = Streams} = State) ->
+handle_call({append, Expected, Events}, _From,
+            #state{streams = Streams, tips = Parents} = State) ->
     case check_versions(Expected, Streams) of
         ok when Events =:= [] -> {reply, {ok, nil}, State};
         ok ->
-            {Reply, Updated} = persist(Expected, Events, State),
+            {Reply, Updated} = persist(Expected, Events, Parents, State),
             {reply, Reply, Updated};
         Error -> {reply, {error, Error}, State}
     end.
@@ -172,10 +231,19 @@ check_versions([{Id, {version, Expected}} | Rest], Streams) ->
         {Actual, _} -> {version_conflict, Id, {version, Expected}, {version, Actual}}
     end.
 
-persist(Expected, Events, #state{directory = Directory, sync = Sync,
-                                streams = Streams, tips = Parents} = State) ->
-    Transaction = {1, os:system_time(nanosecond), crypto:strong_rand_bytes(16),
-                   Parents, lists:sort(Expected), Events},
+resolution_bases(Events, Streams) ->
+    Ids = lists:usort([Id || {event, Id, _, _} <- Events]),
+    [{Id, {version, element(1, maps:get(Id, Streams, {0, []}))}} || Id <- Ids].
+
+detected_forks(#state{transactions = Transactions, ordered = Reversed}) ->
+    eventcore_filesystem_graph:forks(Transactions, lists:reverse(Reversed)).
+
+persist(Expected, Events, Parents, #state{directory = Directory, sync = Sync,
+                                         replica = Replica, transactions = Transactions} = State) ->
+    Time = os:system_time(nanosecond),
+    Nonce = crypto:strong_rand_bytes(16),
+    Bases = lists:sort(Expected),
+    Transaction = {2, Time, Replica, Nonce, Parents, Bases, Events},
     Bytes = term_to_binary(Transaction),
     Id = checksum(Bytes),
     Path = filename:join(Directory, <<Id/binary, ".txn">>),
@@ -183,7 +251,8 @@ persist(Expected, Events, #state{directory = Directory, sync = Sync,
     Failure = {error, {store_failure, append_events}},
     case write_transaction(Temp, Path, Bytes, Sync) of
         ok ->
-            Updated = State#state{streams = index_events(Events, Streams), tips = [Id]},
+            Record = transaction_record(Time, Replica, Nonce, Parents, Bases, Events),
+            Updated = index_new_transaction(Id, Record, Transactions#{Id => Record}, State),
             case sync_directory(Directory, Sync) of
                 ok -> {{ok, nil}, Updated};
                 {error, _} -> {Failure, Updated}
@@ -261,21 +330,30 @@ decode_transaction(Id, Bytes) ->
         false -> error;
         true ->
             try binary_to_term(Bytes, [safe, used]) of
-                {{1, Time, Nonce, Parents, Bases, Events} = Transaction, Used}
-                  when Used =:= byte_size(Bytes), is_integer(Time),
-                       is_binary(Nonce), byte_size(Nonce) =:= 16,
-                       is_list(Parents), is_list(Bases), is_list(Events) ->
-                    case valid_list(fun valid_id/1, Parents) andalso
-                         valid_list(fun valid_base/1, Bases) andalso
-                         valid_list(fun valid_event/1, Events) of
-                        true -> {ok, Transaction};
-                        false -> error
-                    end;
+                {{1, Time, Nonce, Parents, Bases, Events}, Used} when Used =:= byte_size(Bytes) ->
+                    validate_transaction(Time, undefined, Nonce, Parents, Bases, Events);
+                {{2, Time, Replica, Nonce, Parents, Bases, Events}, Used}
+                  when Used =:= byte_size(Bytes), is_binary(Replica), byte_size(Replica) > 0 ->
+                    validate_transaction(Time, Replica, Nonce, Parents, Bases, Events);
                 _ -> error
             catch
                 error:badarg -> error
             end
     end.
+
+validate_transaction(Time, Replica, Nonce, Parents, Bases, Events)
+  when is_integer(Time), is_binary(Nonce), byte_size(Nonce) =:= 16 ->
+    case valid_list(fun valid_id/1, Parents) andalso
+         valid_list(fun valid_base/1, Bases) andalso
+         valid_list(fun valid_event/1, Events) of
+        true -> {ok, transaction_record(Time, Replica, Nonce, Parents, Bases, Events)};
+        false -> error
+    end;
+validate_transaction(_, _, _, _, _, _) -> error.
+
+transaction_record(Time, Replica, Nonce, Parents, Bases, Events) ->
+    #{time => Time, replica => Replica, nonce => Nonce, parents => Parents,
+      bases => Bases, events => Events}.
 
 valid_list(_Check, []) -> true;
 valid_list(Check, [Item | Rest]) -> Check(Item) andalso valid_list(Check, Rest);
@@ -291,57 +369,24 @@ valid_event(_) -> false.
 valid_text(Text) -> is_binary(Text) andalso unicode:characters_to_binary(Text) =:= Text.
 
 rebuild(Transactions, Failures, State) ->
-    Ids = lists:sort(maps:keys(Transactions)),
-    {Ranked, _Depths} = lists:mapfoldl(
-        fun(Id, Depths) ->
-            {Depth, Updated} = depth(Id, Transactions, Depths),
-            {1, Time, Nonce, _, _, Events} = maps:get(Id, Transactions),
-            {{Depth, Time, Nonce, Id, Events}, Updated}
-        end, #{}, Ids),
-    Dangling = lists:filtermap(
-        fun(Id) ->
-            {1, _, _, Parents, _, _} = maps:get(Id, Transactions),
-            case [Parent || Parent <- Parents, not maps:is_key(Parent, Transactions)] of
-                [] -> false;
-                Missing -> {true, {dangling, Id, Missing}}
-            end
-        end, Ids),
-    Referenced = maps:fold(
-        fun(_, {1, _, _, Parents, _, _}, Set) ->
-            lists:foldl(fun(Id, Acc) -> Acc#{Id => true} end, Set, Parents)
-        end, #{}, Transactions),
-    Tips = [Id || Id <- Ids, not maps:is_key(Id, Referenced)],
-    case rebuild_streams(lists:sort(Ranked), Transactions, Dangling =:= [], #{}) of
-        {ok, Streams} ->
-            {ok, State#state{streams = Streams, tips = Tips, dangling = Dangling,
-                             integrity_failures = Failures}};
-        Error -> Error
-    end.
+    {ok, index_transactions(Transactions, State#state{integrity_failures = Failures})}.
 
-rebuild_streams([], _, _, Streams) -> {ok, Streams};
-rebuild_streams([{_, _, _, Id, Events} | Rest], Transactions, Complete, Streams) ->
-    {1, _, _, _, Bases, _} = maps:get(Id, Transactions),
-    case Complete andalso check_versions(Bases, Streams) =/= ok of
-        true -> {error, conflicting_history};
-        false -> rebuild_streams(Rest, Transactions, Complete, index_events(Events, Streams))
-    end.
+index_new_transaction(Id, #{parents := Tips, events := Events}, Transactions,
+                      #state{tips = Tips, streams = Streams, ordered = Reversed} = State) ->
+    State#state{transactions = Transactions, revision = map_size(Transactions),
+                ordered = [Id | Reversed], tips = [Id], streams = index_events(Events, Streams)};
+index_new_transaction(_Id, _Record, Transactions, State) ->
+    index_transactions(Transactions, State).
 
-depth(Id, Transactions, Depths) ->
-    case maps:find(Id, Depths) of
-        {ok, Depth} -> {Depth, Depths};
-        error ->
-            {1, _, _, Parents, _, _} = maps:get(Id, Transactions),
-            {Depth, Memo} = lists:foldl(
-                fun(Parent, {Best, Acc}) ->
-                    case maps:is_key(Parent, Transactions) of
-                        true ->
-                            {ParentDepth, Updated} = depth(Parent, Transactions, Acc),
-                            {max(Best, ParentDepth + 1), Updated};
-                        false -> {Best, Acc}
-                    end
-                end, {0, Depths}, Parents),
-            {Depth, Memo#{Id => Depth}}
-    end.
+index_transactions(Transactions, State) ->
+    Ordered = eventcore_filesystem_graph:order(Transactions),
+    Streams = lists:foldl(fun(Id, Index) ->
+        #{events := Events} = maps:get(Id, Transactions),
+        index_events(Events, Index)
+    end, #{}, Ordered),
+    State#state{transactions = Transactions, revision = map_size(Transactions),
+                ordered = lists:reverse(Ordered), streams = Streams, tips = eventcore_filesystem_graph:tips(Transactions),
+                dangling = eventcore_filesystem_graph:dangling(Transactions)}.
 
 index_events(Events, Streams) ->
     lists:foldl(

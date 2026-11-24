@@ -7,7 +7,9 @@ import eventcore/store.{
 import eventcore/stream.{type Id, type Version}
 import gleam/dict
 import gleam/list
+import gleam/option.{type Option, None, Some}
 import gleam/result
+import gleam/string
 
 pub type Sync {
   Full
@@ -29,16 +31,48 @@ pub type Codec(payload) {
 pub type OpenError {
   StoreLocked
   LockExecutableMissing
-  ConflictingHistory
+  InvalidReplicaId
   CannotOpen
 }
 
 pub type Status {
-  Status(integrity_failures: List(String), dangling: List(Dangling))
+  Status(
+    integrity_failures: List(String),
+    dangling: List(Dangling),
+    forks: List(Fork),
+  )
 }
 
 pub type Dangling {
   Dangling(transaction: String, missing_parents: List(String))
+}
+
+pub type Fork {
+  Fork(stream: Id, base_version: Version, transactions: List(String))
+}
+
+pub type Branch(payload) {
+  Branch(transaction: String, events: List(Event(payload)))
+}
+
+pub type ForkContext(payload) {
+  ForkContext(fork: Fork, branches: List(Branch(payload)))
+}
+
+pub type Resolution(payload) {
+  Resolve(events: List(Event(payload)))
+  Unresolvable(reason: String)
+}
+
+pub type ReconcileReport {
+  ReconcileReport(resolved_count: Int, unresolved_streams: List(Id))
+}
+
+pub type JournalError {
+  JournalUnavailable
+  ReplicaIdentityConflict(replica: String, first: String, second: String)
+  ReconciliationChanged
+  JournalStoreError(StoreError)
 }
 
 pub opaque type Filesystem(payload) {
@@ -58,7 +92,26 @@ pub fn open_with_config(
   config: Config,
   codec: Codec(payload),
 ) -> Result(Filesystem(payload), OpenError) {
-  start(config.root, config.sync)
+  open_journal(config, None, codec)
+}
+
+pub fn open_with_replica(
+  config: Config,
+  replica: String,
+  codec: Codec(payload),
+) -> Result(Filesystem(payload), OpenError) {
+  case string.trim(replica) {
+    "" -> Error(InvalidReplicaId)
+    id -> open_journal(config, Some(id), codec)
+  }
+}
+
+fn open_journal(
+  config: Config,
+  replica: Option(String),
+  codec: Codec(payload),
+) -> Result(Filesystem(payload), OpenError) {
+  start(config.root, config.sync, replica)
   |> result.map(Filesystem(_, codec))
 }
 
@@ -67,9 +120,64 @@ pub fn close(filesystem: Filesystem(payload)) -> Result(Nil, StoreError) {
   |> result.replace_error(store.StoreFailure(store.CloseStore))
 }
 
-pub fn status(filesystem: Filesystem(payload)) -> Result(Status, StoreError) {
+pub fn status(filesystem: Filesystem(payload)) -> Result(Status, JournalError) {
   journal_status(filesystem.server)
-  |> result.replace_error(store.StoreFailure(store.ReadStream))
+}
+
+pub fn replica_id(
+  filesystem: Filesystem(payload),
+) -> Result(String, JournalError) {
+  journal_replica_id(filesystem.server)
+}
+
+pub fn detect_forks(
+  filesystem: Filesystem(payload),
+) -> Result(List(Fork), JournalError) {
+  journal_forks(filesystem.server)
+}
+
+pub fn topology_generation(
+  filesystem: Filesystem(payload),
+) -> Result(Int, JournalError) {
+  journal_topology_generation(filesystem.server)
+}
+
+/// The resolver runs in the caller. If the graph changes before a resolution
+/// can be recorded, reconcile returns ReconciliationChanged. Earlier
+/// resolutions in this call remain committed.
+pub fn reconcile(
+  filesystem: Filesystem(payload),
+  resolver: fn(ForkContext(payload)) -> Resolution(payload),
+) -> Result(ReconcileReport, JournalError) {
+  use #(revision, contexts) <- result.try(fork_snapshot(filesystem.server))
+  use #(_, resolved, unresolved) <- result.try(
+    list.try_fold(contexts, #(revision, 0, []), fn(progress, entry) {
+      let #(revision, resolved, unresolved) = progress
+      let #(fork, encoded) = entry
+      use branches <- result.try(
+        list.try_map(encoded, fn(branch) {
+          store.collect(decode_events(branch.1, filesystem.codec))
+          |> result.map(Branch(branch.0, _))
+          |> result.map_error(JournalStoreError)
+        }),
+      )
+      case resolver(ForkContext(fork, branches)) {
+        Unresolvable(_) ->
+          Ok(#(revision, resolved, [fork.stream, ..unresolved]))
+        Resolve(events) -> {
+          use events <- result.try(
+            encode_events(events, filesystem.codec)
+            |> result.map_error(JournalStoreError),
+          )
+          resolve(filesystem.server, revision, fork, events)
+          |> result.map(fn(next_revision) {
+            #(next_revision, resolved + 1, unresolved)
+          })
+        }
+      }
+    }),
+  )
+  Ok(ReconcileReport(resolved, list.reverse(unresolved)))
 }
 
 pub fn as_store(filesystem: Filesystem(payload)) -> Store(payload) {
@@ -114,26 +222,62 @@ fn append_events(
   filesystem: Filesystem(payload),
   writes: store.Writes(payload),
 ) -> Result(Nil, StoreError) {
-  use events <- result.try(
-    store.entries(writes)
-    |> list.try_map(fn(event) {
-      filesystem.codec.encode(event.kind, event.payload)
-      |> result.map(store.Event(event.stream, event.kind, _))
-      |> result.map_error(store.SerializationFailed(event.stream, _))
-    }),
-  )
+  use events <- result.try(encode_events(
+    store.entries(writes),
+    filesystem.codec,
+  ))
   let expected = dict.to_list(store.expected_versions(writes))
   append(filesystem.server, expected, events)
 }
 
-@external(erlang, "eventcore_filesystem_ffi", "start")
-fn start(root: String, sync: Sync) -> Result(Server, OpenError)
+fn encode_events(
+  events: List(Event(payload)),
+  codec: Codec(payload),
+) -> Result(List(Event(BitArray)), StoreError) {
+  list.try_map(events, fn(event) {
+    codec.encode(event.kind, event.payload)
+    |> result.map(store.Event(event.stream, event.kind, _))
+    |> result.map_error(store.SerializationFailed(event.stream, _))
+  })
+}
+
+@external(erlang, "eventcore_filesystem_ffi", "start_with_replica")
+fn start(
+  root: String,
+  sync: Sync,
+  replica: Option(String),
+) -> Result(Server, OpenError)
 
 @external(erlang, "eventcore_filesystem_ffi", "stop")
 fn stop(server: Server) -> Result(Nil, Nil)
 
 @external(erlang, "eventcore_filesystem_ffi", "status")
-fn journal_status(server: Server) -> Result(Status, Nil)
+fn journal_status(server: Server) -> Result(Status, JournalError)
+
+@external(erlang, "eventcore_filesystem_ffi", "replica_id")
+fn journal_replica_id(server: Server) -> Result(String, JournalError)
+
+@external(erlang, "eventcore_filesystem_ffi", "forks")
+fn journal_forks(server: Server) -> Result(List(Fork), JournalError)
+
+@external(erlang, "eventcore_filesystem_ffi", "topology_generation")
+fn journal_topology_generation(server: Server) -> Result(Int, JournalError)
+
+@external(erlang, "eventcore_filesystem_ffi", "fork_snapshot")
+fn fork_snapshot(
+  server: Server,
+) -> Result(
+  #(Int, List(#(Fork, List(#(String, List(Event(BitArray))))))),
+  JournalError,
+)
+
+@external(erlang, "eventcore_filesystem_ffi", "resolve")
+fn resolve(
+  server: Server,
+  revision: Int,
+  fork: Fork,
+  events: List(Event(BitArray)),
+) -> Result(Int, JournalError)
 
 @external(erlang, "eventcore_filesystem_ffi", "read")
 fn read(
