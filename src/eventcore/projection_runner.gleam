@@ -155,7 +155,7 @@ fn validate(config: Config) -> Result(Nil, RunError(error)) {
     config.poll_interval >= 0
     && config.empty_backoff >= 0
     && config.poll_failure_backoff >= 0
-    && config.poll_retries > 0
+    && config.poll_retries >= 0
     && config.event_retries >= 0
     && config.event_retry_delay >= 0
     && config.event_retry_delay <= 18_446_744_073_709_551_615

@@ -173,6 +173,25 @@ pub fn poll_failure_retries_are_bounded_without_checkpoint_advance_test() {
   assert process.receive(attempts, 0) == Ok(None)
   assert process.receive(attempts, 0) == Ok(None)
   assert process.receive(attempts, 0) == Error(Nil)
+
+  let delays = process.new_subject()
+  let no_retries = runner.Config(..runner.default_config, poll_retries: 0)
+  let control =
+    runner.Control(fn(delay) {
+      process.send(delays, delay)
+      True
+    })
+  assert runner.run(
+      runner.Backend(..backend, reader: reader),
+      projector,
+      no_retries,
+      control,
+    )
+    == Error(runner.PollFailed(failure))
+  assert process.receive(attempts, 0) == Ok(None)
+  assert process.receive(attempts, 0) == Error(Nil)
+  assert process.receive(delays, 0) == Ok(0)
+  assert process.receive(delays, 0) == Error(Nil)
   assert backend.checkpoints.load("orders") == Ok(None)
   assert memory.close(memory) == Ok(Nil)
 }
