@@ -32,8 +32,9 @@ streams can advance while a fork remains open.
 Run the resolver in the caller. Recheck the graph revision in the journal
 server when committing a resolution. Include the latest local publication
 as a causal parent. When a resolution writes another stream, its parents
-include the transactions that contributed that stream's current version.
-Refresh the remaining forks after each resolution.
+include the writes that contributed that stream's current version and its
+resolution records, including empty decisions. Compute ownership in canonical
+order and walk each owner's ancestry once when finding its frontier. Refresh the remaining forks after each resolution.
 Report a concurrent revision change so the caller can inspect current
 branches again.
 

@@ -637,3 +637,66 @@ pub fn cross_stream_resolution_follows_the_imported_output_history_test() {
   remove_root(right)
   remove_root(third)
 }
+
+pub fn cross_stream_resolution_observes_imported_empty_decisions_test() {
+  let left = temp_root()
+  let right = temp_root()
+  let first_output = temp_root()
+  let second_output = temp_root()
+  let late_output = temp_root()
+  let assert Ok(id) = stream.id("resolved")
+  let assert Ok(output) = stream.id("output")
+  let zero = stream.initial_version
+  let assert Ok(a) = filesystem.open(left, codec())
+  let assert Ok(b) = filesystem.open(right, codec())
+  let assert Ok(c) = filesystem.open(first_output, codec())
+  let assert Ok(d) = filesystem.open(second_output, codec())
+  let assert Ok(e) = filesystem.open(late_output, codec())
+  append_value(a, id, zero, 10)
+  append_value(b, id, zero, 20)
+  append_value(c, output, zero, 1)
+  append_value(d, output, zero, 2)
+  append_value(e, output, zero, 4)
+  assert filesystem.close(a) == Ok(Nil)
+  assert filesystem.close(b) == Ok(Nil)
+  assert filesystem.close(c) == Ok(Nil)
+  assert filesystem.close(d) == Ok(Nil)
+  assert filesystem.close(e) == Ok(Nil)
+
+  copy_transactions(second_output, first_output)
+  let assert Ok(c) = filesystem.open(first_output, codec())
+  assert filesystem.reconcile(c, fn(_) { filesystem.Resolve([]) })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert filesystem.close(c) == Ok(Nil)
+
+  copy_transactions(right, left)
+  copy_transactions(first_output, left)
+  let assert Ok(a) = filesystem.open(left, codec())
+  assert filesystem.reconcile(a, fn(_) {
+      filesystem.Resolve([store.Event(output, "resolution", 3)])
+    })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert filesystem.close(a) == Ok(Nil)
+
+  copy_transactions(late_output, left)
+  let assert Ok(a) = filesystem.open(left, codec())
+  assert filesystem.reconcile(a, fn(context) {
+      let filesystem.Fork(stream_id, _, _) = context.fork
+      assert stream_id == output
+      let values =
+        list.map(context.branches, fn(branch) {
+          list.sort(
+            list.map(branch.events, fn(event) { event.payload }),
+            int.compare,
+          )
+        })
+      assert values == [[1, 2, 3], [4]] || values == [[4], [1, 2, 3]]
+      filesystem.Resolve([])
+    })
+    == Ok(filesystem.ReconcileReport(1, []))
+  assert filesystem.close(a) == Ok(Nil)
+  list.each(
+    [left, right, first_output, second_output, late_output],
+    remove_root,
+  )
+}

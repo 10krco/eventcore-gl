@@ -220,7 +220,7 @@ handle_call({resolve, _, {fork, Stream, Base, Heads} = Fork, Events}, _From,
                 true ->
                     Bases = resolution_bases(Events, Streams),
                     OtherStreams = maps:from_keys([Id || {Id, _} <- Bases, Id =/= Stream], true),
-                    Dependencies = writing_transactions(OtherStreams, Transactions),
+                    Dependencies = stream_dependencies(OtherStreams, Transactions),
                     Parents = lists:usort(Heads ++ Dependencies ++ latest_local_transaction(State)),
                     OtherContested = maps:remove(Stream, Contested),
                     case check_contested(Events, OtherContested) of
@@ -275,10 +275,14 @@ check_versions([{Id, {version, Expected}} | Rest], Streams) ->
         {Actual, _} -> {version_conflict, Id, {version, Expected}, {version, Actual}}
     end.
 
-writing_transactions(Streams, _Transactions) when map_size(Streams) =:= 0 -> [];
-writing_transactions(Streams, Transactions) ->
-    [Id || Id := #{events := Events} <- Transactions,
-           lists:any(fun({event, Stream, _, _}) -> maps:is_key(Stream, Streams) end, Events)].
+stream_dependencies(Streams, _Transactions) when map_size(Streams) =:= 0 -> [];
+stream_dependencies(Streams, Transactions) ->
+    [Id || Id := #{events := Events, resolution := Resolution} <- Transactions,
+           lists:any(fun({event, Stream, _, _}) -> maps:is_key(Stream, Streams) end, Events)
+           orelse resolves_stream(Resolution, Streams)].
+
+resolves_stream(none, _) -> false;
+resolves_stream({{Stream, _}, _}, Streams) -> maps:is_key(Stream, Streams).
 
 resolution_bases(Events, Streams) ->
     Ids = lists:usort([Id || {event, Id, _, _} <- Events]),

@@ -140,17 +140,16 @@ add_claim(Key, Claim, Groups) ->
 
 branches(Stream, Claims, Transactions, Order) ->
     ClaimMap = maps:from_list(Claims),
-    Owners = lists:foldl(fun(Id, Acc) ->
-        case branch_owner(Id, Stream, ClaimMap, Transactions) of
-            none -> Acc;
-            Owner -> Acc#{Id => Owner}
-        end
-    end, #{}, Order),
+    AcceptedByClaim = maps:map(fun(_, AcceptedHeads) ->
+        ordsets:from_list([Claim || Claim := _ <- ClaimMap,
+            lists:any(fun(Head) -> covers(Claim, Head, Transactions) end, AcceptedHeads)])
+    end, ClaimMap),
+    Owners = branch_ownership(Stream, ClaimMap, AcceptedByClaim, Transactions, Order),
     ByOwner = maps:groups_from_list(fun(Id) -> maps:get(Id, Owners) end, maps:keys(Owners)),
-    ResolvedBy = lists:append(maps:values(ClaimMap)),
-    Heads = lists:sort([Id || Members <- maps:values(ByOwner), Id <- Members,
-        not lists:any(fun(Other) -> ancestor(Id, Other, Transactions) end, Members),
-        not lists:any(fun(Head) -> covers(Id, Head, Transactions) end, ResolvedBy)]),
+    AcceptedHeads = lists:append(maps:values(ClaimMap)),
+    Covered = lists:foldl(fun(Id, Acc) -> mark_ancestry([Id], Transactions, Acc) end,
+                          #{}, AcceptedHeads),
+    Heads = branch_frontier(lists:reverse(Order), Owners, Covered, Transactions),
     case Heads of
         [_, _ | _] ->
             [{Id, branch_history(Id, Stream, ClaimMap, Owners, ByOwner, Transactions, Order)}
@@ -158,18 +157,57 @@ branches(Stream, Claims, Transactions, Order) ->
         _ -> []
     end.
 
-branch_owner(Id, Stream, Claims, Transactions) ->
-    case maps:is_key(Id, Claims) of
-        true -> Id;
-        false ->
-            case branch_events(Stream, Id, Transactions) of
-                [] -> none;
-                [_ | _] ->
-                    case branch_owners(Id, Claims, Transactions) of
-                        [Owner] -> Owner;
-                        _ -> none
-                    end
-            end
+% Each transaction inherits the claims observed by its parents. Subtract the
+% claims accepted by its observed decisions before assigning ordinary writes.
+branch_ownership(Stream, Claims, AcceptedByClaim, Transactions, Order) ->
+    {Owners, _} = lists:foldl(fun(Id, {Current, Observed}) ->
+        #{parents := Parents} = maps:get(Id, Transactions),
+        Inherited = lists:foldl(fun(Parent, Acc) ->
+            ordsets:union(Acc, maps:get(Parent, Observed, []))
+        end, [], Parents),
+        case maps:is_key(Id, Claims) of
+            true -> {Current#{Id => Id}, Observed#{Id => ordsets:add_element(Id, Inherited)}};
+            false ->
+                case branch_events(Stream, Id, Transactions) of
+                    [] -> {Current, Observed#{Id => Inherited}};
+                    [_ | _] ->
+                        Accepted = ordsets:union([maps:get(Claim, AcceptedByClaim) || Claim <- Inherited]),
+                        case ordsets:subtract(Inherited, Accepted) of
+                            [Owner] -> {Current#{Id => Owner}, Observed#{Id => Inherited}};
+                            _ -> {Current, Observed#{Id => Inherited}}
+                        end
+                end
+        end
+    end, {#{}, #{}}, Order),
+    Owners.
+
+% Walk newest first. For each owner, mark its heads' ancestors once so that a
+% long resolved suffix does not require pairwise ancestry checks.
+branch_frontier(Reversed, Owners, Covered, Transactions) ->
+    {Heads, _} = lists:foldl(fun(Id, {Heads, ByOwner} = Acc) ->
+        case maps:find(Id, Owners) of
+            error -> Acc;
+            {ok, Owner} ->
+                Seen = maps:get(Owner, ByOwner, #{}),
+                case maps:is_key(Id, Seen) of
+                    true -> Acc;
+                    false ->
+                        Updated = ByOwner#{Owner => mark_ancestry([Id], Transactions, Seen)},
+                        case maps:is_key(Id, Covered) of
+                            true -> {Heads, Updated};
+                            false -> {[Id | Heads], Updated}
+                        end
+                end
+        end
+    end, {[], #{}}, Reversed),
+    lists:sort(Heads).
+
+mark_ancestry([], _, Seen) -> Seen;
+mark_ancestry([Id | Rest], Transactions, Seen) ->
+    case {maps:is_key(Id, Seen), maps:find(Id, Transactions)} of
+        {false, {ok, #{parents := Parents}}} ->
+            mark_ancestry(Parents ++ Rest, Transactions, Seen#{Id => true});
+        _ -> mark_ancestry(Rest, Transactions, Seen)
     end.
 
 branch_history(Head, Stream, Claims, Owners, ByOwner, Transactions, Order) ->
@@ -188,14 +226,6 @@ branch_evidence([Head | Rest], Claims, Owners, ByOwner, Transactions, Evidence) 
             branch_evidence(Accepted ++ Rest, Claims, Owners, ByOwner, Transactions, Known);
         _ -> branch_evidence(Rest, Claims, Owners, ByOwner, Transactions, Evidence)
     end.
-
-% A resolution supersedes its accepted branches only for descendants that
-% actually observed it. Imported extensions can therefore reopen the fork.
-branch_owners(Id, Claims, Transactions) ->
-    Ancestors = [{Claim, Heads} || Claim := Heads <- Claims, ancestor(Claim, Id, Transactions)],
-    Accepted = lists:append([Heads || {_, Heads} <- Ancestors]),
-    [Claim || {Claim, _} <- Ancestors,
-              not lists:any(fun(Head) -> covers(Claim, Head, Transactions) end, Accepted)].
 
 covers(Id, Id, _) -> true;
 covers(Ancestor, Id, Transactions) -> ancestor(Ancestor, Id, Transactions).
