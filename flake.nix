@@ -7,6 +7,12 @@
     let
       system = "x86_64-linux";
       pkgs = nixpkgs.legacyPackages.${system};
+      # Resolve the driver's -lsqlite3 to the pinned SQLCipher library.
+      sqlcipherSqlite = pkgs.runCommand "sqlcipher-sqlite-compat" { } ''
+        mkdir -p "$out/include" "$out/lib"
+        ln -s ${pkgs.lib.getDev pkgs.sqlcipher}/include/sqlcipher/sqlite3.h "$out/include/sqlite3.h"
+        printf 'INPUT ( %s/lib/libsqlcipher.so )\n' ${pkgs.lib.getLib pkgs.sqlcipher} > "$out/lib/libsqlite3.so"
+      '';
       tiber = pkgs.stdenv.mkDerivation rec {
         pname = "tiber";
         version = "1.5.1";
@@ -24,6 +30,9 @@
       };
     in {
       devShells.${system}.default = pkgs.mkShell {
+        USE_SYSTEM_SQLITE = "1";
+        CFLAGS = "-I${sqlcipherSqlite}/include";
+        LDFLAGS = "-L${sqlcipherSqlite}/lib";
         packages = with pkgs; [ gleam beamPackages.erlang beamPackages.rebar3 lefthook git gh tiber util-linux ];
       };
     };

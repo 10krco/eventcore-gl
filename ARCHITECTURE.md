@@ -50,3 +50,14 @@ Later imports can reopen a fork, and resolvers can inspect the evidence
 accepted by earlier resolutions. Projections can compare an event-prefix
 fingerprint after importing history and rebuild when the consumed prefix
 changes. See [ADR 0005](docs/decisions/0005-filesystem-reconciliation.md).
+
+## SQLite storage
+
+One OTP server owns each SQLite connection and serializes work on it. Each
+append uses an immediate SQLite transaction to check every expected stream
+version and write the complete batch. SQLite arbitrates between independent
+connections. Event rows have per-stream versions and a global sequence.
+Explicit migrations create the event and checkpoint tables. A checkpoint
+store can also use its own database. File opens apply any encryption key
+and validate it before enabling WAL. Supplied connections retain their
+pragmas. See [ADR 0006](docs/decisions/0006-sqlite-storage.md).
