@@ -4,6 +4,17 @@ import eventcore/store
 import eventcore/stream
 import gleam/dict
 
+type Notifications(value)
+
+@external(erlang, "eventcore_command_test_ffi", "notifications")
+fn notifications() -> Notifications(value)
+
+@external(erlang, "eventcore_command_test_ffi", "record")
+fn record(notifications: Notifications(value), value: value) -> Nil
+
+@external(erlang, "eventcore_command_test_ffi", "drain")
+fn drain(notifications: Notifications(value)) -> List(value)
+
 pub fn declarations_validate_and_preserve_uniqueness_test() {
   let assert Ok(id) = stream.id("account")
   let assert Error(command.EmptyDeclarations) = command.declare([])
@@ -19,18 +30,24 @@ pub fn discovers_participants_and_replays_after_conflicts_test() {
   let assert Ok(initial_peer) = stream.id("initial-peer")
   let assert Ok(secondary) = stream.id("secondary")
   let assert Ok(tertiary) = stream.id("tertiary")
+  let assert Ok(replacement) = stream.id("replacement")
   let zero = stream.initial_version
   let one = stream.next_version(zero)
   let assert Ok(seed) = store.register(store.writes(), primary, zero)
   let assert Ok(seed) = store.append(seed, store.Event(primary, "opened", 100))
   let assert Ok(seed) = store.register(seed, secondary, zero)
   let assert Ok(seed) = store.append(seed, store.Event(secondary, "opened", 20))
+  let assert Ok(seed) = store.register(seed, replacement, zero)
+  let assert Ok(seed) =
+    store.append(seed, store.Event(replacement, "opened", 25))
   let assert Ok(Nil) = storage.append_events(seed)
 
   let instrumented =
     store.Store(storage.read_after, fn(writes) {
       case dict.get(store.expected_versions(writes), primary) {
         Ok(version) if version == one -> {
+          assert dict.has_key(store.expected_versions(writes), secondary)
+          assert !dict.has_key(store.expected_versions(writes), replacement)
           let assert Ok(concurrent) =
             store.register(store.writes(), primary, one)
           let assert Ok(concurrent) =
@@ -38,7 +55,12 @@ pub fn discovers_participants_and_replays_after_conflicts_test() {
           let assert Ok(Nil) = storage.append_events(concurrent)
           storage.append_events(writes)
         }
-        _ -> storage.append_events(writes)
+        _ -> {
+          assert !dict.has_key(store.expected_versions(writes), secondary)
+          assert dict.get(store.expected_versions(writes), replacement)
+            == Ok(one)
+          storage.append_events(writes)
+        }
       }
     })
 
@@ -50,17 +72,18 @@ pub fn discovers_participants_and_replays_after_conflicts_test() {
       apply: fn(applied, event) { [event.payload, ..applied] },
       discover: fn(applied) {
         case applied {
-          [20, ..] -> [tertiary, primary]
-          [100, ..] | [5, 100, ..] -> [secondary, initial_peer, secondary]
+          [20, ..] | [25, ..] -> [tertiary, primary]
+          [100, ..] -> [secondary, initial_peer, secondary]
+          [5, 100] -> [replacement]
           _ -> []
         }
       },
       handle: fn(applied) {
         case applied {
-          [20, 5, 100] ->
+          [25, 5, 100] ->
             Ok([
               store.Event(primary, "debited", -30),
-              store.Event(secondary, "credited", 30),
+              store.Event(replacement, "credited", 30),
             ])
           [20, 100] -> Ok([store.Event(primary, "debited", -40)])
           _ -> Error(command.BusinessRule("unexpected reconstruction"))
@@ -71,22 +94,22 @@ pub fn discovers_participants_and_replays_after_conflicts_test() {
   let context =
     command.RetryContext([primary, initial_peer, secondary, tertiary], 1, 0)
   let assert Ok(policy) = command.retry_policy(1, command.Fixed(0))
+  let retries = notifications()
+  let traces = notifications()
   let policy =
     policy
-    |> command.with_metrics(fn(actual) {
-      assert actual == context
-    })
-    |> command.with_trace(fn(trace) {
-      case trace {
-        command.Retrying(actual) -> {
-          assert actual == context
-        }
-        _ -> Nil
-      }
-    })
+    |> command.with_metrics(record(retries, _))
+    |> command.with_trace(record(traces, _))
 
   assert command.execute(instrumented, transfer, policy)
     == Ok(command.Execution(2))
+  assert drain(retries) == [context]
+  assert drain(traces)
+    == [
+      command.ExecutionStarted,
+      command.Retrying(context),
+      command.CommandSucceeded(2),
+    ]
   let assert Ok(events) = store.read_stream(storage, primary)
   assert store.collect(events)
     == Ok([
@@ -95,10 +118,12 @@ pub fn discovers_participants_and_replays_after_conflicts_test() {
       store.Event(primary, "debited", -30),
     ])
   let assert Ok(events) = store.read_stream(storage, secondary)
+  assert store.collect(events) == Ok([store.Event(secondary, "opened", 20)])
+  let assert Ok(events) = store.read_stream(storage, replacement)
   assert store.collect(events)
     == Ok([
-      store.Event(secondary, "opened", 20),
-      store.Event(secondary, "credited", 30),
+      store.Event(replacement, "opened", 25),
+      store.Event(replacement, "credited", 30),
     ])
   assert memory.close(pid) == Ok(Nil)
 }
@@ -141,6 +166,11 @@ pub fn retry_default_and_exhaustion_test() {
     })
   assert command.execute(storage, operation, policy)
     == Error(command.ConcurrencyError(4))
+
+  let assert Ok(zero_delay) = command.retry_policy(65, command.Exponential(0))
+  let zero_delay = command.with_trace(zero_delay, fn(_) { Nil })
+  assert command.execute(storage, operation, zero_delay)
+    == Error(command.ConcurrencyError(65))
 }
 
 pub fn business_rejections_and_storage_errors_are_terminal_test() {

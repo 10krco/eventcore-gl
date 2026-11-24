@@ -265,6 +265,7 @@ const max_delay = 18_446_744_073_709_551_615
 fn delay_ms(backoff: Backoff, exponent: Int) -> Int {
   case backoff {
     Fixed(delay) -> delay
+    Exponential(0) -> 0
     Exponential(base) -> {
       let jitter = 1.0 +. { float.random() -. 0.5 } *. 0.4
       let delay = exponential_delay(base, exponent)
