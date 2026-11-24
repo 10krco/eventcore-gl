@@ -8,23 +8,41 @@ fn binary_codec() -> sqlite.Codec(BitArray) {
   sqlite.Codec(fn(_, value) { Ok(value) }, fn(_, bytes) { Ok(bytes) })
 }
 
+fn integer_codec() -> sqlite.Codec(Int) {
+  sqlite.Codec(fn(_, value) { Ok(<<value:32>>) }, fn(_, bytes) {
+    case bytes {
+      <<value:32>> -> Ok(value)
+      _ -> Error("expected a 32-bit integer")
+    }
+  })
+}
+
 pub fn memory_contract_test() {
-  let assert Ok(db) =
-    sqlite.open_memory(
-      sqlite.Codec(fn(_, value) { Ok(<<value:32>>) }, fn(_, bytes) {
-        case bytes {
-          <<value:32>> -> Ok(value)
-          _ -> Error("expected a 32-bit integer")
-        }
-      }),
-    )
+  let assert Ok(db) = sqlite.open_memory(integer_codec())
   assert sqlite.migrate(db) == Ok(Nil)
   assert sqlite.migrate(db) == Ok(Nil)
   store_contract.check_atomic_streams(sqlite.as_store(db))
   assert sqlite.close(db) == Ok(Nil)
 }
 
-pub fn encrypted_database_and_checkpoints_reopen_test() {
+pub fn encryption_matches_the_selected_backend_test() {
+  case sqlite_test_backend() {
+    "sqlcipher" -> encrypted_database_and_checkpoints_reopen()
+    "plain" -> {
+      let path = temp_database()
+      let key = Some("passphrase")
+      let assert Error(sqlite.EncryptionUnavailable) =
+        sqlite.open_file(path, key, binary_codec())
+      assert sqlite.open_checkpoints(path, key)
+        == Error(sqlite.EncryptionUnavailable)
+      assert delete_database(path) == Nil
+    }
+    _ ->
+      panic as "Expected EVENTCORE_SQLITE_TEST_BACKEND to be plain or sqlcipher"
+  }
+}
+
+fn encrypted_database_and_checkpoints_reopen() {
   let path = temp_database()
   let key = Some("a'quoted λ passphrase")
   let codec = binary_codec()
@@ -65,16 +83,67 @@ pub fn encrypted_database_and_checkpoints_reopen_test() {
 @external(erlang, "eventcore_sqlite_test_ffi", "temp_database")
 fn temp_database() -> String
 
+@external(erlang, "eventcore_sqlite_test_ffi", "sqlite_test_backend")
+fn sqlite_test_backend() -> String
+
 @external(erlang, "eventcore_sqlite_test_ffi", "delete_database")
 fn delete_database(path: String) -> Nil
 
 pub fn supplied_connection_keeps_its_pragmas_test() {
   let connection = open_supplied()
-  let assert Ok(db) = sqlite.from_connection(connection, binary_codec())
+  let assert Ok(db) = sqlite.from_connection(connection, integer_codec())
   assert sqlite.migrate(db) == Ok(Nil)
-  assert pragmas(connection) == #(1, "memory")
+  assert pragmas(connection) == #(1, "memory", 1)
+  store_contract.check_atomic_streams(sqlite.as_store(db))
+  assert pragmas(connection) == #(1, "memory", 1)
   assert sqlite.close(db) == Ok(Nil)
 }
+
+pub fn supplied_checkpoint_writes_accept_count_rows_test() {
+  let connection = open_supplied()
+  let assert Ok(checkpoints) = sqlite.checkpoints_from_connection(connection)
+  assert sqlite.migrate_checkpoints(checkpoints) == Ok(Nil)
+  assert sqlite.save_checkpoint(checkpoints, "projection", 1) == Ok(Nil)
+  assert sqlite.save_checkpoint(checkpoints, "projection", 2) == Ok(Nil)
+  assert sqlite.load_checkpoint(checkpoints, "projection") == Ok(Some(2))
+  assert sqlite.reset_checkpoint(checkpoints, "projection") == Ok(Nil)
+  assert sqlite.reset_checkpoint(checkpoints, "projection") == Ok(Nil)
+  assert sqlite.load_checkpoint(checkpoints, "projection") == Ok(None)
+  assert pragmas(connection) == #(1, "memory", 1)
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+}
+
+pub fn invalid_payload_length_and_padding_return_typed_errors_test() {
+  let connection = open_supplied()
+  let assert Ok(db) = sqlite.from_connection(connection, binary_codec())
+  assert sqlite.migrate(db) == Ok(Nil)
+  let assert Ok(id) = stream.id("malformed")
+  assert insert_invalid_payloads(connection) == Nil
+  let storage = sqlite.as_store(db)
+  let zero = stream.initial_version
+  let failure = Error(store.DeserializationFailed(id, "Invalid SQLite payload"))
+  let assert Ok(events) = storage.read_after(id, zero)
+  assert store.collect(events) == failure
+  let assert Ok(events) = storage.read_after(id, stream.next_version(zero))
+  assert store.collect(events) == failure
+  assert sqlite.close(db) == Ok(Nil)
+}
+
+@external(erlang, "eventcore_sqlite_test_ffi", "insert_invalid_payloads")
+fn insert_invalid_payloads(connection: sqlite.Connection) -> Nil
+
+pub fn file_open_requires_wal_test() {
+  let assert Error(sqlite.CannotOpen) = sqlite.open(":memory:", binary_codec())
+  let path = temp_database()
+  let assert Ok(db) = sqlite.open(path, binary_codec())
+  assert sqlite.migrate(db) == Ok(Nil)
+  assert file_journal_mode(path) == "wal"
+  assert sqlite.close(db) == Ok(Nil)
+  assert delete_database(path) == Nil
+}
+
+@external(erlang, "eventcore_sqlite_test_ffi", "file_journal_mode")
+fn file_journal_mode(path: String) -> String
 
 pub fn independent_connections_contend_on_the_same_expected_version_test() {
   let path = temp_database()
@@ -104,7 +173,7 @@ pub fn independent_connections_contend_on_the_same_expected_version_test() {
 fn open_supplied() -> sqlite.Connection
 
 @external(erlang, "eventcore_sqlite_test_ffi", "pragmas")
-fn pragmas(connection: sqlite.Connection) -> #(Int, String)
+fn pragmas(connection: sqlite.Connection) -> #(Int, String, Int)
 
 @external(erlang, "eventcore_sqlite_test_ffi", "two_writers")
 fn two_writers(

@@ -15,14 +15,16 @@ and commit in that transaction. Roll back on a conflict or a failed statement.
 A failed rollback retires the connection.
 
 Provide explicit migrations for event and checkpoint storage. Bind event data
-as query parameters. Store caller-encoded payloads in a bitstring envelope
-that preserves alignment. Use an integer sequence for database-wide event
+as query parameters. Store caller-encoded payloads as a 64-bit bit count
+followed by the padded bytes. Validate the count and padding when reading.
+Use an integer sequence for database-wide event
 order and a unique stream and version pair for stream order.
 
 Use the Erlang SQLite driver in system-library mode in the Nix environment.
 Its link resolves to the pinned SQLCipher library. Apply the escaped key on
-file opens before reading the schema or enabling WAL. Verify cipher support
-and the key before returning a configured encrypted connection. Take ownership
+file opens before reading the schema or enabling WAL. Require the effective
+journal mode to be WAL for file opens and memory for in-memory opens. Verify
+cipher support and the key before returning a configured encrypted connection. Take ownership
 of supplied connections with their existing SQLite settings.
 
 ## Consequences

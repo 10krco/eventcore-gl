@@ -19,5 +19,9 @@ jobs:
       - run: nix develop --no-update-lock-file -c gleam format --check
       - run: nix develop --no-update-lock-file -c gleam build --warnings-as-errors
       - run: nix develop --no-update-lock-file -c gleam test
+      - name: Test bundled SQLite
+        run: |
+          nix develop --no-update-lock-file -c gleam clean
+          nix develop --no-update-lock-file -c env -u USE_SYSTEM_SQLITE -u CFLAGS -u LDFLAGS EVENTCORE_SQLITE_TEST_BACKEND=plain gleam test
       - name: Verify the committed Gleam manifest
         run: git diff --exit-code HEAD -- manifest.toml

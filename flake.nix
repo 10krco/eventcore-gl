@@ -30,6 +30,7 @@
       };
     in {
       devShells.${system}.default = pkgs.mkShell {
+        EVENTCORE_SQLITE_TEST_BACKEND = "sqlcipher";
         USE_SYSTEM_SQLITE = "1";
         CFLAGS = "-I${sqlcipherSqlite}/include";
         LDFLAGS = "-L${sqlcipherSqlite}/lib";

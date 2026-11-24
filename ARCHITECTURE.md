@@ -59,5 +59,6 @@ version and write the complete batch. SQLite arbitrates between independent
 connections. Event rows have per-stream versions and a global sequence.
 Explicit migrations create the event and checkpoint tables. A checkpoint
 store can also use its own database. File opens apply any encryption key
-and validate it before enabling WAL. Supplied connections retain their
+and validate it before requiring WAL. In-memory opens require memory journal
+mode. Supplied connections retain their
 pragmas. See [ADR 0006](docs/decisions/0006-sqlite-storage.md).

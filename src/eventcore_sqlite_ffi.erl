@@ -46,14 +46,15 @@ open({supplied, Connection}) ->
         {ok, Connection}
     end, {error, cannot_open});
 open(memory) ->
-    configure_open(fun() -> sqlite:open(":memory:", #{flags => [memory]}) end, none);
+    configure_open(fun() -> sqlite:open(":memory:", #{flags => [memory]}) end, none, <<"memory">>);
 open({file, Path, Encryption}) ->
-    configure_open(fun() -> sqlite:open(Path, #{busy_timeout => 5000}) end, Encryption).
+    configure_open(fun() -> sqlite:open(Path, #{busy_timeout => 5000}) end, Encryption, <<"wal">>).
 
-configure_open(Open, Encryption) ->
+configure_open(Open, Encryption, JournalMode) ->
     guard_query(fun() ->
         Connection = Open(),
-        Result = guard_query(fun() -> configure(Connection, Encryption) end, {error, cannot_open}),
+        Result = guard_query(fun() -> configure(Connection, Encryption, JournalMode) end,
+                             {error, cannot_open}),
         case Result of
             ok -> {ok, Connection};
             {error, _} ->
@@ -62,10 +63,10 @@ configure_open(Open, Encryption) ->
         end
     end, {error, cannot_open}).
 
-configure(Connection, Encryption) ->
+configure(Connection, Encryption, JournalMode) ->
     case apply_key(Connection, Encryption) of
         ok ->
-            [_] = sqlite:query(Connection, "PRAGMA journal_mode = WAL"),
+            [{JournalMode}] = sqlite:query(Connection, ["PRAGMA journal_mode = ", JournalMode]),
             ok;
         Error -> Error
     end.
@@ -120,14 +121,14 @@ handle_call({checkpoint, Name}, _From, {Connection, _} = State) ->
     {reply, Reply, State};
 handle_call({save_checkpoint, Name, Position}, _From, {Connection, _} = State) ->
     Reply = guard_query(fun() ->
-        [] = sqlite:query(Connection, "INSERT INTO eventcore_checkpoints(name, position) VALUES(?, ?) "
+        ok = write_query(Connection, "INSERT INTO eventcore_checkpoints(name, position) VALUES(?, ?) "
                          "ON CONFLICT(name) DO UPDATE SET position = excluded.position", [Name, Position]),
         {ok, nil}
     end, {error, checkpoint_failed}),
     {reply, Reply, State};
 handle_call({reset_checkpoint, Name}, _From, {Connection, _} = State) ->
     Reply = guard_query(fun() ->
-        [] = sqlite:query(Connection, "DELETE FROM eventcore_checkpoints WHERE name = ?", [Name]),
+        ok = write_query(Connection, "DELETE FROM eventcore_checkpoints WHERE name = ?", [Name]),
         {ok, nil}
     end, {error, checkpoint_failed}),
     {reply, Reply, State}.
@@ -185,14 +186,13 @@ read_events(Connection, {id, Name} = Stream, After) ->
                         "WHERE stream = ? AND version > ? ORDER BY version", [Name, After]),
     {ok, [read_event(Stream, Kind, Bytes) || {Kind, Bytes} <- Rows]}.
 
-read_event(Stream, Kind, Bytes) ->
-    try binary_to_term(Bytes, [safe, used]) of
-        {Payload, Used} when is_bitstring(Payload), Used =:= byte_size(Bytes) ->
-            {ok, {event, Stream, Kind, Payload}};
+read_event(Stream, Kind, <<Length:64, Body/binary>>) when byte_size(Body) =:= (Length + 7) div 8 ->
+    Padding = bit_size(Body) - Length,
+    case Body of
+        <<Payload:Length/bitstring, 0:Padding>> -> {ok, {event, Stream, Kind, Payload}};
         _ -> invalid_payload(Stream)
-    catch
-        error:badarg -> invalid_payload(Stream)
-    end.
+    end;
+read_event(Stream, _, _) -> invalid_payload(Stream).
 
 invalid_payload(Stream) ->
     {error, {deserialization_failed, Stream, <<"Invalid SQLite payload">>}}.
@@ -209,6 +209,15 @@ stream_versions(Connection, [{{id, Name} = Stream, {version, Expected}} | Rest],
 insert_events(_Connection, [], _) -> {ok, nil};
 insert_events(Connection, [{event, {id, Name} = Stream, Kind, Payload} | Rest], Versions) ->
     Version = maps:get(Stream, Versions) + 1,
-    [] = sqlite:query(Connection, "INSERT INTO eventcore_events(stream, version, kind, payload) "
-                     "VALUES(?, ?, ?, ?)", [Name, Version, Kind, {blob, term_to_binary(Payload)}]),
+    Length = bit_size(Payload),
+    Padding = (8 - Length rem 8) rem 8,
+    Bytes = <<Length:64, Payload/bitstring, 0:Padding>>,
+    ok = write_query(Connection, "INSERT INTO eventcore_events(stream, version, kind, payload) "
+                     "VALUES(?, ?, ?, ?)", [Name, Version, Kind, {blob, Bytes}]),
     insert_events(Connection, Rest, Versions#{Stream := Version}).
+
+write_query(Connection, Sql, Parameters) ->
+    case sqlite:query(Connection, Sql, Parameters) of
+        [] -> ok;
+        [{Count}] when is_integer(Count), Count >= 0 -> ok
+    end.
