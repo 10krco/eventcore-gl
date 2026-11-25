@@ -103,7 +103,9 @@ records the failure and checkpoint policies.
 
 Filesystem projections use a replica-local ingestion sequence. The server
 recovers persisted assignments before assigning positions to imported
-transactions. It exposes bounded pages after the assignment is published.
+transactions. It syncs the journal directory before publishing newly recovered
+assignments. A bounded page fails if it encounters a reserved position with
+an unavailable event.
 Named checkpoints use atomic local files, and the store process owns the
 named leases on its BEAM node. See
 [ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md).

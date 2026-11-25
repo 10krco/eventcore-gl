@@ -14,10 +14,11 @@ checksummed, contiguous segments. A segment records transaction IDs and
 event counts. On reopen, keep existing positions and assign new positions
 to imported transactions in canonical order. Preserve the position range
 of a transaction missing from the event index so subsequent positions stay
-valid.
+valid. A page spanning an unavailable position fails so a checkpoint
+cannot skip the event if its transaction is later restored.
 
 Persist an assignment after the transaction file and its directory are
-synced under the configured policy. Publish the assignment by atomic rename.
+synced under the configured policy, including on recovery. Publish the assignment by atomic rename.
 If publication fails after a transaction commits, keep its pending assignment
 and retry before exposing a projection frontier. Keep named projection
 checkpoints in the same local metadata directory. Use the store process to

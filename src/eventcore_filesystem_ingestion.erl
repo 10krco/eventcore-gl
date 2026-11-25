@@ -51,8 +51,14 @@ flush(Publish, #ingestion{directory = Directory, frontier = High, pending = Pend
     end.
 
 fetch(First, Last, #ingestion{events = Events}) ->
-    [{Position, Event} || Position <- lists:seq(First, Last),
-                          {ok, Event} <- [maps:find(Position, Events)]].
+    fetch(First, Last, Events, []).
+
+fetch(Position, Last, _, Acc) when Position > Last -> {ok, lists:reverse(Acc)};
+fetch(Position, Last, Events, Acc) ->
+    case maps:find(Position, Events) of
+        {ok, Event} -> fetch(Position + 1, Last, Events, [{Position, Event} | Acc]);
+        error -> {error, nil}
+    end.
 
 segment_name(Start) ->
     iolist_to_binary(io_lib:format("~20..0B.ingestion", [Start])).

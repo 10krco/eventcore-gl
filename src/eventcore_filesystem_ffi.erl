@@ -11,7 +11,7 @@
     transactions = #{}, ordered = [], revision = 0, history_revision = 0,
     streams = #{}, tips = [], contested = #{},
     integrity_failures = [], dangling = [],
-    projection_directory, ingestion, leases = #{}
+    projection_directory, ingestion, sync_journal, leases = #{}
 }).
 
 start(Root, Sync) ->
@@ -20,7 +20,7 @@ start(Root, Sync) ->
 start_with_replica(Root, Sync, Replica) ->
     start_server(Root, Sync, Replica, fun(Directory) -> sync_directory(Directory, Sync) end).
 
-% Accept a sync function to exercise open failures in the Erlang tests.
+% Accept a directory sync function to exercise failures in tests.
 start(Root, Sync, SyncAncestor) ->
     start_server(Root, Sync, none, SyncAncestor).
 
@@ -98,6 +98,7 @@ init({Owner, RequestedRoot, Sync, Replica, SyncAncestor}) ->
                 {ok, Lock} ->
                     State = #state{owner = monitor(process, Owner), lock = Lock,
                                    directory = Directory, sync = Sync,
+                                   sync_journal = fun() -> SyncAncestor(Directory) end,
                                    projection_directory = filename:join([Root, <<".eventcore">>, <<"projection">>]),
                                    snapshot_directory = filename:join([Root, <<".eventcore">>, <<"snapshots">>])},
                     case prepare(Root, Replica, State) of
@@ -150,7 +151,7 @@ open_ingestion({ok, #state{projection_directory = Directory, transactions = Tran
     IngestionDirectory = filename:join(Directory, <<"ingestion">>),
     case eventcore_filesystem_ingestion:open(IngestionDirectory, lists:reverse(Reversed), Transactions) of
         {ok, Index} ->
-            case flush_ingestion(State#state{ingestion = Index}) of
+            case sync_and_flush_ingestion(State#state{ingestion = Index}) of
                 {ok, _, Updated} -> {ok, Updated};
                 _ -> {error, ingestion_unavailable}
             end;
@@ -236,16 +237,13 @@ handle_call({acquire, Name}, {Holder, _}, #state{leases = Leases} = State) ->
 handle_call({release, Name, Token}, _From, #state{leases = Leases} = State) ->
     Updated = eventcore_projection_leases:release(Name, Token, Leases),
     {reply, nil, State#state{leases = Updated}};
-handle_call(projection_frontier, _From, #state{directory = Directory, sync = Sync} = State) ->
-    #state{ingestion = Index} = State,
-    Ready = not eventcore_filesystem_ingestion:needs_flush(Index) orelse
-        sync_directory(Directory, Sync) =:= ok,
-    case Ready andalso flush_ingestion(State) of
+handle_call(projection_frontier, _From, State) ->
+    case sync_and_flush_ingestion(State) of
         {ok, High, Updated} -> {reply, {ok, High}, Updated};
         _ -> {reply, {error, nil}, State}
     end;
 handle_call({projection_fetch, First, Last}, _From, #state{ingestion = Index} = State) ->
-    {reply, {ok, eventcore_filesystem_ingestion:fetch(First, Last, Index)}, State};
+    {reply, eventcore_filesystem_ingestion:fetch(First, Last, Index), State};
 handle_call({projection_load, Name}, _From, State) ->
     {_, Path} = projection_checkpoint(Name, State),
     Reply = case file:read_file(Path) of
@@ -390,7 +388,8 @@ fork_contexts(#state{transactions = Transactions, ordered = Reversed}) ->
     eventcore_filesystem_graph:forks(Transactions, lists:reverse(Reversed)).
 
 persist(Expected, Events, Parents, Resolution, #state{directory = Directory, sync = Sync,
-                                         replica = Replica, transactions = Transactions} = State) ->
+                                         replica = Replica, transactions = Transactions,
+                                         sync_journal = SyncJournal} = State) ->
     Time = os:system_time(nanosecond),
     Nonce = crypto:strong_rand_bytes(16),
     Bases = lists:sort(Expected),
@@ -406,7 +405,7 @@ persist(Expected, Events, Parents, Resolution, #state{directory = Directory, syn
             #state{ingestion = Index} = State,
             Ingested = State#state{ingestion = eventcore_filesystem_ingestion:add(Id, Events, Index)},
             Updated = index_new_transaction(Id, Record, Transactions#{Id => Record}, Ingested),
-            case sync_directory(Directory, Sync) of
+            case SyncJournal() of
                 ok ->
                     case flush_ingestion(Updated) of
                         {ok, _, Flushed} -> {{ok, nil}, Flushed};
@@ -415,6 +414,16 @@ persist(Expected, Events, Parents, Resolution, #state{directory = Directory, syn
                 {error, _} -> {Failure, Updated}
             end;
         {error, _} -> {Failure, State}
+    end.
+
+sync_and_flush_ingestion(#state{ingestion = Index, sync_journal = SyncJournal} = State) ->
+    case eventcore_filesystem_ingestion:needs_flush(Index) of
+        false -> flush_ingestion(State);
+        true ->
+            case SyncJournal() of
+                ok -> flush_ingestion(State);
+                Error -> Error
+            end
     end.
 
 flush_ingestion(#state{ingestion = Index, sync = Sync} = State) ->

@@ -944,45 +944,75 @@ pub fn missing_transactions_leave_projection_position_ranges_reserved_test() {
   assert filesystem.close(backup_journal) == Ok(Nil)
   let assert Ok(journal) = filesystem.open(local, codec())
   let assert Ok(id) = stream.id("notes")
-  let first = store.Event(id, "note", 10)
-  let last = store.Event(id, "note", 20)
-  write_projection_event(journal, first, stream.initial_version)
-  let assert [#(_, first_path)] = transaction_paths(local)
-  write_projection_event(
-    journal,
-    last,
-    stream.next_version(stream.initial_version),
-  )
+  let initial = store.Event(id, "note", 10)
+  let missing = store.Event(id, "note", 20)
+  let last = store.Event(id, "note", 30)
+  let one_version = stream.next_version(stream.initial_version)
+  write_projection_event(journal, initial, stream.initial_version)
+  let assert [#(initial_id, _)] = transaction_paths(local)
+  write_projection_event(journal, missing, one_version)
+  let assert Ok(#(_, missing_path)) =
+    list.find(transaction_paths(local), fn(file) { file.0 != initial_id })
+  write_projection_event(journal, last, stream.next_version(one_version))
+  let assert Ok(one) = projection.position(1)
+  let backend = filesystem.projection_backend(journal)
+  assert backend.checkpoints.save("notes", one) == Ok(Nil)
   assert filesystem.close(journal) == Ok(Nil)
   copy_transactions(local, backup)
-  remove(first_path)
+  remove(missing_path)
 
   let assert Ok(journal) = filesystem.open(local, codec())
-  let reader = filesystem.projection_reader(journal)
-  let assert Ok(page) = projection.page(None, 10)
-  let assert Ok(one) = projection.position(1)
-  let assert Ok(two) = projection.position(2)
-  assert reader(projection.all(), page)
-    == Ok(projection.PageResult(
-      [
-        projection.Delivery(last, two),
-      ],
-      Some(two),
-    ))
+  let backend = filesystem.projection_backend(journal)
+  let assert Ok(Some(saved)) = backend.checkpoints.load("notes")
+  let assert Ok(page) = projection.page(Some(saved), 10)
+  assert backend.reader(projection.all(), page)
+    == Error(store.StoreFailure(store.ReadProjection))
+  assert backend.checkpoints.load("notes") == Ok(Some(one))
   assert filesystem.close(journal) == Ok(Nil)
 
   copy_transactions(backup, local)
   let assert Ok(journal) = filesystem.open(local, codec())
-  let reader = filesystem.projection_reader(journal)
-  assert reader(projection.all(), page)
+  let backend = filesystem.projection_backend(journal)
+  let assert Ok(Some(saved)) = backend.checkpoints.load("notes")
+  let assert Ok(page) = projection.page(Some(saved), 10)
+  let assert Ok(two) = projection.position(2)
+  let assert Ok(three) = projection.position(3)
+  assert backend.reader(projection.all(), page)
     == Ok(projection.PageResult(
       [
-        projection.Delivery(first, one),
-        projection.Delivery(last, two),
+        projection.Delivery(missing, two),
+        projection.Delivery(last, three),
       ],
-      Some(two),
+      Some(three),
     ))
   assert filesystem.close(journal) == Ok(Nil)
   remove_root(local)
   remove_root(backup)
+}
+
+pub fn recovered_ingestion_requires_the_journal_directory_sync_test() {
+  let local = temp_root()
+  let other = temp_root()
+  let assert Ok(journal) = filesystem.open(other, codec())
+  let assert Ok(id) = stream.id("notes")
+  let event = store.Event(id, "note", 1)
+  write_projection_event(journal, event, stream.initial_version)
+  assert filesystem.close(journal) == Ok(Nil)
+  let assert Ok(journal) = filesystem.open(local, codec())
+  assert filesystem.close(journal) == Ok(Nil)
+  copy_transactions(other, local)
+
+  assert open_with_failed_ancestor_sync(local, local <> "/events")
+    == Error(filesystem.CannotOpen)
+  assert !is_directory(local <> "/.eventcore/projection/ingestion")
+
+  let assert Ok(journal) = filesystem.open(local, codec())
+  let assert Ok(page) = projection.page(None, 10)
+  let assert Ok(one) = projection.position(1)
+  let reader = filesystem.projection_reader(journal)
+  assert reader(projection.all(), page)
+    == Ok(projection.PageResult([projection.Delivery(event, one)], Some(one)))
+  assert filesystem.close(journal) == Ok(Nil)
+  remove_root(other)
+  remove_root(local)
 }
