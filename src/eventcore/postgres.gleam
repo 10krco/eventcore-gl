@@ -1,5 +1,7 @@
 //// PostgreSQL event and checkpoint storage for an existing Pog pool.
 
+import eventcore/projection
+import eventcore/projection_delivery as delivery
 import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError}
 import eventcore/stream.{type Id, type Version}
@@ -7,6 +9,7 @@ import gleam/bit_array
 import gleam/dict.{type Dict}
 import gleam/dynamic/decode
 import gleam/erlang/process.{type Name, type Pid}
+import gleam/int
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/otp/actor
@@ -108,6 +111,195 @@ pub fn migrate(events: EventStore(payload)) -> Result(Nil, MigrationError) {
     "CREATE TABLE IF NOT EXISTS eventcore_command_snapshots (
       name text PRIMARY KEY, body bytea NOT NULL)",
   ])
+}
+
+pub type DeliveryError {
+  DeliveryReadFailed
+  InvalidDeliveryStream(String)
+  InvalidDeliveryVersion(Int)
+  InvalidDeliveryPayload(projection.Position, String)
+}
+
+/// Adds persisted event identities to the existing committed event sequence.
+pub fn migrate_delivery(
+  events: EventStore(payload),
+) -> Result(Nil, MigrationError) {
+  migrate_tables(events.pool, [
+    "ALTER TABLE eventcore_events
+      ADD COLUMN IF NOT EXISTS event_id uuid NOT NULL DEFAULT gen_random_uuid(),
+      ADD COLUMN IF NOT EXISTS metadata json NOT NULL DEFAULT '{}'::json",
+    "CREATE UNIQUE INDEX IF NOT EXISTS eventcore_events_event_id ON eventcore_events(event_id)",
+  ])
+}
+
+pub fn projection_source(
+  events: EventStore(payload),
+  id: delivery.SourceId,
+) -> delivery.Source(DeliveryError) {
+  delivery.Source(
+    id,
+    fn() { delivery_frontier(events.pool) |> result.map(delivery_position) },
+    fn(selection, page, through) {
+      read_delivery(events.pool, id, selection, page, through)
+    },
+  )
+}
+
+fn delivery_position(value: Int) -> Option(projection.Position) {
+  option.from_result(projection.position(value))
+}
+
+fn delivery_frontier(pool: pog.Connection) -> Result(Int, DeliveryError) {
+  use returned <- result.try(
+    pog.query("SELECT last_position FROM eventcore_positions WHERE singleton")
+    |> pog.returning(decode.at([0], decode.int))
+    |> pog.execute(pool)
+    |> result.replace_error(DeliveryReadFailed),
+  )
+  case returned.rows {
+    [position] -> Ok(position)
+    _ -> Error(DeliveryReadFailed)
+  }
+}
+
+fn read_delivery(
+  pool: pog.Connection,
+  id: delivery.SourceId,
+  selection: delivery.Selection,
+  page: projection.Page,
+  through: delivery.UpperBound,
+) -> Result(List(delivery.Envelope), DeliveryError) {
+  use frontier <- result.try(delivery_frontier(pool))
+  let high = case through {
+    delivery.Unbounded -> frontier
+    delivery.Inclusive(position) ->
+      int.min(frontier, projection.sequence(position))
+  }
+  let after =
+    option.map(projection.page_after(page), projection.sequence)
+    |> option.unwrap(0)
+  scan_delivery(
+    pool,
+    id,
+    selection,
+    after,
+    high,
+    projection.page_limit(page),
+    [],
+  )
+}
+
+type DeliveryRow {
+  DeliveryRow(
+    position: Int,
+    id: String,
+    stream: String,
+    version: Int,
+    kind: String,
+    payload: BitArray,
+    metadata: String,
+  )
+}
+
+fn delivery_row() -> decode.Decoder(DeliveryRow) {
+  use position <- decode.field(0, decode.int)
+  use id <- decode.field(1, decode.string)
+  use stream <- decode.field(2, decode.string)
+  use version <- decode.field(3, decode.int)
+  use kind <- decode.field(4, decode.string)
+  use payload <- decode.field(5, decode.bit_array)
+  use metadata <- decode.field(6, decode.string)
+  decode.success(DeliveryRow(
+    position,
+    id,
+    stream,
+    version,
+    kind,
+    payload,
+    metadata,
+  ))
+}
+
+fn scan_delivery(pool, id, selection, after, high, remaining, reversed) {
+  case after >= high || remaining == 0 {
+    True -> Ok(list.reverse(reversed))
+    False -> {
+      let through = int.min(after + 128, high)
+      use returned <- result.try(
+        pog.query(
+          "SELECT position, event_id::text, stream, version, kind, payload, metadata::text
+          FROM eventcore_events WHERE position BETWEEN $1 AND $2 ORDER BY position",
+        )
+        |> pog.parameter(pog.int(after + 1))
+        |> pog.parameter(pog.int(through))
+        |> pog.returning(delivery_row())
+        |> pog.execute(pool)
+        |> result.replace_error(DeliveryReadFailed),
+      )
+      use #(remaining, reversed) <- result.try(select_delivery(
+        returned.rows,
+        id,
+        selection,
+        remaining,
+        reversed,
+      ))
+      scan_delivery(pool, id, selection, through, high, remaining, reversed)
+    }
+  }
+}
+
+fn select_delivery(
+  rows: List(DeliveryRow),
+  id,
+  selection,
+  remaining,
+  reversed,
+) {
+  case rows, remaining {
+    [], _ | _, 0 -> Ok(#(remaining, reversed))
+    [row, ..rest], _ -> {
+      use stream <- result.try(
+        stream.id(row.stream)
+        |> result.replace_error(InvalidDeliveryStream(row.stream)),
+      )
+      case delivery.selects(selection, stream, row.kind) {
+        False -> select_delivery(rest, id, selection, remaining, reversed)
+        True -> {
+          use position <- result.try(
+            projection.position(row.position)
+            |> result.replace_error(DeliveryReadFailed),
+          )
+          use version <- result.try(
+            stream.version(row.version)
+            |> result.replace_error(InvalidDeliveryVersion(row.version)),
+          )
+          use kind <- result.try(
+            delivery.event_type(row.kind)
+            |> result.replace_error(DeliveryReadFailed),
+          )
+          use payload <- result.try(
+            unpack_payload(row.payload)
+            |> result.map_error(InvalidDeliveryPayload(position, _)),
+          )
+          let envelope =
+            delivery.Envelope(
+              id,
+              position,
+              row.id,
+              stream,
+              version,
+              kind,
+              payload,
+              row.metadata,
+            )
+          select_delivery(rest, id, selection, remaining - 1, [
+            envelope,
+            ..reversed
+          ])
+        }
+      }
+    }
+  }
 }
 
 /// Use the supplied pool for checkpoint-only operations.

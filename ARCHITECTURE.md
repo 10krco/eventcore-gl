@@ -115,3 +115,10 @@ Each page captures an upper position before scanning. A projector can use
 the event database for its progress or a separate checkpoint database.
 Views that share a checkpoint handle also share its named leases.
 See [ADR 0012](docs/decisions/0012-sqlite-projection-replay.md).
+
+PostgreSQL strict delivery uses the committed event position counter as its
+watermark. Separate migrations add persistent UUIDs and JSON metadata for
+existing and future rows. The delivery source scans bounded position ranges,
+applies its validated selection before counting deliveries, and returns the
+original payload bytes and JSON metadata for application decoding.
+See [ADR 0013](docs/decisions/0013-postgres-projection-delivery.md).
