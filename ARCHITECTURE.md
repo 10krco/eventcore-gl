@@ -142,3 +142,12 @@ Retry and skip follow rollback, and after-commit work runs after acknowledgement
 Reset uses the same lock and commits destination cleanup with cursor deletion.
 Reset-and-replay holds leadership while it moves from cleanup to replay.
 See [ADR 0015](docs/decisions/0015-postgres-transactional-projections.md).
+
+## Typed model components
+
+The experimental model module wraps domain values in role-specific opaque types.
+A field value carries its component role, owner type, and occurrence witness.
+Domain modules combine required field values in private constructors. Input
+origins and state recipes provide roots. Mappings read one or more typed fields
+and produce the exact target field value, with fallible transformations
+preserving their domain errors. See [ADR 0017](docs/decisions/0017-typed-model-components.md).
