@@ -272,6 +272,7 @@ optional_filters(Options) ->
 create_tables(Connection, release_event_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_release_ids ("
         "position INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, milliseconds INTEGER NOT NULL)"),
+    [] = sqlite:query(Connection, "DROP TRIGGER IF EXISTS eventcore_assign_release_id"),
     ok = upgrade_release_ids(Connection),
     % Reserve 42 position bits for key order within a millisecond.
     % The bundled SQLite predates the unixepoch('subsec') modifier.
@@ -279,7 +280,7 @@ create_tables(Connection, release_event_schema) ->
         "+ CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER), "
         "COALESCE((SELECT milliseconds FROM eventcore_release_ids ORDER BY uuid DESC LIMIT 1), 0)) "
         "+ CASE WHEN (NEW.position & 4398046511103) = 0 THEN 1 ELSE 0 END",
-    [] = sqlite:query(Connection, ["CREATE TRIGGER IF NOT EXISTS eventcore_assign_release_id "
+    [] = sqlite:query(Connection, ["CREATE TRIGGER eventcore_assign_release_id "
         "AFTER INSERT ON eventcore_events BEGIN "
         "INSERT INTO eventcore_release_ids(position, uuid, milliseconds) "
         "SELECT NEW.position, ", release_uuid("milliseconds", "NEW.position"), ", milliseconds "
@@ -312,7 +313,6 @@ upgrade_release_ids(Connection) ->
     case lists:member({<<"milliseconds">>}, Columns) of
         true -> ok;
         false ->
-            [] = sqlite:query(Connection, "DROP TRIGGER IF EXISTS eventcore_assign_release_id"),
             [] = sqlite:query(Connection, "ALTER TABLE eventcore_release_ids "
                 "ADD COLUMN milliseconds INTEGER NOT NULL DEFAULT 0"),
             % SQLite casts dynamic hex strings to zero. Decode the timestamp's
