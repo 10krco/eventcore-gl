@@ -146,26 +146,31 @@ RETURNS uuid LANGUAGE sql VOLATILE AS $body$
   )::uuid
 $body$"
 
-// UUID ordering compares the timestamp, version, then sequence. A v4 ID
-// therefore precedes every v7 ID with the same 48-bit prefix.
+// Seed the predecessor of the first representable UUIDv7 above the retained
+// UUID. A sequence above its 42-bit maximum carries into the next millisecond.
 const seed_event_id_sql =
-  "DO $body$ DECLARE latest text; BEGIN
+  "DO $body$
+DECLARE latest text; milliseconds bigint; sequence bigint;
+  version text; random_a bigint; variant int;
+BEGIN
   IF NOT EXISTS (SELECT 1 FROM eventcore_uuid_clock WHERE singleton) THEN
     SELECT replace(event_id::text, '-', '') INTO latest
     FROM eventcore_events WHERE event_id IS NOT NULL
     ORDER BY event_id DESC LIMIT 1;
+    milliseconds := COALESCE(('x' || left(latest, 12))::bit(48)::bigint, 0);
+    version := substr(latest, 13, 1);
+    random_a := ('x' || substr(latest, 14, 3))::bit(12)::bigint;
+    variant := ('x' || substr(latest, 17, 1))::bit(4)::int;
+    sequence := CASE
+      WHEN version > '7' THEN 4398046511103
+      WHEN version IS DISTINCT FROM '7' THEN -1
+      WHEN variant < 8 THEN (random_a << 30) - 1
+      WHEN variant > 11 THEN ((random_a + 1) << 30) - 1
+      ELSE (random_a << 30)
+        | (('x' || substr(latest, 17, 8))::bit(32)::bigint & 1073741823)
+    END;
     INSERT INTO eventcore_uuid_clock(singleton, milliseconds, sequence)
-    VALUES (true,
-      COALESCE(('x' || left(latest, 12))::bit(48)::bigint, 0)
-        + CASE WHEN substr(latest, 13, 1) > '7'
-            OR (substr(latest, 13, 1) = '7'
-              AND ('x' || substr(latest, 17, 1))::bit(4)::int NOT BETWEEN 8 AND 11)
-          THEN 1 ELSE 0 END,
-      CASE WHEN substr(latest, 13, 1) = '7'
-        AND ('x' || substr(latest, 17, 1))::bit(4)::int BETWEEN 8 AND 11 THEN
-        ((('x' || substr(latest, 14, 3))::bit(12)::bigint) << 30)
-          | ((('x' || substr(latest, 17, 8))::bit(32)::bigint) & 1073741823)
-        ELSE -1 END);
+    VALUES (true, milliseconds, sequence);
   END IF;
 END $body$"
 

@@ -113,9 +113,18 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     events,
     reopened,
     second_checkpoints,
-    "non-rfc",
-    "80000000-0000-7000-c000-000000000000",
-    140_737_488_355_329,
+    "low-variant",
+    "ffffffff-ffff-7000-0000-000000000000",
+    281_474_976_710_655,
+  )
+  check_monotonic_uuids(
+    first,
+    events,
+    reopened,
+    second_checkpoints,
+    "high-variant",
+    "ffffffff-ffff-7001-c000-000000000000",
+    281_474_976_710_655,
   )
   check_release_projection(first, events, second_checkpoints)
 
