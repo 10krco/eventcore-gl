@@ -26,8 +26,9 @@ per-name OS lock performs the atomic rename after the runner rechecks its
 lease. A replacement waits for the rename or for the process to exit. If
 that process dies before the rename, the former holder cannot publish its
 prepared file. Use one coordinator root for all runners sharing a checkpoint.
-Release waits for the worker to exit. Lock files stay in place so all
-contenders use the same inode.
+A checked lease requires a fenced checkpoint adapter. A journal-backed fenced
+save requires the journal to run on the writer's node. Release waits for the
+worker to exit. Lock files stay in place so all contenders use the same inode.
 
 ## Consequences
 

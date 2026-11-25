@@ -160,6 +160,8 @@ projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
         _ -> Owner ! {Reference, {error, coordinator_unavailable}}
     end.
 
+projection_fenced_save(Pid, _Name, _Position, _Fence) when node(Pid) =/= node() ->
+    {error, lease_lost};
 projection_fenced_save(Pid, Name, Position, Fence) ->
     case call(Pid, projection_checkpoint_config, {error, lease_lost}) of
         {ok, Directory, Sync} ->

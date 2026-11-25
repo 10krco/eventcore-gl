@@ -1110,9 +1110,13 @@ pub fn projector_stops_without_checkpointing_if_flock_process_exits_test() {
     ))
   }
   let checkpoints =
-    projection.Checkpoints(fn(_) { Ok(None) }, fn(_, _) {
-      panic as "a projector without leadership cannot save progress"
-    })
+    projection.FencedCheckpoints(
+      fn(_) { Ok(None) },
+      fn(_, _) { panic as "a checked projector must use the fence" },
+      fn(_, _, _) {
+        panic as "a projector without leadership cannot save progress"
+      },
+    )
   let projector =
     projection_runner.Projector(
       name: "lock-loss",
@@ -1182,3 +1186,43 @@ fn exercise_checkpoint_handoff(
   new: projection.Position,
   kill_fence: Bool,
 ) -> Nil
+
+pub fn checked_filesystem_lease_rejects_unfenced_checkpoints_test() {
+  let root = temp_root()
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let name = "unfenced"
+  let backend =
+    projection_runner.Backend(
+      fn(_, _) { panic as "invalid pair cannot poll" },
+      projection.Checkpoints(
+        fn(_) { panic as "invalid pair cannot load" },
+        fn(_, _) { panic as "invalid pair cannot save" },
+      ),
+      coordinate,
+    )
+  let projector =
+    projection_runner.Projector(
+      name: name,
+      filter: projection.all(),
+      initial: Nil,
+      apply: fn(_, _) { panic as "invalid pair cannot apply" },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      backend,
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Error(projection_runner.InvalidConfiguration)
+  let assert Ok(lease) = coordinate(name)
+  lease.release()
+  remove_root(root)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "check_remote_fenced_save")
+fn check_remote_fenced_save() -> Nil
+
+pub fn fenced_checkpoint_rejects_remote_journal_test() {
+  check_remote_fenced_save()
+}

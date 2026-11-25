@@ -152,6 +152,7 @@ pub fn run(
     backend.acquire(projector.name) |> result.map_error(Leadership),
   )
   with_release(lease.release, fn() {
+    use Nil <- result.try(validate_checkpoint_pair(backend.checkpoints, lease))
     use Nil <- result.try(check_lease(lease) |> result.map_error(Leadership))
     use position <- result.try(
       backend.checkpoints.load(projector.name)
@@ -164,6 +165,16 @@ pub fn run(
       0,
     )
   })
+}
+
+fn validate_checkpoint_pair(
+  checkpoints: Checkpoints,
+  lease: Lease,
+) -> Result(Nil, RunError(error)) {
+  case checkpoints, lease {
+    projection.Checkpoints(..), CheckedLease(..) -> Error(InvalidConfiguration)
+    _, _ -> Ok(Nil)
+  }
 }
 
 fn validate(config: Config) -> Result(Nil, RunError(error)) {
@@ -324,13 +335,10 @@ fn save(
   let saved = case run.backend.checkpoints, run.lease {
     projection.FencedCheckpoints(save_fenced:, ..), CheckedLease(fence:, ..) ->
       save_fenced(name, position, fence)
-    checkpoints, lease ->
-      case check_lease(lease) {
-        Ok(Nil) ->
-          checkpoints.save(name, position)
-          |> result.map_error(projection.WriteFailed)
-        Error(_) -> Error(projection.LeaseLost)
-      }
+    checkpoints, Lease(..) ->
+      checkpoints.save(name, position)
+      |> result.map_error(projection.WriteFailed)
+    projection.Checkpoints(..), CheckedLease(..) -> Error(projection.LeaseLost)
   }
   case saved {
     Ok(Nil) -> Ok(Nil)

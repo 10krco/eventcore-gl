@@ -120,7 +120,9 @@ opens sync newly created directory entries. The runner checks active leases
 before applying events. A separate per-name OS lock serializes checkpoint
 commits. Once the runner validates its lease under that lock, the process
 holding the lock performs the atomic rename. Competing runners share the
-coordinator root for these writes. See
+coordinator root for these writes. The runner rejects ordinary checkpoint
+callbacks paired with checked leases. Journal-backed fenced writes require a
+local journal. See
 [ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md) and
 [ADR 0022](docs/decisions/0022-filesystem-projection-coordination.md).
 

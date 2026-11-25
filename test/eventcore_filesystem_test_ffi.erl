@@ -1,7 +1,7 @@
 -module(eventcore_filesystem_test_ffi).
 -export([temp_root/0, remove_root/1, transaction_paths/1, tamper/1, remove/1,
          copy_transactions/2, copy_replica/2, downgrade_transaction/1, add_malformed_transaction/2,
-         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2, await_lease/2, kill_projection_lock/0, exercise_checkpoint_handoff/6]).
+         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2, await_lease/2, kill_projection_lock/0, exercise_checkpoint_handoff/6, check_remote_fenced_save/0, open_remote_journal/1]).
 
 temp_root() ->
     Random = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
@@ -215,3 +215,60 @@ exercise_checkpoint_handoff(Acquire, Name, Save, OldPosition, NewPosition, KillF
     after 3000 -> error(new_holder_timeout)
     end,
     receive {Ref, new_checked} -> nil after 0 -> error(new_check_missing) end.
+
+check_remote_fenced_save() ->
+    LocalRoot = temp_root(),
+    RemoteRoot = temp_root(),
+    Paths = lists:usort([filename:dirname(code:which(Module)) ||
+                         Module <- [?MODULE, eventcore_filesystem_ffi]]),
+    PathArgs = lists:append([["-pa", filename:absname(Path)] || Path <- Paths]),
+    Options = #{name => peer:random_name("eventcore-checkpoint"),
+                connection => standard_io,
+                args => ["+S", "2", "+SDcpu", "1", "+SDio", "1" | PathArgs]},
+    {ok, Peer, Node} = peer:start_link(Options),
+    StartedDistribution = case node() of
+        nonode@nohost ->
+            {ok, _} = net_kernel:start([list_to_atom(peer:random_name("eventcore-test")), shortnames]),
+            true;
+        _ -> false
+    end,
+    try
+        pong = net_adm:ping(Node),
+        {ok, Journal} = peer:call(Peer, ?MODULE, open_remote_journal, [RemoteRoot]),
+        Node = node(Journal),
+        Name = <<"remote-checkpoint">>,
+        {ok, LocalDirectory} = eventcore_filesystem_ffi:open_projection_coordinator(LocalRoot),
+        {ok, {checked_lease, Release, _, Fence}} =
+            eventcore_filesystem_ffi:standalone_projection_acquire(LocalDirectory, Name),
+        try
+            {ok, nil} = peer:call(Peer, eventcore_filesystem_ffi, projection_save,
+                                  [Journal, Name, {position, 1}]),
+            {ok, {some, {position, 1}}} =
+                eventcore_filesystem_ffi:projection_load(Journal, Name),
+            {error, lease_lost} =
+                eventcore_filesystem_ffi:projection_fenced_save(Journal, Name, {position, 2}, Fence),
+            {ok, {some, {position, 1}}} =
+                peer:call(Peer, eventcore_filesystem_ffi, projection_load, [Journal, Name])
+        after
+            Release()
+        end
+    after
+        peer:stop(Peer),
+        case StartedDistribution of
+            true -> net_kernel:stop();
+            false -> ok
+        end,
+        remove_root(LocalRoot),
+        remove_root(RemoteRoot)
+    end.
+
+open_remote_journal(Root) ->
+    Caller = self(),
+    Reference = make_ref(),
+    spawn(fun() ->
+        Caller ! {Reference, eventcore_filesystem_ffi:start(Root, full)},
+        receive stop -> ok end
+    end),
+    receive {Reference, Reply} -> Reply
+    after 5000 -> error(remote_journal_open_timeout)
+    end.
