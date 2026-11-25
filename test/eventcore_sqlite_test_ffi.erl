@@ -1,7 +1,7 @@
 -module(eventcore_sqlite_test_ffi).
 -export([temp_database/0, delete_database/1, two_writers/2, open_supplied/0, pragmas/1,
          reject_kind/1, ignore_kind/1, disable_count_changes/1, sqlite_test_backend/0,
-         insert_invalid_payloads/1, file_journal_mode/1, pin_release_clock/1, restore_previous_release_schema/1]).
+         insert_invalid_payloads/1, file_journal_mode/1, pin_release_clock/1, restore_previous_release_schema/1, assert_release_clock/1]).
 
 sqlite_test_backend() ->
     unicode:characters_to_binary(os:getenv("EVENTCORE_SQLITE_TEST_BACKEND", "plain")).
@@ -96,6 +96,16 @@ restore_previous_release_schema(Path) ->
         [] = sqlite:query(Db, "CREATE TRIGGER eventcore_assign_release_id AFTER INSERT ON eventcore_events "
             "BEGIN INSERT INTO eventcore_release_ids(position, uuid) "
             "VALUES (NEW.position, '00000000-0000-7000-8000-000000000000'); END"),
+        nil
+    after
+        sqlite:close(Db)
+    end.
+
+
+assert_release_clock(Path) ->
+    Db = sqlite:open(Path),
+    try
+        [{140737488355327}] = sqlite:query(Db, "SELECT milliseconds FROM eventcore_release_ids"),
         nil
     after
         sqlite:close(Db)

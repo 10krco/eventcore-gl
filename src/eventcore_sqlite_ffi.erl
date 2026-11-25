@@ -274,7 +274,9 @@ create_tables(Connection, release_event_schema) ->
         "position INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, milliseconds INTEGER NOT NULL)"),
     ok = upgrade_release_ids(Connection),
     % Reserve 42 position bits for key order within a millisecond.
-    Clock = "max(CAST(round(unixepoch('subsec') * 1000) AS INTEGER), "
+    % The bundled SQLite predates the unixepoch('subsec') modifier.
+    Clock = "max(CAST(strftime('%s', 'now') AS INTEGER) * 1000 "
+        "+ CAST(substr(strftime('%f', 'now'), 4, 3) AS INTEGER), "
         "COALESCE((SELECT milliseconds FROM eventcore_release_ids ORDER BY uuid DESC LIMIT 1), 0)) "
         "+ CASE WHEN (NEW.position & 4398046511103) = 0 THEN 1 ELSE 0 END",
     [] = sqlite:query(Connection, ["CREATE TRIGGER IF NOT EXISTS eventcore_assign_release_id "

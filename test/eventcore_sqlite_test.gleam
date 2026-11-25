@@ -519,6 +519,7 @@ pub fn release_sqlite_uses_native_selection_and_resumes_uuid_after_reopen_test()
   assert backend.checkpoints.save("notes", cursor) == Ok(Nil)
   assert restore_previous_release_schema(path) == Nil
   assert sqlite.migrate_release_delivery(events) == Ok(Nil)
+  assert assert_release_clock(path) == Nil
   assert backend.checkpoints.load("notes") == Ok(Some(cursor))
   assert backend.reader(prefix, first_page)
     == Ok(projection.PageResult([delivery], Some(cursor)))
@@ -590,3 +591,6 @@ pub fn release_sqlite_counts_an_incompatible_row_before_decoding_test() {
   assert delivery.event == last
   assert sqlite.close(events) == Ok(Nil)
 }
+
+@external(erlang, "eventcore_sqlite_test_ffi", "assert_release_clock")
+fn assert_release_clock(path: String) -> Nil
