@@ -317,23 +317,56 @@ pub fn projection_reader(
 pub fn projection_checkpoints(
   filesystem: Filesystem(payload),
 ) -> projection.Checkpoints {
-  projection.Checkpoints(
+  projection.FencedCheckpoints(
     projection_load(filesystem.server, _),
     fn(name, position) { projection_save(filesystem.server, name, position) },
+    fn(name, position, fence) {
+      projection_fenced_save(filesystem.server, name, position, fence)
+    },
   )
 }
 
-/// Uses named leases on the journal's BEAM node for the legacy runner.
+/// Open checkpoints independently of the event journal's writer lock.
+pub fn open_projection_checkpoints(
+  config: Config,
+) -> Result(projection.Checkpoints, OpenError) {
+  use directory <- result.map(open_checkpoint_directory(
+    config.root,
+    config.sync,
+  ))
+  projection.FencedCheckpoints(
+    standalone_projection_load(directory, _),
+    fn(name, position) {
+      standalone_projection_save(directory, config.sync, name, position)
+    },
+    fn(name, position, fence) {
+      standalone_projection_fenced_save(
+        directory,
+        config.sync,
+        name,
+        position,
+        fence,
+      )
+    },
+  )
+}
+
+/// Open named OS advisory locks without opening the event journal.
+pub fn open_projection_coordinator(
+  root: String,
+) -> Result(projection_runner.Coordinator, OpenError) {
+  use directory <- result.map(open_lock_directory(root))
+  standalone_projection_acquire(directory, _)
+}
+
+/// Uses named OS advisory locks for the legacy runner.
 pub fn projection_backend(
   filesystem: Filesystem(payload),
 ) -> projection_runner.Backend(payload) {
   projection_runner.Backend(
     projection_reader(filesystem),
     projection_checkpoints(filesystem),
-    fn(name) {
-      use release <- result.map(acquire_projection(filesystem.server, name))
-      projection_runner.Lease(release)
-    },
+    acquire_projection(filesystem.server, _),
   )
 }
 
@@ -484,8 +517,54 @@ fn projection_save(
   position: projection.Position,
 ) -> Result(Nil, StoreError)
 
-@external(erlang, "eventcore_projection_leases", "request")
+@external(erlang, "eventcore_filesystem_ffi", "projection_acquire")
 fn acquire_projection(
   server: Server,
   name: String,
-) -> Result(fn() -> Nil, projection_runner.LeadershipError)
+) -> Result(projection_runner.Lease, projection_runner.LeadershipError)
+
+@external(erlang, "eventcore_filesystem_ffi", "open_projection_checkpoints")
+fn open_checkpoint_directory(
+  root: String,
+  sync: Sync,
+) -> Result(String, OpenError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_load")
+fn standalone_projection_load(
+  directory: String,
+  name: String,
+) -> Result(Option(projection.Position), StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_save")
+fn standalone_projection_save(
+  directory: String,
+  sync: Sync,
+  name: String,
+  position: projection.Position,
+) -> Result(Nil, StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "open_projection_coordinator")
+fn open_lock_directory(root: String) -> Result(String, OpenError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_acquire")
+fn standalone_projection_acquire(
+  directory: String,
+  name: String,
+) -> Result(projection_runner.Lease, projection_runner.LeadershipError)
+
+@external(erlang, "eventcore_filesystem_ffi", "projection_fenced_save")
+fn projection_fenced_save(
+  server: Server,
+  name: String,
+  position: projection.Position,
+  fence: projection.CheckpointFence,
+) -> Result(Nil, projection.CheckpointWriteError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_fenced_save")
+fn standalone_projection_fenced_save(
+  directory: String,
+  sync: Sync,
+  name: String,
+  position: projection.Position,
+  fence: projection.CheckpointFence,
+) -> Result(Nil, projection.CheckpointWriteError)

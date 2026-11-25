@@ -18,6 +18,19 @@ pub type LeadershipError {
 
 pub type Lease {
   Lease(release: fn() -> Nil)
+  CheckedLease(
+    release: fn() -> Nil,
+    check: fn() -> Result(Nil, LeadershipError),
+    fence: projection.CheckpointFence,
+  )
+}
+
+/// Check that a lease can still be used before processing or saving progress.
+pub fn check_lease(lease: Lease) -> Result(Nil, LeadershipError) {
+  case lease {
+    Lease(_) -> Ok(Nil)
+    CheckedLease(check:, ..) -> check()
+  }
 }
 
 pub type Coordinator =
@@ -124,6 +137,7 @@ type Run(payload, state, error) {
     projector: Projector(payload, state, error),
     config: Config,
     control: Control,
+    lease: Lease,
   )
 }
 
@@ -138,17 +152,29 @@ pub fn run(
     backend.acquire(projector.name) |> result.map_error(Leadership),
   )
   with_release(lease.release, fn() {
+    use Nil <- result.try(validate_checkpoint_pair(backend.checkpoints, lease))
+    use Nil <- result.try(check_lease(lease) |> result.map_error(Leadership))
     use position <- result.try(
       backend.checkpoints.load(projector.name)
       |> result.map_error(CheckpointLoad),
     )
     poll(
-      Run(backend, projector, config, control),
+      Run(backend, projector, config, control, lease),
       projector.initial,
       position,
       0,
     )
   })
+}
+
+fn validate_checkpoint_pair(
+  checkpoints: Checkpoints,
+  lease: Lease,
+) -> Result(Nil, RunError(error)) {
+  case checkpoints, lease {
+    projection.Checkpoints(..), CheckedLease(..) -> Error(InvalidConfiguration)
+    _, _ -> Ok(Nil)
+  }
 }
 
 fn validate(config: Config) -> Result(Nil, RunError(error)) {
@@ -175,6 +201,7 @@ fn poll(
   after: Option(Position),
   failures: Int,
 ) -> Result(state, RunError(error)) {
+  use Nil <- result.try(check_lease(run.lease) |> result.map_error(Leadership))
   case run.control.wait(0) {
     False -> Ok(state)
     True -> {
@@ -210,15 +237,14 @@ fn consume(
   next_poll_delay: Int,
   scanned_through: Option(Position),
 ) -> Result(state, RunError(error)) {
+  use Nil <- result.try(check_lease(run.lease) |> result.map_error(Leadership))
   case events {
     [] -> {
-      let next = case scanned_through {
-        Some(position) if scanned_through != after -> {
-          save(run, position)
-          scanned_through
-        }
-        _ -> after
-      }
+      use next <- result.try(case scanned_through {
+        Some(position) if scanned_through != after ->
+          save(run, position) |> result.replace(scanned_through)
+        _ -> Ok(after)
+      })
       case run.config.mode {
         Batch -> Ok(state)
         Continuous ->
@@ -233,6 +259,9 @@ fn consume(
         False -> Ok(state)
         True -> {
           let #(state, applied) = run.projector.apply(state, event)
+          use Nil <- result.try(
+            check_lease(run.lease) |> result.map_error(Leadership),
+          )
           case applied {
             Ok(Nil) ->
               advance(
@@ -294,19 +323,34 @@ fn advance(
   next_poll_delay: Int,
   scanned_through: Option(Position),
 ) -> Result(state, RunError(error)) {
-  save(run, position)
+  use Nil <- result.try(save(run, position))
   consume(run, state, Some(position), rest, 0, next_poll_delay, scanned_through)
 }
 
-fn save(run: Run(payload, state, error), position: Position) -> Nil {
-  case run.backend.checkpoints.save(run.projector.name, position) {
-    Ok(Nil) -> Nil
-    Error(_) ->
+fn save(
+  run: Run(payload, state, error),
+  position: Position,
+) -> Result(Nil, RunError(error)) {
+  let name = run.projector.name
+  let saved = case run.backend.checkpoints, run.lease {
+    projection.FencedCheckpoints(save_fenced:, ..), CheckedLease(fence:, ..) ->
+      save_fenced(name, position, fence)
+    checkpoints, Lease(..) ->
+      checkpoints.save(name, position)
+      |> result.map_error(projection.WriteFailed)
+    projection.Checkpoints(..), CheckedLease(..) -> Error(projection.LeaseLost)
+  }
+  case saved {
+    Ok(Nil) -> Ok(Nil)
+    Error(projection.LeaseLost) -> Error(Leadership(CoordinatorUnavailable))
+    Error(projection.WriteFailed(_)) -> {
       log(
         run.projector.name,
         "checkpoint_save_failed",
         projection.sequence(position),
       )
+      Ok(Nil)
+    }
   }
 }
 

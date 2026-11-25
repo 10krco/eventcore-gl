@@ -111,9 +111,20 @@ recovers persisted assignments before assigning positions to imported
 transactions. It syncs the journal directory before publishing newly recovered
 assignments. A bounded page fails if it encounters a reserved position with
 an unavailable event.
-Named checkpoints use atomic local files, and the store process owns the
-named leases on its BEAM node. See
-[ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md).
+Named checkpoints use atomic local files. Callers can open these checkpoints
+and named OS advisory locks independently of the journal writer lock. Both
+the standalone and journal-backed coordinators use the same per-name lock
+files. Each lock worker monitors the lease holder and also monitors the
+local journal when the lease came through a journal handle. Full checkpoint
+opens sync newly created directory entries. The runner checks active leases
+before applying events. A separate per-name OS lock serializes checkpoint
+commits. Once the runner validates its lease under that lock, the process
+holding the lock performs the atomic rename. Competing runners share the
+coordinator root for these writes. The runner rejects ordinary checkpoint
+callbacks paired with checked leases. Journal-backed fenced writes require a
+local journal. See
+[ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md) and
+[ADR 0022](docs/decisions/0022-filesystem-projection-coordination.md).
 
 SQLite projection reads scan committed insertion positions in bounded ranges.
 Each page captures an upper position before scanning. A projector can use

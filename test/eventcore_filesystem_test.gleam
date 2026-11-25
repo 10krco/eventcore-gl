@@ -896,7 +896,22 @@ pub fn projection_resumes_after_import_with_stable_local_positions_test() {
   lease.release()
   let assert Ok(lease) = backend.acquire("notes")
   lease.release()
-  assert backend.checkpoints.save("notes", two) == Ok(Nil)
+  let projector =
+    projection_runner.Projector(
+      name: "notes",
+      filter: projection.all(),
+      initial: [],
+      apply: fn(events, delivery) { #([delivery.event, ..events], Ok(Nil)) },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      backend,
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Ok([local_last, local_first])
+  assert backend.checkpoints.load("notes") == Ok(Some(two))
   assert filesystem.close(journal) == Ok(Nil)
 
   copy_transactions(other, local)
@@ -1022,4 +1037,192 @@ pub fn recovered_ingestion_requires_the_journal_directory_sync_test() {
   assert filesystem.close(journal) == Ok(Nil)
   remove_root(other)
   remove_root(local)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "check_os_lock")
+fn check_os_lock(root: String, name: String) -> Nil
+
+@external(erlang, "eventcore_filesystem_test_ffi", "check_holder_exit")
+fn check_holder_exit(
+  acquire: projection_runner.Coordinator,
+  name: String,
+) -> Nil
+
+pub fn standalone_projection_state_shares_journal_checkpoint_and_os_lock_test() {
+  let root = temp_root()
+  let config = filesystem.Config(root, filesystem.Full)
+  let assert Ok(checkpoints) = filesystem.open_projection_checkpoints(config)
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let name = "projection/日本語"
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(second) = projection.position(2)
+  assert checkpoints.load(name) == Ok(None)
+  assert checkpoints.save(name, first) == Ok(Nil)
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let backend = filesystem.projection_backend(journal)
+  assert backend.checkpoints.load(name) == Ok(Some(first))
+  assert backend.checkpoints.save(name, second) == Ok(Nil)
+  let assert Ok(reopened) = filesystem.open_projection_checkpoints(config)
+  assert reopened.load(name) == Ok(Some(second))
+  assert reopened.load("other") == Ok(None)
+
+  let assert Ok(lease) = backend.acquire(name)
+  assert coordinate(name) == Error(projection_runner.AlreadyLeading)
+  check_os_lock(root, name)
+  let assert Ok(other) = coordinate("other")
+  other.release()
+  lease.release()
+  let assert Ok(lease) = coordinate(name)
+  assert backend.acquire(name) == Error(projection_runner.AlreadyLeading)
+  lease.release()
+  check_holder_exit(coordinate, name)
+  let assert Ok(active) = backend.acquire(name)
+  assert filesystem.close(journal) == Ok(Nil)
+  let after_close = await_lease(coordinate, name)
+  assert projection_runner.check_lease(active)
+    == Error(projection_runner.CoordinatorUnavailable)
+  active.release()
+  assert coordinate(name) == Error(projection_runner.AlreadyLeading)
+  after_close.release()
+  remove_root(root)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "await_lease")
+fn await_lease(
+  acquire: projection_runner.Coordinator,
+  name: String,
+) -> projection_runner.Lease
+
+@external(erlang, "eventcore_filesystem_test_ffi", "kill_projection_lock")
+fn kill_projection_lock() -> Nil
+
+pub fn projector_stops_without_checkpointing_if_flock_process_exits_test() {
+  let root = temp_root()
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let assert Ok(id) = stream.id("projected")
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(second) = projection.position(2)
+  let event = store.Event(id, "created", 1)
+  let reader = fn(_, _) {
+    Ok(projection.PageResult(
+      [projection.Delivery(event, first), projection.Delivery(event, second)],
+      Some(second),
+    ))
+  }
+  let checkpoints =
+    projection.FencedCheckpoints(
+      fn(_) { Ok(None) },
+      fn(_, _) { panic as "a checked projector must use the fence" },
+      fn(_, _, _) {
+        panic as "a projector without leadership cannot save progress"
+      },
+    )
+  let projector =
+    projection_runner.Projector(
+      name: "lock-loss",
+      filter: projection.all(),
+      initial: Nil,
+      apply: fn(_, delivery) {
+        assert delivery.position == first
+        kill_projection_lock()
+        #(Nil, Ok(Nil))
+      },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      projection_runner.Backend(reader, checkpoints, coordinate),
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Error(projection_runner.Leadership(
+      projection_runner.CoordinatorUnavailable,
+    ))
+  let next = await_lease(coordinate, "lock-loss")
+  next.release()
+  remove_root(root)
+}
+
+pub fn stale_filesystem_holder_cannot_overwrite_replacement_checkpoint_test() {
+  let root = temp_root()
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let assert Ok(checkpoints) =
+    filesystem.open_projection_checkpoints(filesystem.Config(
+      root,
+      filesystem.Full,
+    ))
+  let name = "checkpoint-fence"
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(second) = projection.position(2)
+  let assert projection.FencedCheckpoints(save_fenced:, ..) = checkpoints
+  exercise_checkpoint_handoff(
+    coordinate,
+    name,
+    save_fenced,
+    first,
+    second,
+    False,
+  )
+  assert checkpoints.load(name) == Ok(Some(second))
+  exercise_checkpoint_handoff(
+    coordinate,
+    name,
+    save_fenced,
+    second,
+    first,
+    True,
+  )
+  assert checkpoints.load(name) == Ok(Some(first))
+  remove_root(root)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "exercise_checkpoint_handoff")
+fn exercise_checkpoint_handoff(
+  coordinate: projection_runner.Coordinator,
+  name: String,
+  save: fn(String, projection.Position, projection.CheckpointFence) ->
+    Result(Nil, projection.CheckpointWriteError),
+  old: projection.Position,
+  new: projection.Position,
+  kill_fence: Bool,
+) -> Nil
+
+pub fn checked_filesystem_lease_rejects_unfenced_checkpoints_test() {
+  let root = temp_root()
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let name = "unfenced"
+  let backend =
+    projection_runner.Backend(
+      fn(_, _) { panic as "invalid pair cannot poll" },
+      projection.Checkpoints(
+        fn(_) { panic as "invalid pair cannot load" },
+        fn(_, _) { panic as "invalid pair cannot save" },
+      ),
+      coordinate,
+    )
+  let projector =
+    projection_runner.Projector(
+      name: name,
+      filter: projection.all(),
+      initial: Nil,
+      apply: fn(_, _) { panic as "invalid pair cannot apply" },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      backend,
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Error(projection_runner.InvalidConfiguration)
+  let assert Ok(lease) = coordinate(name)
+  lease.release()
+  remove_root(root)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "check_remote_fenced_save")
+fn check_remote_fenced_save() -> Nil
+
+pub fn fenced_checkpoint_rejects_remote_journal_test() {
+  check_remote_fenced_save()
 }

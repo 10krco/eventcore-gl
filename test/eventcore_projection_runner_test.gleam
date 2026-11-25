@@ -254,7 +254,7 @@ pub fn failed_checkpoint_save_replays_after_restart_test() {
     |> result.try(store.append(_, store.Event(id, "submitted", 1)))
   assert memory.as_store(memory).append_events(writes) == Ok(Nil)
   let failing =
-    projection.Checkpoints(..backend.checkpoints, save: fn(_, _) {
+    projection.Checkpoints(load: backend.checkpoints.load, save: fn(_, _) {
       Error(store.StoreFailure(store.SaveCheckpoint))
     })
   let projector =

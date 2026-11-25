@@ -3,7 +3,10 @@
 -export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
          event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/5,
          replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4,
-         projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3]).
+         projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3, projection_fenced_save/4,
+         open_projection_checkpoints/2, standalone_projection_load/2, standalone_projection_save/4,
+         standalone_projection_fenced_save/5,
+         open_projection_coordinator/1, standalone_projection_acquire/2, projection_acquire/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
@@ -11,7 +14,7 @@
     transactions = #{}, ordered = [], revision = 0, history_revision = 0,
     streams = #{}, tips = [], contested = #{},
     integrity_failures = [], dangling = [],
-    projection_directory, ingestion, sync_journal, leases = #{}
+    projection_directory, ingestion, sync_journal
 }).
 
 start(Root, Sync) ->
@@ -68,6 +71,197 @@ projection_load(Pid, Name) ->
 
 projection_save(Pid, Name, Position) ->
     guarded_call(Pid, none, {projection_save, Name, Position}, save_checkpoint).
+
+open_projection_checkpoints(Root, Sync) ->
+    open_projection_directory(Root, <<"checkpoints">>, Sync).
+
+open_projection_coordinator(Root) ->
+    open_projection_directory(Root, <<"locks">>, unsynced).
+
+open_projection_directory(Root, Name, Sync) ->
+    Directory = filename:join([filename:absname(Root), <<".eventcore">>, <<"projection">>, Name]),
+    case ensure_directory(Directory, Sync, fun(Parent) -> sync_directory(Parent, Sync) end) of
+        ok -> {ok, Directory};
+        _ -> {error, cannot_open}
+    end.
+
+standalone_projection_load(Directory, Name) ->
+    case read_projection_checkpoint(Directory, Name) of
+        {error, nil} -> {error, {store_failure, load_checkpoint}};
+        Reply -> Reply
+    end.
+
+standalone_projection_save(Directory, Sync, Name, Position) ->
+    case write_projection_checkpoint(Directory, Sync, Name, Position) of
+        {error, nil} -> {error, {store_failure, save_checkpoint}};
+        Reply -> Reply
+    end.
+
+standalone_projection_acquire(Directory, Name) ->
+    acquire_projection_lock(Directory, Name, none).
+
+projection_acquire(Pid, _Name) when node(Pid) =/= node() ->
+    {error, remote_holder};
+projection_acquire(Pid, Name) ->
+    case call(Pid, projection_lock_directory, {error, coordinator_unavailable}) of
+        {ok, Directory} -> acquire_projection_lock(Directory, Name, {some, Pid});
+        Error -> Error
+    end.
+
+acquire_projection_lock(Directory, Name, Journal) ->
+    Path = filename:join(Directory, <<(checksum(Name))/binary, ".lock">>),
+    case open_projection_lock(Directory, Path, Journal) of
+        {ok, Worker, Port, Token} ->
+            Release = fun() -> release_projection_lock(Worker, Token) end,
+            Check = fun() -> check_projection_lock(Worker, Port, Journal) end,
+            Fence = {Name, <<Path/binary, ".checkpoint">>, Check},
+            {ok, {checked_lease, Release, Check, Fence}};
+        Error -> Error
+    end.
+
+open_projection_lock(Directory, Path, Journal) ->
+    Owner = self(),
+    Reference = make_ref(),
+    {Worker, Monitor} = spawn_monitor(fun() ->
+        projection_lock_worker(Owner, Reference, Directory, Path, Journal)
+    end),
+    receive
+        {Reference, Reply} ->
+            erlang:demonitor(Monitor, [flush]),
+            Reply;
+        {'DOWN', Monitor, process, Worker, _} ->
+            {error, coordinator_unavailable}
+    end.
+
+projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
+    process_flag(trap_exit, true),
+    OwnerMonitor = monitor(process, Owner),
+    JournalMonitor = case Journal of
+        none -> none;
+        {some, JournalPid} -> monitor(process, JournalPid)
+    end,
+    Lock = case filelib:ensure_path(Directory) of
+        ok -> acquire_lock(Path);
+        Error -> Error
+    end,
+    case Lock of
+        {ok, Port} ->
+            Worker = self(),
+            Token = make_ref(),
+            Owner ! {Reference, {ok, Worker, Port, Token}},
+            receive
+                {release, Token} -> release_lock(Port);
+                {'DOWN', OwnerMonitor, process, _, _} -> release_lock(Port);
+                {'DOWN', JournalMonitor, process, _, _} -> release_lock(Port);
+                {Port, {exit_status, _}} -> ok;
+                {'EXIT', Port, _} -> ok
+            end;
+        {error, store_locked} -> Owner ! {Reference, {error, already_leading}};
+        _ -> Owner ! {Reference, {error, coordinator_unavailable}}
+    end.
+
+projection_fenced_save(Pid, _Name, _Position, _Fence) when node(Pid) =/= node() ->
+    {error, lease_lost};
+projection_fenced_save(Pid, Name, Position, Fence) ->
+    case call(Pid, projection_checkpoint_config, {error, lease_lost}) of
+        {ok, Directory, Sync} ->
+            standalone_projection_fenced_save(Directory, Sync, Name, Position, Fence);
+        Error -> Error
+    end.
+
+standalone_projection_fenced_save(Directory, Sync, Name, {position, Sequence},
+                                  {Name, Lock, Check})
+    when Sequence > 0, Sequence < (1 bsl 64) ->
+    case ensure_directory(Directory, Sync, fun(Parent) -> sync_directory(Parent, Sync) end) of
+        ok -> publish_fenced_checkpoint(Directory, Sync, Name, Sequence, Lock, Check);
+        Error -> checkpoint_write_result(Error)
+    end;
+standalone_projection_fenced_save(_, _, _, _, _) -> {error, lease_lost}.
+
+publish_fenced_checkpoint(Directory, Sync, Name, Sequence, Lock, Check) ->
+    Path = projection_checkpoint_path(Directory, Name),
+    Nonce = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
+    Temp = <<Path/binary, ".", Nonce/binary, ".tmp">>,
+    try
+        case prepare_rename(Temp, <<Sequence:64>>, Sync) of
+            ok ->
+                Deadline = erlang:monotonic_time(millisecond) + 5000,
+                case fenced_rename(Temp, Path, Lock, Check, Deadline) of
+                    ok -> checkpoint_write_result(sync_directory(Directory, Sync));
+                    {error, lease_lost} = Error -> Error;
+                    Error -> checkpoint_write_result(Error)
+                end;
+            Error -> checkpoint_write_result(Error)
+        end
+    after
+        file:delete(Temp)
+    end.
+
+checkpoint_write_result(ok) -> {ok, nil};
+checkpoint_write_result(_) -> {error, {write_failed, {store_failure, save_checkpoint}}}.
+
+fenced_rename(Temp, Path, Lock, Check, Deadline) ->
+    case os:find_executable("flock") of
+        false -> {error, lease_lost};
+        Executable ->
+            % The process holding flock performs the rename itself via exec.
+            % A terminated lock holder cannot resume a pending rename.
+            Port = open_port({spawn_executable, Executable},
+                             [binary, exit_status, use_stdio,
+                              {args, ["-F", "-n", "-E", "75", "--", Lock,
+                                      "sh", "-c",
+                                      "printf R; IFS= read -r action && [ \"$action\" = commit ] && exec mv -fT -- \"$1\" \"$2\"",
+                                      "checkpoint", Temp, Path]}]),
+            try
+                receive
+                    {Port, {data, <<"R">>}} ->
+                        case Check() of
+                            {ok, nil} -> commit_fenced_rename(Port);
+                            _ -> {error, lease_lost}
+                        end;
+                    {Port, {exit_status, 75}} ->
+                        case erlang:monotonic_time(millisecond) < Deadline of
+                            true ->
+                                timer:sleep(10),
+                                fenced_rename(Temp, Path, Lock, Check, Deadline);
+                            false -> {error, lease_lost}
+                        end;
+                    {Port, {exit_status, _}} -> {error, lease_lost}
+                after 5000 -> {error, lease_lost}
+                end
+            after
+                catch port_close(Port)
+            end
+    end.
+
+commit_fenced_rename(Port) ->
+    case catch port_command(Port, <<"commit\n">>) of
+        true ->
+            receive
+                {Port, {exit_status, 0}} -> ok;
+                {Port, {exit_status, 1}} -> {error, rename_failed};
+                {Port, {exit_status, _}} -> {error, lease_lost}
+            after 5000 -> {error, lease_lost}
+            end;
+        _ -> {error, lease_lost}
+    end.
+
+check_projection_lock(Worker, Port, Journal) ->
+    case is_process_alive(Worker) andalso erlang:port_info(Port) =/= undefined
+         andalso journal_alive(Journal) of
+        true -> {ok, nil};
+        false -> {error, coordinator_unavailable}
+    end.
+
+journal_alive(none) -> true;
+journal_alive({some, Pid}) -> is_process_alive(Pid).
+
+release_projection_lock(Worker, Token) ->
+    Monitor = monitor(process, Worker),
+    Worker ! {release, Token},
+    receive
+        {'DOWN', Monitor, process, Worker, _} -> nil
+    end.
 
 load_snapshot(Pid, Revision, Name) ->
     guarded_call(Pid, {some, Revision}, {load_snapshot, Name}, load_snapshot).
@@ -227,16 +421,13 @@ handle_info({Port, {exit_status, _}}, #state{lock = Port} = State) ->
     {stop, lock_lost, State};
 handle_info({'EXIT', Port, _}, #state{lock = Port} = State) ->
     {stop, lock_lost, State};
-handle_info({'DOWN', Holder, process, _, _}, #state{leases = Leases} = State) ->
-    {noreply, State#state{leases = eventcore_projection_leases:down(Holder, Leases)}};
 handle_info(_Info, State) -> {noreply, State}.
 
-handle_call({acquire, Name}, {Holder, _}, #state{leases = Leases} = State) ->
-    {Reply, Updated} = eventcore_projection_leases:acquire(Name, Holder, Leases),
-    {reply, Reply, State#state{leases = Updated}};
-handle_call({release, Name, Token}, _From, #state{leases = Leases} = State) ->
-    Updated = eventcore_projection_leases:release(Name, Token, Leases),
-    {reply, nil, State#state{leases = Updated}};
+handle_call(projection_lock_directory, _From, #state{projection_directory = Root} = State) ->
+    {reply, {ok, filename:join(Root, <<"locks">>)}, State};
+handle_call(projection_checkpoint_config, _From,
+            #state{projection_directory = Root, sync = Sync} = State) ->
+    {reply, {ok, filename:join(Root, <<"checkpoints">>), Sync}, State};
 handle_call(projection_frontier, _From, State) ->
     case sync_and_flush_ingestion(State) of
         {ok, High, Updated} -> {reply, {ok, High}, Updated};
@@ -244,21 +435,11 @@ handle_call(projection_frontier, _From, State) ->
     end;
 handle_call({projection_fetch, First, Last}, _From, #state{ingestion = Index} = State) ->
     {reply, eventcore_filesystem_ingestion:fetch(First, Last, Index), State};
-handle_call({projection_load, Name}, _From, State) ->
-    {_, Path} = projection_checkpoint(Name, State),
-    Reply = case file:read_file(Path) of
-        {ok, <<Sequence:64>>} when Sequence > 0 -> {ok, {some, {position, Sequence}}};
-        {error, enoent} -> {ok, none};
-        _ -> {error, nil}
-    end,
-    {reply, Reply, State};
-handle_call({projection_save, Name, {position, Sequence}}, _From, #state{sync = Sync} = State) ->
-    {Directory, Path} = projection_checkpoint(Name, State),
-    Reply = case Sequence > 0 andalso Sequence < (1 bsl 64) of
-        true -> publish_snapshot(Directory, Path, <<Sequence:64>>, Sync);
-        false -> {error, nil}
-    end,
-    {reply, Reply, State};
+handle_call({projection_load, Name}, _From, #state{projection_directory = Root} = State) ->
+    {reply, read_projection_checkpoint(filename:join(Root, <<"checkpoints">>), Name), State};
+handle_call({projection_save, Name, Position}, _From,
+            #state{projection_directory = Root, sync = Sync} = State) ->
+    {reply, write_projection_checkpoint(filename:join(Root, <<"checkpoints">>), Sync, Name, Position), State};
 handle_call(status, _From, #state{integrity_failures = Bad, dangling = [_ | _] = Dangling,
                                  transactions = Transactions, ordered = Reversed} = State) ->
     Forks = [Fork || {Fork, _} <- eventcore_filesystem_graph:stream_forks(Transactions, lists:reverse(Reversed))],
@@ -433,9 +614,21 @@ flush_ingestion(#state{ingestion = Index, sync = Sync} = State) ->
         Error -> Error
     end.
 
-projection_checkpoint(Name, #state{projection_directory = Root}) ->
-    Directory = filename:join(Root, <<"checkpoints">>),
-    {Directory, filename:join(Directory, <<(checksum(Name))/binary, ".checkpoint">>)}.
+read_projection_checkpoint(Directory, Name) ->
+    Path = projection_checkpoint_path(Directory, Name),
+    case file:read_file(Path) of
+        {ok, <<Sequence:64>>} when Sequence > 0 -> {ok, {some, {position, Sequence}}};
+        {error, enoent} -> {ok, none};
+        _ -> {error, nil}
+    end.
+
+write_projection_checkpoint(Directory, Sync, Name, {position, Sequence})
+    when Sequence > 0, Sequence < (1 bsl 64) ->
+    publish_snapshot(Directory, projection_checkpoint_path(Directory, Name), <<Sequence:64>>, Sync);
+write_projection_checkpoint(_, _, _, _) -> {error, nil}.
+
+projection_checkpoint_path(Directory, Name) ->
+    filename:join(Directory, <<(checksum(Name))/binary, ".checkpoint">>).
 
 snapshot_path(Name, #state{snapshot_directory = Directory}) ->
     filename:join(Directory, <<(checksum(Name))/binary, ".snapshot">>).
@@ -494,6 +687,18 @@ publish_snapshot(Directory, Path, Bytes, Sync) ->
     end.
 
 write_transaction(Temp, Path, Bytes, Sync) ->
+    case prepare_rename(Temp, Bytes, Sync) of
+        ok ->
+            case file:rename(Temp, Path) of
+                ok -> ok;
+                Error ->
+                    file:delete(Temp),
+                    Error
+            end;
+        Error -> Error
+    end.
+
+prepare_rename(Temp, Bytes, Sync) ->
     case file:open(Temp, [write, raw, binary, exclusive]) of
         {ok, File} ->
             Written = case file:write(File, Bytes) of
@@ -501,16 +706,14 @@ write_transaction(Temp, Path, Bytes, Sync) ->
                 Error -> Error
             end,
             Closed = file:close(File),
-            Result = case {Written, Closed} of
-                {ok, ok} -> file:rename(Temp, Path);
-                {{error, _} = Error1, _} -> Error1;
-                {ok, Error2} -> Error2
-            end,
-            case Result of
-                ok -> ok;
-                Error3 ->
+            case {Written, Closed} of
+                {ok, ok} -> ok;
+                {{error, _} = Error1, _} ->
                     file:delete(Temp),
-                    Error3
+                    Error1;
+                {ok, Error2} ->
+                    file:delete(Temp),
+                    Error2
             end;
         Error -> Error
     end.
