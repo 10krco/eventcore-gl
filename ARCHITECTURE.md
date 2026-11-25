@@ -38,7 +38,9 @@ transaction bytes. The transaction records its parent IDs, expected stream
 versions and encoded events. A single OTP process holds a host advisory lock,
 checks versions and publishes files by atomic rename. Full sync flushes the
 transaction file, its directory, and the journal directory’s ancestor entries on every open. On reopen the server rebuilds stream histories from the transaction
-graph and reports damaged files and missing parents. Appends require all parents to be present. Complete graphs expose divergent stream histories for reconciliation. See [ADR 0004](docs/decisions/0004-filesystem-journal.md).
+graph and reports damaged files and missing parents. The default policy
+requires all parents to be present before appending. See
+[ADR 0004](docs/decisions/0004-filesystem-journal.md).
 
 ## Filesystem replica reconciliation
 
@@ -46,8 +48,8 @@ New transactions carry a replica identity that typically comes from
 fingerprint-bound metadata under the journal's Git-ignored local directory.
 On reopen, ancestor depth and stable transaction fields determine canonical
 order. The journal compares branch ancestry to detect forks and replica
-identity collisions. Callers can inspect complete branch histories and submit
-a resolution against the graph revision they read. Each resolution records
+identity collisions. With the default `FullBranches` policy, callers can
+inspect complete branch histories and submit a resolution against the graph revision they read. Each resolution records
 the stream, base and heads it joins. Its ancestry includes those heads, the
 latest local publication, and the writes and decisions on any other stream it
 writes.
@@ -55,6 +57,14 @@ Later imports can reopen a fork, and resolvers can inspect the evidence
 accepted by earlier resolutions. Projections can compare an event-prefix
 fingerprint after importing history and rebuild when the consumed prefix
 changes. See [ADR 0005](docs/decisions/0005-filesystem-reconciliation.md).
+
+The `RustRelease` policy is selected when opening a journal. It considers
+all registered stream versions in nonempty appends, including streams read
+without writing. An ordinary append can close a fork by joining its
+ancestry. Resolvers receive each original claiming transaction and write a
+merge whose parents are just those transactions. Resolution events extend
+the live stream index. Reopen rebuilds the canonical order from the graph.
+See [ADR 0023](docs/decisions/0023-filesystem-release-reconciliation.md).
 
 ## SQLite storage
 

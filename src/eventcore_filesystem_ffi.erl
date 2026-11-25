@@ -1,6 +1,7 @@
 -module(eventcore_filesystem_ffi).
 -behaviour(gen_server).
--export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
+-export([start/2, start/3, start_with_replica/3, start_with_reconciliation/4,
+         stop/1, status/1, read/3, append/3,
          event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/5,
          replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4,
          projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3, projection_fenced_save/4,
@@ -14,21 +15,25 @@
     transactions = #{}, ordered = [], revision = 0, history_revision = 0,
     streams = #{}, tips = [], contested = #{},
     integrity_failures = [], dangling = [],
-    projection_directory, ingestion, sync_journal
+    projection_directory, ingestion, sync_journal, reconciliation
 }).
 
 start(Root, Sync) ->
     start_with_replica(Root, Sync, none).
 
 start_with_replica(Root, Sync, Replica) ->
-    start_server(Root, Sync, Replica, fun(Directory) -> sync_directory(Directory, Sync) end).
+    start_with_reconciliation(Root, Sync, Replica, full_branches).
+
+start_with_reconciliation(Root, Sync, Replica, Reconciliation) ->
+    SyncDirectory = fun(Directory) -> sync_directory(Directory, Sync) end,
+    start_server(Root, Sync, Replica, SyncDirectory, Reconciliation).
 
 % Accept a directory sync function to exercise failures in tests.
 start(Root, Sync, SyncAncestor) ->
-    start_server(Root, Sync, none, SyncAncestor).
+    start_server(Root, Sync, none, SyncAncestor, full_branches).
 
-start_server(Root, Sync, Replica, SyncAncestor) ->
-    case gen_server:start(?MODULE, {self(), Root, Sync, Replica, SyncAncestor}, []) of
+start_server(Root, Sync, Replica, SyncAncestor, Reconciliation) ->
+    case gen_server:start(?MODULE, {self(), Root, Sync, Replica, SyncAncestor, Reconciliation}, []) of
         {ok, Pid} -> {ok, Pid};
         {error, {shutdown, store_locked}} -> {error, store_locked};
         {error, {shutdown, lock_executable_missing}} -> {error, lock_executable_missing};
@@ -282,7 +287,7 @@ call(Pid, Request, Failure) ->
         exit:_ -> Failure
     end.
 
-init({Owner, RequestedRoot, Sync, Replica, SyncAncestor}) ->
+init({Owner, RequestedRoot, Sync, Replica, SyncAncestor, Reconciliation}) ->
     process_flag(trap_exit, true),
     Root = filename:absname(RequestedRoot),
     Directory = filename:join(Root, <<"events">>),
@@ -291,7 +296,7 @@ init({Owner, RequestedRoot, Sync, Replica, SyncAncestor}) ->
             case acquire_lock(filename:join(Root, <<".lock">>)) of
                 {ok, Lock} ->
                     State = #state{owner = monitor(process, Owner), lock = Lock,
-                                   directory = Directory, sync = Sync,
+                                   directory = Directory, sync = Sync, reconciliation = Reconciliation,
                                    sync_journal = fun() -> SyncAncestor(Directory) end,
                                    projection_directory = filename:join([Root, <<".eventcore">>, <<"projection">>]),
                                    snapshot_directory = filename:join([Root, <<".eventcore">>, <<"snapshots">>])},
@@ -440,13 +445,14 @@ handle_call({projection_load, Name}, _From, #state{projection_directory = Root} 
 handle_call({projection_save, Name, Position}, _From,
             #state{projection_directory = Root, sync = Sync} = State) ->
     {reply, write_projection_checkpoint(filename:join(Root, <<"checkpoints">>), Sync, Name, Position), State};
-handle_call(status, _From, #state{integrity_failures = Bad, dangling = [_ | _] = Dangling,
+handle_call(status, _From, #state{reconciliation = full_branches,
+                                 integrity_failures = Bad, dangling = [_ | _] = Dangling,
                                  transactions = Transactions, ordered = Reversed} = State) ->
     Forks = [Fork || {Fork, _} <- eventcore_filesystem_graph:stream_forks(Transactions, lists:reverse(Reversed))],
     {reply, {ok, {status, Bad, Dangling, Forks}}, State};
-handle_call(status, _From, #state{integrity_failures = Bad} = State) ->
+handle_call(status, _From, #state{integrity_failures = Bad, dangling = Dangling} = State) ->
     Reply = case detected_forks(State) of
-        {ok, Forks} -> {ok, {status, Bad, [], Forks}};
+        {ok, Forks} -> {ok, {status, Bad, Dangling, Forks}};
         Error -> Error
     end,
     {reply, Reply, State};
@@ -469,6 +475,9 @@ handle_call(fork_snapshot, _From, #state{revision = Revision} = State) ->
 handle_call({resolve, Revision, _, _}, _From, #state{revision = Current} = State)
   when Revision =/= Current ->
     {reply, {error, reconciliation_changed}, State};
+handle_call({resolve, _, {fork, _, _, Heads}, Events}, _From,
+            #state{reconciliation = rust_release, streams = Streams} = State) ->
+    reply_to_resolution(persist(resolution_bases(Events, Streams), Events, Heads, none, State));
 handle_call({resolve, _, _, _}, _From, #state{dangling = [_ | _]} = State) ->
     {reply, {error, journal_unavailable}, State};
 handle_call({resolve, _, {fork, Stream, Base, Heads} = Fork, Events}, _From,
@@ -505,7 +514,10 @@ handle_call({read, Id, After}, _From, #state{streams = Streams} = State) ->
     {Version, Reversed} = maps:get(Id, Streams, {0, []}),
     Tail = lists:reverse(lists:sublist(Reversed, max(0, Version - After))),
     {reply, {ok, Tail}, State};
-handle_call({append, _, _}, _From, #state{dangling = [_ | _]} = State) ->
+handle_call({append, _, []}, _From, #state{reconciliation = rust_release} = State) ->
+    {reply, {ok, nil}, State};
+handle_call({append, _, _}, _From,
+            #state{reconciliation = full_branches, dangling = [_ | _]} = State) ->
     {reply, {error, {store_failure, append_events}}, State};
 handle_call({append, Expected, Events}, _From,
             #state{streams = Streams, tips = Parents, contested = Contested} = State) ->
@@ -565,6 +577,8 @@ detected_forks(State) ->
         Error -> Error
     end.
 
+fork_contexts(#state{reconciliation = rust_release, transactions = Transactions, ordered = Reversed}) ->
+    eventcore_filesystem_graph:release_forks(Transactions, lists:reverse(Reversed));
 fork_contexts(#state{transactions = Transactions, ordered = Reversed}) ->
     eventcore_filesystem_graph:forks(Transactions, lists:reverse(Reversed)).
 
@@ -820,17 +834,30 @@ index_new_transaction(Id, #{parents := Tips, events := Events, resolution := non
                       #state{tips = Tips, streams = Streams, ordered = Reversed} = State) ->
     State#state{transactions = Transactions, revision = map_size(Transactions),
                 ordered = [Id | Reversed], tips = [Id], streams = index_events(Events, Streams)};
+index_new_transaction(Id, #{parents := Parents, events := Events}, Transactions,
+                      #state{reconciliation = rust_release, tips = Tips,
+                             streams = Streams, ordered = Reversed} = State) ->
+    % The release appends resolution events to a live index and reorders
+    % by graph depth when the journal opens again.
+    Remaining = ordsets:subtract(Tips, Parents),
+    State#state{transactions = Transactions, revision = map_size(Transactions),
+                ordered = [Id | Reversed], tips = ordsets:add_element(Id, Remaining),
+                streams = index_events(Events, Streams)};
 index_new_transaction(_Id, _Record, Transactions, State) ->
     index_transactions(Transactions, State#state{history_revision = State#state.history_revision + 1}).
 
-index_transactions(Transactions, State) ->
+index_transactions(Transactions, #state{reconciliation = Reconciliation} = State) ->
     Ordered = eventcore_filesystem_graph:order(Transactions),
-    Forks = eventcore_filesystem_graph:stream_forks(Transactions, Ordered),
     Streams = lists:foldl(fun(Id, Index) ->
         #{events := Events} = maps:get(Id, Transactions),
         index_events(Events, Index)
     end, #{}, Ordered),
-    Contested = maps:from_keys([Stream || {{fork, Stream, _, _}, _} <- Forks], true),
+    Contested = case Reconciliation of
+        full_branches ->
+            Forks = eventcore_filesystem_graph:stream_forks(Transactions, Ordered),
+            maps:from_keys([Stream || {{fork, Stream, _, _}, _} <- Forks], true);
+        rust_release -> #{}
+    end,
     State#state{transactions = Transactions, revision = map_size(Transactions), contested = Contested,
                 ordered = lists:reverse(Ordered), streams = Streams, tips = eventcore_filesystem_graph:tips(Transactions),
                 dangling = eventcore_filesystem_graph:dangling(Transactions)}.

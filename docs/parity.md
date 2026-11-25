@@ -30,12 +30,11 @@ Owning Tiber task `20261124-m7wf`.
 | [Run PostgreSQL storage contracts](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-postgres/tests/contract_suite_test.rs) | Pass shared contracts against a real database, migrate and reconnect, commit batches atomically, retry competing writers, and assert the published observability behavior. | [Live PostgreSQL contract](../test/eventcore_postgres_integration_test.gleam) and [two-pool scenarios](../test/postgres_contract.gleam). |
 | [Restore and catch up command state](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore/tests/command_state_snapshot_test.rs) | Handle a missing snapshot, persist monotonically advancing snapshots, exercise the default 100-event refresh threshold and replay only required events in stream order. Exercise restart on each supporting adapter. | [Replay and refresh tests](../test/eventcore_command_test.gleam), [journal restart and invalidation tests](../test/eventcore_filesystem_test.gleam), and [SQLite restart tests](../test/eventcore_sqlite_test.gleam). The [PostgreSQL contract](../test/postgres_contract.gleam) reopens the snapshot through a second pool and rejects a regressing version. |
 
-Rust 2.1.0 closes a fork when any transaction joins its ancestry and passes
-only the initial competing transactions to the resolver. Gleam keeps the
-fork open until an explicit resolution names it and supplies each branch's
-events through its current head. Unrelated streams can advance while writes
-to the forked stream wait for resolution. These differences prevent unrelated
-writes from concealing a conflict and give the resolver the full evidence.
+Open the journal with `RustRelease` to reproduce the published fork rules.
+The release tests exercise initial claim events, read-only stream claims,
+empty appends, and ordinary appends that close forks. The default
+`FullBranches` policy requires a recorded resolution and supplies each
+branch's events through its current head.
 [Rust fork detection](https://github.com/jwilger/eventcore/blob/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/src/merge.rs#L231)
 [Rust resolver context](https://github.com/jwilger/eventcore/blob/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-fs/src/lib.rs#L622)
 

@@ -1,5 +1,5 @@
 -module(eventcore_filesystem_graph).
--export([order/1, tips/1, dangling/1, forks/2, stream_forks/2,
+-export([order/1, tips/1, dangling/1, forks/2, stream_forks/2, release_forks/2,
          topology_generation/1, event_prefix_token/3]).
 
 order(Transactions) ->
@@ -59,6 +59,38 @@ forks(Transactions, Order) ->
         ok -> {ok, stream_forks(Transactions, Order)};
         Conflict -> {error, Conflict}
     end.
+
+release_forks(Transactions, Order) ->
+    Replicas = maps:groups_from_list(
+        fun(Id) -> maps:get(replica, maps:get(Id, Transactions)) end, Order),
+    case replica_conflicts(lists:sort(maps:to_list(maps:remove(undefined, Replicas))),
+                           Transactions) of
+        ok -> {ok, release_stream_forks(Transactions)};
+        Conflict -> {error, Conflict}
+    end.
+
+release_stream_forks(Transactions) ->
+    Claims = maps:fold(fun(Id, #{bases := Bases}, Groups) ->
+        lists:foldl(fun(Key, Acc) -> add_claim(Key, Id, Acc) end, Groups, Bases)
+    end, #{}, Transactions),
+    Competing = [{Key, Ids} || {Key, [_, _ | _] = Ids} <- maps:to_list(Claims)],
+    Open = drop_joined_claims(tips(Transactions), Competing, Transactions),
+    [begin
+        Ids = lists:sort(ClaimsAtBase),
+        {{fork, Stream, Version, Ids},
+         [{Id, branch_events(Stream, Id, Transactions)} || Id <- Ids]}
+     end || {{Stream, Version}, ClaimsAtBase} <- lists:sort(Open)].
+
+drop_joined_claims(_, [], _) -> [];
+drop_joined_claims([], Claims, _) -> Claims;
+drop_joined_claims([Tip | Rest], Claims, Transactions) ->
+    % If any transaction strictly descends from every claim, a tip does too.
+    #{parents := Parents} = maps:get(Tip, Transactions),
+    Ancestors = mark_ancestry(Parents, Transactions, #{}),
+    Open = lists:filter(fun({_, Ids}) ->
+        not lists:all(fun(Id) -> maps:is_key(Id, Ancestors) end, Ids)
+    end, Claims),
+    drop_joined_claims(Rest, Open, Transactions).
 
 branch_events(Stream, Id, Transactions) ->
     #{events := Events} = maps:get(Id, Transactions),
