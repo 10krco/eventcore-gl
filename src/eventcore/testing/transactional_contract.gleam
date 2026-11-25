@@ -106,7 +106,12 @@ pub fn check(fixture: Fixture(source_error, progress_error)) -> Nil {
   assert transactional.run(destination, projector, source, config)
     == Ok(transactional.CaughtUp(0, 0, Some(position3)))
 
-  let assert Ok(alternate_id) = delivery.selection_id("amount-v2")
+  let assert Ok(candidate) = delivery.selection_id("amount-v2")
+  let assert Ok(fallback) = delivery.selection_id("amount-v3")
+  let alternate_id = case selection_id == candidate {
+    True -> fallback
+    False -> candidate
+  }
   assert transactional.reset(destination, name, source_id, alternate_id, fn(_) {
       panic as "mismatched reset callback"
     })
@@ -117,6 +122,8 @@ pub fn check(fixture: Fixture(source_error, progress_error)) -> Nil {
     })
     == Error(transactional.ResetCallbackFailed("rollback"))
   assert fixture.effect_count() == 2
+  assert fixture.load_progress(name)
+    == Ok(Some(Progress(source_id, selection_id, position3)))
 
   let replay =
     transactional.Projector(

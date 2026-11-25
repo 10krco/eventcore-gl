@@ -97,6 +97,7 @@ pub fn check_snapshots(repository: snapshot.Repository) -> Nil {
   assert repository.load(key) == Ok(Some(first))
   assert repository.save(key, Some(first), second) == Ok(Nil)
   assert repository.save(key, Some(first), first) == Ok(Nil)
+  assert repository.save(key, Some(second), first) == Ok(Nil)
   assert repository.load(key) == Ok(Some(second))
 }
 
@@ -185,6 +186,7 @@ pub fn check_delivery_boundary(
   selection: delivery.Selection,
   before: projection.Position,
   boundary: projection.Position,
+  following: projection.Position,
   earlier_event_id: String,
   boundary_kind: delivery.EventType,
   boundary_payload: BitArray,
@@ -205,6 +207,5 @@ pub fn check_delivery_boundary(
   assert after.source == source.id
   assert after.event_id != at_boundary.event_id
   assert after.payload == following_payload
-  assert projection.sequence(after.position)
-    == projection.sequence(boundary) + 1
+  assert after.position == following
 }

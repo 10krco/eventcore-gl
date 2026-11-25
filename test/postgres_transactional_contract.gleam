@@ -35,7 +35,7 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     |> result.try(store.append(_, store.Event(id, "amount", <<3>>)))
   assert postgres.as_store(events).append_events(batch) == Ok(Nil)
   let assert Ok(source_id) = delivery.source_id("transactional-store")
-  let assert Ok(selection_id) = delivery.selection_id("amount-v1")
+  let assert Ok(selection_id) = delivery.selection_id("amount-v2")
   let assert Ok(kind) = delivery.event_type("amount")
   let assert Ok(selection) =
     delivery.selection(selection_id, projection.all(), [kind])

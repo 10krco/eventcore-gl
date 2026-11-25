@@ -236,9 +236,15 @@ fn check_committed_delivery(
   assert postgres.as_store(events).append_events(batch) == Ok(Nil)
   let assert Ok(Some(boundary)) = source.high_watermark()
 
-  let next_batch =
-    single_event(new_stream, stream.next_version(stream.initial_version), 300)
+  let one = stream.next_version(stream.initial_version)
+  let assert Ok(next_batch) =
+    store.writes()
+    |> store.register(new_stream, one)
+    |> result.try(store.append(_, store.Event(new_stream, "unselected", 250)))
+    |> result.try(store.append(_, store.Event(new_stream, "created", 300)))
   assert postgres.as_store(reopened).append_events(next_batch) == Ok(Nil)
+  let assert Ok(Some(following)) = source.high_watermark()
+  assert projection.sequence(following) == projection.sequence(boundary) + 2
   let assert Ok(persisted) = delivery.persisted_event_type(" opened ")
   let assert Ok(later) = delivery.event_type("created")
   let assert Ok(exact_selection) =
@@ -248,6 +254,7 @@ fn check_committed_delivery(
     exact_selection,
     before,
     boundary,
+    following,
     first.event_id,
     persisted,
     <<200:64>>,
