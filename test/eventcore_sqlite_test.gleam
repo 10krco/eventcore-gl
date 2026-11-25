@@ -325,6 +325,19 @@ pub fn projection_pages_resume_from_a_separate_sqlite_checkpoint_test() {
   assert delete_database(checkpoint_path) == Nil
 }
 
+pub fn invalid_sqlite_projection_checkpoint_fails_instead_of_replaying_test() {
+  let path = temp_database()
+  let assert Ok(checkpoints) = sqlite.open_checkpoints(path, None)
+  assert sqlite.migrate_checkpoints(checkpoints) == Ok(Nil)
+  let progress = sqlite.projection_checkpoints(checkpoints)
+  assert progress.load("notes") == Ok(None)
+  assert sqlite.save_checkpoint(checkpoints, "notes", 0) == Ok(Nil)
+  assert progress.load("notes")
+    == Error(store.StoreFailure(store.LoadCheckpoint))
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+  assert delete_database(path) == Nil
+}
+
 pub fn sqlite_projection_frontier_excludes_concurrent_commits_until_next_page_test() {
   let path = temp_database()
   let codec = integer_codec()
@@ -332,18 +345,18 @@ pub fn sqlite_projection_frontier_excludes_concurrent_commits_until_next_page_te
   assert sqlite.migrate(writer) == Ok(Nil)
   let assert Ok(id) = stream.id("notes")
   let first = store.Event(id, "note", 1)
-  let second = store.Event(id, "note", 2)
+  let last_initial = store.Event(id, "note", 2)
+  let concurrent = store.Event(id, "note", 3)
+  let filler = list.repeat(store.Event(id, "ignored", 0), 128)
   let assert Ok(initial) =
     store.register(store.writes(), id, stream.initial_version)
   let assert Ok(initial) = store.append(initial, first)
+  let assert Ok(initial) = list.try_fold(filler, initial, store.append)
+  let assert Ok(initial) = store.append(initial, last_initial)
   assert sqlite.as_store(writer).append_events(initial) == Ok(Nil)
-  let assert Ok(next) =
-    store.register(
-      store.writes(),
-      id,
-      stream.next_version(stream.initial_version),
-    )
-  let assert Ok(next) = store.append(next, second)
+  let assert Ok(version) = stream.version(130)
+  let assert Ok(next) = store.register(store.writes(), id, version)
+  let assert Ok(next) = store.append(next, concurrent)
   let reader_codec =
     sqlite.Codec(codec.encode, fn(kind, bytes) {
       use value <- result.try(codec.decode(kind, bytes))
@@ -359,21 +372,24 @@ pub fn sqlite_projection_frontier_excludes_concurrent_commits_until_next_page_te
   let reader = sqlite.projection_reader(db)
   let assert Ok(page) = projection.page(None, 3)
   let assert Ok(one) = projection.position(1)
-  assert reader(projection.all(), page)
+  let assert Ok(last_position) = projection.position(130)
+  let selection = projection.with_event_type(projection.all(), "note")
+  assert reader(selection, page)
     == Ok(projection.PageResult(
       [
         projection.Delivery(first, one),
+        projection.Delivery(last_initial, last_position),
       ],
-      Some(one),
+      Some(last_position),
     ))
-  let assert Ok(page) = projection.page(Some(one), 3)
-  let assert Ok(two) = projection.position(2)
-  assert reader(projection.all(), page)
+  let assert Ok(page) = projection.page(Some(last_position), 3)
+  let assert Ok(next_position) = projection.position(131)
+  assert reader(selection, page)
     == Ok(projection.PageResult(
       [
-        projection.Delivery(second, two),
+        projection.Delivery(concurrent, next_position),
       ],
-      Some(two),
+      Some(next_position),
     ))
   assert sqlite.close(db) == Ok(Nil)
   assert sqlite.close(writer) == Ok(Nil)

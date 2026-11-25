@@ -215,10 +215,13 @@ pub fn projection_checkpoints(
     fn(name) {
       load_checkpoint(checkpoints, name)
       |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
-      |> result.map(fn(cursor) {
+      |> result.try(fn(cursor) {
         case cursor {
-          Some(sequence) -> option.from_result(projection.position(sequence))
-          None -> None
+          Some(sequence) ->
+            projection.position(sequence)
+            |> result.map(Some)
+            |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
+          None -> Ok(None)
         }
       })
     },
