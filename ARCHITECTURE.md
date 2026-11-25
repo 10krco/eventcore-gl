@@ -150,11 +150,13 @@ Views that share a checkpoint handle also share its named leases.
 See [ADR 0012](docs/decisions/0012-sqlite-projection-replay.md).
 
 PostgreSQL strict delivery uses the committed event position counter as its
-watermark. Separate migrations add persistent UUIDs and JSON metadata for
-existing and future rows. The delivery source scans bounded position ranges,
+watermark. The delivery migration adds persistent UUIDv7 identities and
+JSON metadata. Reapplying it replaces the default while preserving existing
+IDs. The delivery source scans bounded position ranges,
 applies its validated selection before counting deliveries, and returns the
 original payload bytes and JSON metadata for application decoding.
-See [ADR 0013](docs/decisions/0013-postgres-projection-delivery.md).
+See [ADR 0013](docs/decisions/0013-postgres-projection-delivery.md) and
+[ADR 0025](docs/decisions/0025-postgres-delivery-uuid-v7.md).
 
 Legacy PostgreSQL projectors hold a session advisory lock in the checkpoint
 database. Named checkpoint operations use the lock-owning session. Reads can
