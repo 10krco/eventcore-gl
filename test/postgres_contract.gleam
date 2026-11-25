@@ -7,12 +7,12 @@ import eventcore/projection_runner as runner
 import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
+import eventcore/testing/adapter_contract as store_contract
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{None, Some}
 import gleam/result
 import pog
-import store_contract
 
 pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   let codec =
@@ -69,6 +69,13 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   assert snapshots.save(key, None, newer) == Ok(Nil)
   assert second_snapshots.save(key, Some(newer), older) == Ok(Nil)
   assert second_snapshots.load(key) == Ok(Some(newer))
+  let backend = postgres.projection_backend(events)
+  let second_backend = postgres.projection_backend(reopened)
+  store_contract.check_read_only_participant(postgres.as_store(events))
+  store_contract.check_snapshots(snapshots)
+  store_contract.check_replay(postgres.as_store(events), second_backend.reader)
+  store_contract.check_checkpoints(second_backend.checkpoints)
+  store_contract.check_coordination(backend.acquire, second_backend.acquire)
 }
 
 fn check_competing_writers(first: store.Store(Int), second: store.Store(Int)) {
@@ -229,30 +236,31 @@ fn check_committed_delivery(
   assert postgres.as_store(events).append_events(batch) == Ok(Nil)
   let assert Ok(Some(boundary)) = source.high_watermark()
 
-  let next_batch =
-    single_event(new_stream, stream.next_version(stream.initial_version), 300)
+  let one = stream.next_version(stream.initial_version)
+  let assert Ok(next_batch) =
+    store.writes()
+    |> store.register(new_stream, one)
+    |> result.try(store.append(_, store.Event(new_stream, "unselected", 250)))
+    |> result.try(store.append(_, store.Event(new_stream, "created", 300)))
   assert postgres.as_store(reopened).append_events(next_batch) == Ok(Nil)
+  let assert Ok(Some(following)) = source.high_watermark()
+  assert projection.sequence(following) == projection.sequence(boundary) + 2
   let assert Ok(persisted) = delivery.persisted_event_type(" opened ")
   let assert Ok(later) = delivery.event_type("created")
   let assert Ok(exact_selection) =
     delivery.selection(selection_id, prefix, [persisted, later])
-  let assert Ok(page) = projection.page(Some(before), 1)
-  let assert Ok([at_boundary]) =
-    source.read(exact_selection, page, delivery.Inclusive(boundary))
-  assert at_boundary.position == boundary
-  assert at_boundary.event_type == persisted
-  assert at_boundary.event_id != first.event_id
-  assert at_boundary.payload == <<200:64>>
+  store_contract.check_delivery_boundary(
+    source,
+    exact_selection,
+    before,
+    boundary,
+    following,
+    first.event_id,
+    persisted,
+    <<200:64>>,
+    <<300:64>>,
+  )
 
-  let assert Ok(page) = projection.page(Some(boundary), 1)
-  assert source.read(exact_selection, page, delivery.Inclusive(boundary))
-    == Ok([])
-  let assert Ok([after]) =
-    source.read(exact_selection, page, delivery.Unbounded)
-  assert after.event_id != at_boundary.event_id
-  assert after.payload == <<300:64>>
-  assert projection.sequence(after.position)
-    == projection.sequence(boundary) + 1
   Nil
 }
 

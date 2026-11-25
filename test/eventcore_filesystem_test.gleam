@@ -5,12 +5,12 @@ import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
+import eventcore/testing/adapter_contract as store_contract
 import gleam/bit_array
 import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
-import store_contract
 
 @external(erlang, "eventcore_filesystem_test_ffi", "temp_root")
 fn temp_root() -> String
@@ -45,6 +45,13 @@ pub fn full_sync_reopens_atomic_writes_and_locks_exclusively_test() {
   let assert Error(filesystem.StoreLocked) = filesystem.open(root, codec())
   let storage = filesystem.as_store(journal)
   store_contract.check_atomic_streams(storage)
+  let backend = filesystem.projection_backend(journal)
+  let assert Ok(#(_, snapshots)) = filesystem.command_view(journal)
+  store_contract.check_read_only_participant(storage)
+  store_contract.check_snapshots(snapshots)
+  store_contract.check_replay(storage, backend.reader)
+  store_contract.check_checkpoints(backend.checkpoints)
+  store_contract.check_coordination(backend.acquire, backend.acquire)
   let assert Ok(left) = stream.id("left")
   let assert Ok(right) = stream.id("right")
   let a = store.Event(left, "debit", -35)

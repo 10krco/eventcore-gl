@@ -4,10 +4,10 @@ import eventcore/snapshot
 import eventcore/sqlite
 import eventcore/store
 import eventcore/stream
+import eventcore/testing/adapter_contract as store_contract
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
-import store_contract
 
 fn binary_codec() -> sqlite.Codec(BitArray) {
   sqlite.Codec(fn(_, value) { Ok(value) }, fn(_, bytes) { Ok(bytes) })
@@ -27,6 +27,15 @@ pub fn memory_contract_test() {
   assert sqlite.migrate(db) == Ok(Nil)
   assert sqlite.migrate(db) == Ok(Nil)
   store_contract.check_atomic_streams(sqlite.as_store(db))
+  let assert Ok(checkpoints) = sqlite.open_memory_checkpoints()
+  assert sqlite.migrate_checkpoints(checkpoints) == Ok(Nil)
+  let backend = sqlite.projection_backend_with_checkpoints(db, checkpoints)
+  store_contract.check_read_only_participant(sqlite.as_store(db))
+  store_contract.check_snapshots(sqlite.snapshots(db))
+  store_contract.check_replay(sqlite.as_store(db), backend.reader)
+  store_contract.check_checkpoints(backend.checkpoints)
+  store_contract.check_coordination(backend.acquire, backend.acquire)
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
   assert sqlite.close(db) == Ok(Nil)
 }
 

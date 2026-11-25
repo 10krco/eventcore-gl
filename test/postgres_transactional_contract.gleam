@@ -6,6 +6,7 @@ import eventcore/projection_delivery as delivery
 import eventcore/projection_runner
 import eventcore/store
 import eventcore/stream
+import eventcore/testing/transactional_contract
 import gleam/dynamic/decode
 import gleam/erlang/process
 import gleam/option.{None, Some}
@@ -33,9 +34,8 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     |> result.try(store.append(_, store.Event(id, "amount", <<2>>)))
     |> result.try(store.append(_, store.Event(id, "amount", <<3>>)))
   assert postgres.as_store(events).append_events(batch) == Ok(Nil)
-  let assert Ok(name) = delivery.projector_name("transactional-amounts")
   let assert Ok(source_id) = delivery.source_id("transactional-store")
-  let assert Ok(selection_id) = delivery.selection_id("amount-v1")
+  let assert Ok(selection_id) = delivery.selection_id("amount-v2")
   let assert Ok(kind) = delivery.event_type("amount")
   let assert Ok(selection) =
     delivery.selection(selection_id, projection.all(), [kind])
@@ -43,166 +43,47 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   let assert Ok(position1) = projection.position(1)
   let assert Ok(position2) = projection.position(2)
   let assert Ok(position3) = projection.position(3)
+  let writer = postgres.from_pool(second, codec) |> postgres.as_store
+  transactional_contract.check(
+    transactional_contract.Fixture(
+      destination:,
+      alternative:,
+      source:,
+      source_id:,
+      selection:,
+      positions: #(position1, position2, position3),
+      insert: fn(tx, amount) { insert(tx, amount) |> result.replace(Nil) },
+      clear:,
+      effect_count: fn() { count(second) },
+      load_progress: fn(name) {
+        use observed <- result.map(progress.load(second, name))
+        case observed {
+          None -> None
+          Some(progress.Progress(source, selection, position)) ->
+            Some(transactional_contract.Progress(source, selection, position))
+        }
+      },
+      append_live_event: fn() {
+        let assert Ok(new_stream) = stream.id("transactional/live")
+        let assert Ok(batch) =
+          store.writes()
+          |> store.register(new_stream, stream.initial_version)
+          |> result.try(store.append(
+            _,
+            store.Event(new_stream, "amount", <<4>>),
+          ))
+        writer.append_events(batch)
+      },
+    ),
+  )
+
   let assert Ok(policy) = transactional.retry_policy(1, 100, 2.0, 5000)
-  let signal = process.new_subject()
   let config =
     transactional.Config(
       ..transactional.config(selection),
       batch_size: 1,
       retry_policy: policy,
-      retry_wait: fn(delay) {
-        assert delay == 100
-        assert count(second) == 0
-        assert progress.load(second, name) == Ok(None)
-        process.send(signal, Nil)
-      },
     )
-  let projector =
-    transactional.Projector(
-      name,
-      fn(event) { Ok(event.position) },
-      fn(position, _, tx) {
-        let assert Ok(_) = insert(tx, projection.sequence(position))
-        case position {
-          _ if position == position1 ->
-            case process.receive(signal, 0) {
-              Error(Nil) -> Error("retry")
-              Ok(Nil) ->
-                Ok(fn() {
-                  assert insert(tx, 999)
-                    == Error(transactional.TransactionClosed)
-                  assert count(second) == 1
-                  assert progress.load(second, name)
-                    == Ok(
-                      Some(progress.Progress(source_id, selection_id, position1)),
-                    )
-                  Ok(Nil)
-                })
-            }
-          _ if position == position2 -> Error("skip")
-          _ -> Ok(fn() { Error("hook") })
-        }
-      },
-      fn(failure) {
-        case failure.error {
-          "retry" -> transactional.Retry
-          _ -> transactional.Skip
-        }
-      },
-    )
-  assert transactional.run(destination, projector, source, config)
-    == Error(transactional.AfterCommitFailed(position3, "hook"))
-  assert count(second) == 2
-  assert progress.load(second, name)
-    == Ok(Some(progress.Progress(source_id, selection_id, position3)))
-  assert transactional.run(destination, projector, source, config)
-    == Ok(transactional.CaughtUp(0, 0, Some(position3)))
-
-  let assert Ok(alternate_id) = delivery.selection_id("amount-v2")
-  assert transactional.reset(destination, name, source_id, alternate_id, fn(_) {
-      panic as "mismatched reset callback"
-    })
-    == Error(transactional.ResetSelectionMismatch(selection_id, alternate_id))
-  assert transactional.reset(destination, name, source_id, selection_id, fn(tx) {
-      clear(tx)
-      Error("rollback")
-    })
-    == Error(transactional.ResetCallbackFailed("rollback"))
-  assert count(second) == 2
-
-  let replay =
-    transactional.Projector(
-      name,
-      fn(event) { Ok(event.position) },
-      fn(position, _, tx) {
-        let assert Ok(_) = insert(tx, projection.sequence(position))
-        Ok(transactional.no_after_commit)
-      },
-      fn(_) { transactional.Fatal },
-    )
-  assert transactional.reset_and_replay(
-      destination,
-      replay,
-      source,
-      config,
-      fn(tx) {
-        assert transactional.reset(
-            alternative,
-            name,
-            source_id,
-            selection_id,
-            fn(_) { panic as "concurrent reset callback" },
-          )
-          == Error(transactional.ResetLeadership(
-            projection_runner.AlreadyLeading,
-          ))
-        clear(tx)
-        Ok(Nil)
-      },
-    )
-    == Ok(transactional.CaughtUp(3, 0, Some(position3)))
-  assert count(second) == 3
-  let polls = process.new_subject()
-  process.send(polls, Nil)
-  let writer = postgres.from_pool(second, codec) |> postgres.as_store
-  let continuous =
-    transactional.Config(
-      ..config,
-      mode: transactional.Continuous(
-        projection_runner.Control(fn(interval) {
-          assert interval == 1000
-          case process.receive(polls, 0) {
-            Error(Nil) -> False
-            Ok(Nil) -> {
-              let assert Ok(new_stream) = stream.id("transactional/live")
-              let assert Ok(batch) =
-                store.writes()
-                |> store.register(new_stream, stream.initial_version)
-                |> result.try(store.append(
-                  _,
-                  store.Event(new_stream, "amount", <<4>>),
-                ))
-              assert writer.append_events(batch) == Ok(Nil)
-              True
-            }
-          }
-        }),
-      ),
-    )
-  assert transactional.run(destination, replay, source, continuous)
-    == Ok(transactional.Cancelled(1, 0))
-  assert count(second) == 4
-
-  let assert Ok(failure_name) = delivery.projector_name("transactional-failure")
-  let fails =
-    transactional.Projector(
-      failure_name,
-      fn(event) { Ok(event.position) },
-      fn(_, _, tx) {
-        let assert Ok(_) = insert(tx, 99)
-        Error("apply")
-      },
-      fn(_) { transactional.Stop },
-    )
-  assert transactional.run(destination, fails, source, config)
-    == Ok(transactional.Stopped(position1, 0, 0))
-  assert transactional.run(
-      destination,
-      transactional.Projector(..fails, on_error: fn(_) { transactional.Fatal }),
-      source,
-      config,
-    )
-    == Error(transactional.ApplicationFailed(position1, "apply"))
-  assert transactional.run(
-      destination,
-      transactional.Projector(..fails, on_error: fn(_) { transactional.Retry }),
-      source,
-      transactional.config(selection),
-    )
-    == Error(transactional.RetryExhausted(position1, 1, "apply"))
-  assert count(second) == 4
-  assert progress.load(second, failure_name) == Ok(None)
-
   check_idle_fencing(destination, source, config, second)
   check_error_policy_after_rollback(destination, source, config, second)
   check_leadership_loss(destination, source, config, second)
