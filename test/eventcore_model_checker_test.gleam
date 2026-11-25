@@ -191,3 +191,64 @@ pub fn check_requires_every_source_and_alternative_test() {
   assert list.map(warnings, fn(warning) { warning.code })
     == ["ECM101", "ECM103"]
 }
+
+type State {
+  State
+}
+
+pub fn check_preserves_release_terminal_boundaries_test() {
+  let state = model.state("State", State)
+  let output = model.output("Output", Output)
+  let value = model.field(state, "value", Amount, fn(n: Int) { n })
+  let missing = model.field(state, "missing", Currency, fn(n: Int) { n })
+  let visible = model.field(output, "value", Amount, fn(n: Int) { n })
+  let update =
+    model.mapping("update", model.source(missing), value, fn(n) { n })
+  let render =
+    model.mapping("render", model.source(missing), visible, fn(n) { n })
+
+  let assert Ok(checker.Report(checker.Verified, _)) =
+    checker.check([checker.state_seed(value), checker.mapping(update)])
+  let assert Ok(checker.Report(checker.Assumed, _)) =
+    checker.check_with(
+      [
+        checker.field(visible),
+        checker.assumption("external", visible),
+        checker.mapping(render),
+      ],
+      checker.strict() |> checker.allow_assumption("external"),
+    )
+}
+
+pub fn check_preserves_release_temporal_traversal_and_seed_rule_test() {
+  let state = model.state("Balance", State)
+  let request = model.input("Request", Input)
+  let raw = model.origin(request, "value", Amount, fn(n: Int) { n })
+  let a = model.field(state, "a", Amount, fn(n: Int) { n })
+  let b = model.field(state, "b", Currency, fn(n: Int) { n })
+  let seed =
+    model.mapping("seed", model.source(model.origin_field(raw)), b, fn(n) { n })
+  let carry_to_a = model.mapping("carry", model.previous(b), a, fn(n) { n })
+  let copy_to_b = model.mapping("current", model.source(a), b, fn(n) { n })
+
+  let assert Error(checker.Incomplete([cycle])) =
+    checker.check([
+      checker.field(a),
+      checker.field(b),
+      checker.origin(raw),
+      checker.mapping(carry_to_a),
+      checker.mapping(copy_to_b),
+      checker.mapping(seed),
+    ])
+  assert cycle.code == "ECM006"
+
+  let carry_to_b = model.mapping("carry", model.previous(a), b, fn(n) { n })
+  let copy_to_a = model.mapping("current", model.source(b), a, fn(n) { n })
+  let assert Ok(checker.Report(checker.Verified, _)) =
+    checker.check([
+      checker.field(a),
+      checker.field(b),
+      checker.mapping(copy_to_a),
+      checker.mapping(carry_to_b),
+    ])
+}

@@ -9,7 +9,7 @@ import gleam/order
 import gleam/set.{type Set}
 import gleam/string
 
-pub type Descriptor {
+pub opaque type Descriptor {
   Field(id: FieldId, root: Bool, location: Option(String))
   Mapping(
     name: String,
@@ -177,6 +177,16 @@ fn evaluate(
       #(Graph(dict.new(), dict.new(), dict.new(), options), set.new(), []),
       register,
     )
+  let graph =
+    Graph(
+      ..graph,
+      recipes: dict.map_values(graph.recipes, fn(_, values) {
+        list.reverse(values)
+      }),
+      assumptions: dict.map_values(graph.assumptions, fn(_, values) {
+        list.reverse(values)
+      }),
+    )
   let errors =
     list.fold(descriptors, errors, fn(errors, descriptor) {
       case descriptor {
@@ -283,8 +293,15 @@ fn subject(descriptor: Descriptor) -> String {
   }
 }
 
+fn stable_name(descriptor: Descriptor) -> String {
+  case descriptor {
+    Field(id: id, ..) -> id.component <> "." <> id.name
+    _ -> subject(descriptor)
+  }
+}
+
 fn compare_descriptors(a: Descriptor, b: Descriptor) -> order.Order {
-  case string.compare(subject(a), subject(b)) {
+  case string.compare(stable_name(a), stable_name(b)) {
     // Different structured identities can render as the same dotted path.
     order.Eq -> string.compare(string.inspect(a), string.inspect(b))
     different -> different
@@ -336,6 +353,7 @@ fn visit(
   let path = [id, ..path]
   let evaluation =
     Evaluation(..evaluation, active: set.insert(evaluation.active, id))
+  // The Rust 2.1.0 checker treats roots as terminal provenance boundaries.
   let next = case dict.get(graph.fields, id) {
     Ok(Field(root: True, ..)) -> evaluation
     Ok(descriptor) -> visit_required(id, descriptor, graph, path, evaluation)
@@ -355,6 +373,7 @@ fn visit_required(
   path: List(FieldId),
   evaluation: Evaluation,
 ) -> Evaluation {
+  // An explicit assumption takes precedence over producers in the baseline.
   case lookup(graph.assumptions, id), lookup(graph.recipes, id) {
     [_, ..] as assumptions, _ ->
       check_assumptions(graph, id, assumptions, evaluation)
@@ -479,6 +498,7 @@ fn visit_dependency(
   }
 }
 
+// The release recognizes the presence of an all-current recipe as a seed.
 fn has_seed(id: FieldId, graph: Graph) -> Bool {
   case dict.get(graph.fields, id) {
     Ok(Field(root: True, ..)) -> True
