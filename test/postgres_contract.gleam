@@ -3,6 +3,7 @@
 import eventcore/postgres
 import eventcore/projection
 import eventcore/projection_delivery as delivery
+import eventcore/projection_runner as runner
 import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
@@ -54,6 +55,7 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     postgres.as_store(reopened),
   )
   check_trigger_rollback(first, postgres.as_store(reopened))
+  check_legacy_projection(events, reopened, second_checkpoints)
   check_committed_delivery(first, events, reopened)
 
   let assert Ok(key) = snapshot.key("ledger/v1")
@@ -74,11 +76,11 @@ fn check_competing_writers(first: store.Store(Int), second: store.Store(Int)) {
   let initial = stream.initial_version
   let after = stream.next_version(initial)
   let replies = process.new_subject()
-  process.spawn(fn() {
+  process.spawn_unlinked(fn() {
     let batch = single_event(id, initial, 7)
     process.send(replies, #(first, 7, first.append_events(batch)))
   })
-  process.spawn(fn() {
+  process.spawn_unlinked(fn() {
     let batch = single_event(id, initial, 8)
     process.send(replies, #(second, 8, second.append_events(batch)))
   })
@@ -252,4 +254,64 @@ fn check_committed_delivery(
   assert projection.sequence(after.position)
     == projection.sequence(boundary) + 1
   Nil
+}
+
+fn check_legacy_projection(events, reopened, second_checkpoints) {
+  let primary = postgres.projection_backend(events)
+  let secondary = postgres.projection_backend(reopened)
+  let assert Ok(lease) = primary.acquire("debit")
+  assert secondary.acquire("debit") == Error(runner.AlreadyLeading)
+  let assert Ok(independent) = secondary.acquire("other")
+  independent.release()
+  lease.release()
+  let assert Ok(replacement) = secondary.acquire("debit")
+  lease.release()
+  assert primary.acquire("debit") == Error(runner.AlreadyLeading)
+  replacement.release()
+
+  let ready = process.new_subject()
+  let holder =
+    process.spawn_unlinked(fn() {
+      let assert Ok(_) = primary.acquire("crash")
+      process.send(ready, Nil)
+      process.sleep_forever()
+    })
+  let monitor = process.monitor(holder)
+  assert process.receive(ready, 1000) == Ok(Nil)
+  assert secondary.acquire("crash") == Error(runner.AlreadyLeading)
+  process.kill(holder)
+  let selector =
+    process.new_selector()
+    |> process.select_specific_monitor(monitor, fn(_) { Nil })
+  assert process.selector_receive(selector, 1000) == Ok(Nil)
+  let assert Ok(after_crash) = acquire_after_crash(secondary.acquire, 100)
+  after_crash.release()
+
+  let assert Ok(filter) = projection.prefix("contract/debit")
+  let projector =
+    runner.Projector(
+      name: "debit",
+      filter: filter,
+      initial: 0,
+      apply: fn(total, delivery) { #(total + delivery.event.payload, Ok(Nil)) },
+      on_error: fn(_) { runner.Fatal },
+    )
+  let control = runner.Control(fn(_) { True })
+  assert runner.run(primary, projector, runner.default_config, control)
+    == Ok(105)
+  assert runner.run(secondary, projector, runner.default_config, control)
+    == Ok(0)
+  assert postgres.reset_checkpoint(second_checkpoints, "debit") == Ok(Nil)
+  assert runner.run(secondary, projector, runner.default_config, control)
+    == Ok(105)
+}
+
+fn acquire_after_crash(acquire, attempts) {
+  case acquire("crash"), attempts {
+    Error(runner.AlreadyLeading), remaining if remaining > 0 -> {
+      process.sleep(10)
+      acquire_after_crash(acquire, remaining - 1)
+    }
+    result, _ -> result
+  }
 }
