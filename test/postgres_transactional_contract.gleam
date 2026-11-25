@@ -131,6 +131,13 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     |> pog.execute(second)
   check_commit_rejection(destination, source, config, second, position1, 600)
   check_commit_disconnect(destination, source, config, second, position1)
+  check_batch_frontier_and_empty_identities(
+    destination,
+    source,
+    config,
+    second,
+    writer,
+  )
 }
 
 fn check_idle_fencing(
@@ -494,6 +501,94 @@ fn check_commit_disconnect(destination, source, config, observer, position1) {
   assert count(observer) == 4
   assert progress.load(observer, name) == Ok(None)
   Nil
+}
+
+fn check_batch_frontier_and_empty_identities(
+  destination,
+  source: delivery.Source(error),
+  config: transactional.Config,
+  observer,
+  writer: store.Store(BitArray),
+) {
+  let assert Ok(name) = delivery.projector_name("fixed-batch-frontier")
+  let assert Ok(id) = stream.id("transactional/frontier")
+  let assert Ok(prefix) = projection.prefix("transactional/frontier")
+  let assert Ok(kind) = delivery.event_type("amount")
+  let assert Ok(selection) =
+    delivery.selection(delivery.selection_identity(config.selection), prefix, [
+      kind,
+    ])
+  let config = transactional.Config(..config, selection:)
+  let append = fn(version, byte) {
+    let assert Ok(batch) =
+      store.writes()
+      |> store.register(id, version)
+      |> result.try(store.append(_, store.Event(id, "amount", <<byte>>)))
+    assert writer.append_events(batch) == Ok(Nil)
+  }
+  append(stream.initial_version, 51)
+  let assert Ok(Some(initial)) = source.high_watermark()
+  let projector =
+    transactional.Projector(
+      name,
+      fn(event) { Ok(event.position) },
+      fn(position, _, _) {
+        case position == initial {
+          True -> {
+            let assert Ok(version) = stream.version(1)
+            append(version, 52)
+          }
+          False -> Nil
+        }
+        Ok(transactional.no_after_commit)
+      },
+      fn(_) { transactional.Fatal },
+    )
+  assert transactional.run(destination, projector, source, config)
+    == Ok(transactional.CaughtUp(1, 0, Some(initial)))
+  let selection_id = delivery.selection_identity(selection)
+  assert progress.load(observer, name)
+    == Ok(Some(progress.Progress(source.id, selection_id, initial)))
+  let assert Ok(Some(next)) = source.high_watermark()
+  assert projection.sequence(next) == projection.sequence(initial) + 1
+  assert transactional.run(destination, projector, source, config)
+    == Ok(transactional.CaughtUp(1, 0, Some(next)))
+
+  let assert Ok(other_source) = delivery.source_id("empty-alternative")
+  let empty =
+    delivery.Source(
+      id: other_source,
+      high_watermark: fn() { Ok(None) },
+      read: fn(_, _, _) { panic as "initially empty source was read" },
+    )
+  assert transactional.run(destination, projector, empty, config)
+    == Error(transactional.SourceMismatch(source.id, other_source))
+  assert transactional.reset(
+      destination,
+      name,
+      other_source,
+      selection_id,
+      fn(_) { panic as "mismatched source reset callback ran" },
+    )
+    == Error(transactional.ResetSourceMismatch(source.id, other_source))
+
+  let assert Ok(other_selection) = delivery.selection_id("empty-alternative")
+  let assert Ok(kind) = delivery.event_type("unused")
+  let assert Ok(selection) =
+    delivery.selection(other_selection, projection.all(), [kind])
+  let other_config = transactional.Config(..config, selection:)
+  let empty = delivery.Source(..empty, id: source.id)
+  assert transactional.run(destination, projector, empty, other_config)
+    == Error(transactional.SelectionMismatch(selection_id, other_selection))
+  assert transactional.run(destination, projector, source, other_config)
+    == Error(transactional.SelectionMismatch(selection_id, other_selection))
+  let assert Ok(fresh) = delivery.projector_name("empty-fresh")
+  let projector = transactional.Projector(..projector, name: fresh)
+  assert transactional.run(destination, projector, empty, config)
+    == Ok(transactional.CaughtUp(0, 0, None))
+  assert transactional.run(destination, projector, source, other_config)
+    == Ok(transactional.CaughtUp(0, 0, Some(next)))
+  assert progress.load(observer, fresh) == Ok(None)
 }
 
 fn insert(transaction: transactional.Transaction, amount: Int) {
