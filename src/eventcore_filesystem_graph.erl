@@ -1,5 +1,5 @@
 -module(eventcore_filesystem_graph).
--export([order/1, tips/1, dangling/1, forks/2, stream_forks/2, release_forks/2,
+-export([order/1, tips/1, dangling/1, forks/2, stream_forks/2, release_forks/2, release_stream_forks/1,
          topology_generation/1, event_prefix_token/3]).
 
 order(Transactions) ->

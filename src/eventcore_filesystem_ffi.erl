@@ -445,6 +445,11 @@ handle_call({projection_load, Name}, _From, #state{projection_directory = Root} 
 handle_call({projection_save, Name, Position}, _From,
             #state{projection_directory = Root, sync = Sync} = State) ->
     {reply, write_projection_checkpoint(filename:join(Root, <<"checkpoints">>), Sync, Name, Position), State};
+handle_call(status, _From, #state{reconciliation = rust_release,
+                                 integrity_failures = Bad, dangling = [_ | _] = Dangling,
+                                 transactions = Transactions} = State) ->
+    Forks = [Fork || {Fork, _} <- eventcore_filesystem_graph:release_stream_forks(Transactions)],
+    {reply, {ok, {status, Bad, Dangling, Forks}}, State};
 handle_call(status, _From, #state{reconciliation = full_branches,
                                  integrity_failures = Bad, dangling = [_ | _] = Dangling,
                                  transactions = Transactions, ordered = Reversed} = State) ->
