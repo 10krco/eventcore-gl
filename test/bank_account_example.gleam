@@ -129,11 +129,20 @@ pub fn check(storage: store.Store(Int), backend: runner.Backend(Int)) -> Nil {
     == 120
   let assert Ok(history) = store.read_stream(storage, source)
   let assert Ok(events) = store.collect(history)
-  assert list.map(events, fn(event) { event.kind })
-    == ["opened", "deposited", "withdrawn", "transferred-out"]
+  assert events
+    == [
+      Event(source, "opened", 0),
+      Event(source, "deposited", 150),
+      Event(source, "withdrawn", -50),
+      Event(source, "transferred-out", -30),
+    ]
   let assert Ok(history) = store.read_stream(storage, target)
   let assert Ok(events) = store.collect(history)
-  assert list.map(events, fn(event) { event.kind })
-    == ["opened", "deposited", "transferred-in"]
+  assert events
+    == [
+      Event(target, "opened", 0),
+      Event(target, "deposited", 20),
+      Event(target, "transferred-in", 30),
+    ]
   Nil
 }

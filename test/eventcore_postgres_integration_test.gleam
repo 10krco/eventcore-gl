@@ -1,4 +1,5 @@
 import bank_account_example
+import eventcore/command
 import eventcore/internal/postgres_projection_progress as progress
 import eventcore/internal/postgres_projection_session as session
 import eventcore/postgres
@@ -6,7 +7,11 @@ import eventcore/projection
 import eventcore/projection_delivery as delivery
 import eventcore/projection_runner
 import eventcore/store
+import eventcore/stream
+import gleam/bit_array
+import gleam/dict
 import gleam/erlang/process.{type Pid}
+import gleam/int
 import gleam/option.{None, Some}
 import gleam/otp/actor
 import gleam/result
@@ -117,12 +122,15 @@ pub fn bank_account_postgres_example_test() {
   use writes <- with_pool(socket, "bank_writes", 1)
   use replay <- with_pool(socket, "bank_replay", 1)
   let codec =
-    postgres.Codec(fn(_, cents) { Ok(<<cents:64>>) }, fn(_, bytes) {
-      case bytes {
-        <<cents:64-signed>> -> Ok(cents)
-        _ -> Error("invalid account event")
-      }
-    })
+    postgres.Codec(
+      fn(_, cents) { Ok(cents |> int.to_string |> bit_array.from_string) },
+      fn(_, bytes) {
+        bytes
+        |> bit_array.to_string
+        |> result.try(int.parse)
+        |> result.replace_error("invalid account event")
+      },
+    )
   let events = postgres.from_pool(writes, codec)
   let reopened = postgres.from_pool(replay, codec)
   assert postgres.migrate(events) == Ok(Nil)
@@ -132,4 +140,26 @@ pub fn bank_account_postgres_example_test() {
     postgres.as_store(events),
     postgres.projection_backend(reopened),
   )
+  let assert Ok(account) = stream.id("bank/large")
+  let storage = postgres.as_store(events)
+  let amount = 9_223_372_036_854_775_809
+  assert command.execute(
+      storage,
+      bank_account_example.open(account),
+      command.default_policy(),
+    )
+    == Ok(command.Execution(1))
+  assert command.execute(
+      storage,
+      bank_account_example.deposit(account, amount),
+      command.default_policy(),
+    )
+    == Ok(command.Execution(1))
+  let assert Ok(balances) =
+    bank_account_example.project(
+      postgres.projection_backend(reopened),
+      "bank-large-amount",
+    )
+  assert dict.get(balances, account) == Ok(amount)
+  Nil
 }
