@@ -8,9 +8,11 @@ import postgres_contract
 pub fn postgres_two_pool_contract_test() {
   use socket <- with_database()
   use <- check_started_store(socket)
-  use first <- with_pool(socket, "eventcore_first")
-  use second <- with_pool(socket, "eventcore_second")
+  use first <- with_pool(socket, "eventcore_first", 1)
+  use second <- with_pool(socket, "eventcore_second", 1)
+  use larger <- with_pool(socket, "eventcore_larger", 2)
   check_operations(fn() { postgres_contract.check(first, second) })
+  postgres_contract.check_distinct_names(larger, second)
 }
 
 fn check_started_store(socket: String, work: fn() -> Nil) {
@@ -31,8 +33,14 @@ fn check_started_store(socket: String, work: fn() -> Nil) {
   work()
 }
 
-fn with_pool(socket: String, name: String, work: fn(pog.Connection) -> Nil) {
-  let assert Ok(actor.Started(pid, pool)) = pog.start(pool_config(socket, name))
+fn with_pool(
+  socket: String,
+  name: String,
+  size: Int,
+  work: fn(pog.Connection) -> Nil,
+) {
+  let assert Ok(actor.Started(pid, pool)) =
+    pog.start(pool_config(socket, name) |> pog.pool_size(size))
   using_pool(pid, fn() { work(pool) })
 }
 

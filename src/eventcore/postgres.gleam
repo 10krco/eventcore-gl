@@ -1,7 +1,9 @@
 //// PostgreSQL event and checkpoint storage for an existing Pog pool.
 
+import eventcore/internal/projection_scan
 import eventcore/projection
 import eventcore/projection_delivery as delivery
+import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError}
 import eventcore/stream.{type Id, type Version}
@@ -429,6 +431,137 @@ pub fn as_store(events: EventStore(payload)) -> Store(payload) {
     append(events, writes)
   })
 }
+
+/// Read committed insertion positions using the ordinary event codec.
+pub fn projection_reader(
+  events: EventStore(payload),
+) -> projection.Reader(payload) {
+  fn(filter, page) {
+    let pool = projection_connection(events.pool)
+    use frontier <- result.try(
+      pog.query("SELECT last_position FROM eventcore_positions WHERE singleton")
+      |> pog.returning(decode.at([0], decode.int))
+      |> pog.execute(pool)
+      |> result.replace_error(store.StoreFailure(store.ReadProjection)),
+    )
+    case frontier.rows {
+      [high] ->
+        projection_scan.read(
+          filter,
+          page,
+          high,
+          fn(first, last) { projection_range(pool, first, last) },
+          fn(event) {
+            use payload <- result.map(
+              unpack_payload(event.payload)
+              |> result.try(events.codec.decode(event.kind, _))
+              |> result.map_error(store.DeserializationFailed(event.stream, _)),
+            )
+            store.Event(event.stream, event.kind, payload)
+          },
+        )
+      _ -> Error(store.StoreFailure(store.ReadProjection))
+    }
+  }
+}
+
+fn projection_range(pool, first, last) {
+  use returned <- result.try(
+    pog.query(
+      "SELECT position, stream, kind, payload FROM eventcore_events
+      WHERE position BETWEEN $1 AND $2 ORDER BY position",
+    )
+    |> pog.parameter(pog.int(first))
+    |> pog.parameter(pog.int(last))
+    |> pog.returning({
+      use position <- decode.field(0, decode.int)
+      use stream <- decode.field(1, decode.string)
+      use kind <- decode.field(2, decode.string)
+      use payload <- decode.field(3, decode.bit_array)
+      decode.success(#(position, stream, kind, payload))
+    })
+    |> pog.execute(pool)
+    |> result.replace_error(store.StoreFailure(store.ReadProjection)),
+  )
+  list.try_map(returned.rows, fn(row) {
+    let #(position, name, kind, payload) = row
+    use id <- result.map(
+      stream.id(name)
+      |> result.replace_error(store.StoreFailure(store.ReadProjection)),
+    )
+    #(position, store.Event(id, kind, payload))
+  })
+}
+
+pub fn projection_checkpoints(
+  checkpoints: CheckpointStore,
+) -> projection.Checkpoints {
+  projection.Checkpoints(
+    fn(name) {
+      use cursor <- result.try(
+        load_checkpoint(projection_checkpoint_session(checkpoints, name), name)
+        |> result.replace_error(store.StoreFailure(store.LoadCheckpoint)),
+      )
+      case cursor {
+        None -> Ok(None)
+        Some(sequence) ->
+          projection.position(sequence)
+          |> result.map(Some)
+          |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
+      }
+    },
+    fn(name, position) {
+      save_checkpoint(
+        projection_checkpoint_session(checkpoints, name),
+        name,
+        projection.sequence(position),
+      )
+      |> result.replace_error(store.StoreFailure(store.SaveCheckpoint))
+    },
+  )
+}
+
+pub fn projection_backend(
+  events: EventStore(payload),
+) -> projection_runner.Backend(payload) {
+  projection_backend_with_checkpoints(
+    events,
+    checkpoints_from_pool(events.pool),
+  )
+}
+
+pub fn projection_backend_with_checkpoints(
+  events: EventStore(payload),
+  checkpoints: CheckpointStore,
+) -> projection_runner.Backend(payload) {
+  projection_runner.Backend(
+    projection_reader(events),
+    projection_checkpoints(checkpoints),
+    fn(name) {
+      use release <- result.map(acquire_projection(checkpoints.pool, name))
+      projection_runner.Lease(release)
+    },
+  )
+}
+
+@external(erlang, "eventcore_postgres_ffi", "acquire_projection")
+fn acquire_projection(
+  pool: pog.Connection,
+  name: String,
+) -> Result(fn() -> Nil, projection_runner.LeadershipError)
+
+fn projection_checkpoint_session(
+  checkpoints: CheckpointStore,
+  name: String,
+) -> CheckpointStore {
+  CheckpointStore(checkpoint_connection(checkpoints.pool, name))
+}
+
+@external(erlang, "eventcore_postgres_ffi", "checkpoint_connection")
+fn checkpoint_connection(pool: pog.Connection, name: String) -> pog.Connection
+
+@external(erlang, "eventcore_postgres_ffi", "projection_connection")
+fn projection_connection(pool: pog.Connection) -> pog.Connection
 
 pub fn reset_checkpoint(
   checkpoints: CheckpointStore,
