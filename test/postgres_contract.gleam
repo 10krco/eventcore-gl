@@ -261,6 +261,11 @@ fn check_legacy_projection(events, reopened, second_checkpoints) {
   let secondary = postgres.projection_backend(reopened)
   let assert Ok(lease) = primary.acquire("debit")
   assert secondary.acquire("debit") == Error(runner.AlreadyLeading)
+  let blocked = process.new_subject()
+  let _ =
+    process.spawn(fn() { process.send(blocked, primary.acquire("debit")) })
+  assert process.receive(blocked, 1000)
+    == Ok(Error(runner.CoordinatorUnavailable))
   let assert Ok(independent) = secondary.acquire("other")
   independent.release()
   lease.release()
@@ -286,6 +291,8 @@ fn check_legacy_projection(events, reopened, second_checkpoints) {
   assert process.selector_receive(selector, 1000) == Ok(Nil)
   let assert Ok(after_crash) = acquire_after_crash(secondary.acquire, 100)
   after_crash.release()
+  let assert Ok(reconnected) = acquire_after_crash(primary.acquire, 100)
+  reconnected.release()
 
   let assert Ok(filter) = projection.prefix("contract/debit")
   let projector =
@@ -308,10 +315,29 @@ fn check_legacy_projection(events, reopened, second_checkpoints) {
 
 fn acquire_after_crash(acquire, attempts) {
   case acquire("crash"), attempts {
-    Error(runner.AlreadyLeading), remaining if remaining > 0 -> {
+    Error(runner.AlreadyLeading), remaining
+    | Error(runner.CoordinatorUnavailable), remaining
+      if remaining > 0
+    -> {
       process.sleep(10)
       acquire_after_crash(acquire, remaining - 1)
     }
     result, _ -> result
   }
+}
+
+pub fn check_distinct_names(first: pog.Connection, second: pog.Connection) {
+  let codec =
+    postgres.Codec(fn(_, bytes) { Ok(bytes) }, fn(_, bytes) { Ok(bytes) })
+  let primary = postgres.projection_backend(postgres.from_pool(first, codec))
+  let secondary = postgres.projection_backend(postgres.from_pool(second, codec))
+  let assert Ok(one) = primary.acquire("independent-one")
+  let assert Ok(two) = primary.acquire("independent-two")
+  assert secondary.acquire("independent-one") == Error(runner.AlreadyLeading)
+  assert secondary.acquire("independent-two") == Error(runner.AlreadyLeading)
+  one.release()
+  let assert Ok(after_release) = secondary.acquire("independent-one")
+  after_release.release()
+  assert secondary.acquire("independent-two") == Error(runner.AlreadyLeading)
+  two.release()
 }

@@ -22,6 +22,7 @@ frontier using the legacy event codec.
 
 ## Consequences
 
-Each active projector reserves a checkout for its lifetime. Independent
-pools on the same database coordinate through PostgreSQL. Legacy reads and
+Each active projector reserves a checkout for its lifetime. A pool with
+spare connections can serve multiple names. An exhausted pool returns a
+coordination error after a bounded acquisition wait. Independent pools on the same database coordinate through PostgreSQL. Legacy reads and
 checkpoint updates remain separate operations.

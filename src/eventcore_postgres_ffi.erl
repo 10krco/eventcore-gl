@@ -23,17 +23,27 @@ stop_pool(Pid) ->
 
 
 acquire_projection({pool, Pool}, Name) ->
-    case get({?MODULE, Pool}) of
-        undefined -> checkout_projection(Pool, Name);
-        _ -> {error, already_leading}
+    Key = lock_key(Name),
+    case lists:keymember(Key, 1, held_sessions(Pool)) of
+        true -> {error, already_leading};
+        false -> checkout_projection(Pool, Key, erlang:monotonic_time(millisecond) + 100)
     end;
 acquire_projection(_, _) ->
     {error, coordinator_unavailable}.
 
-checkout_projection(Pool, Name) ->
-    try pgo:checkout(Pool, [{queue, true}, {timeout, infinity}]) of
+checkout_projection(Pool, Key, Deadline) ->
+    %% Pog's checkout timeout also expires the held session. Bound only the
+    %% acquisition attempt, leaving a successful checkout valid until release.
+    try pgo:checkout(Pool, [{queue, false}, {timeout, infinity}]) of
         {ok, Ref, Connection} ->
-            lock_session(Pool, Ref, Connection, lock_key(Name));
+            lock_session(Pool, Ref, Connection, Key);
+        {error, "connection not available and queuing is disabled"} ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(5),
+                    checkout_projection(Pool, Key, Deadline);
+                false -> {error, coordinator_unavailable}
+            end;
         {error, _} ->
             {error, coordinator_unavailable}
     catch
@@ -45,8 +55,8 @@ lock_session(Pool, Ref, Connection, Key) ->
         #{rows := [{true}]} ->
             Token = make_ref(),
             Owner = self(),
-            put({?MODULE, Pool}, {Token, Ref, Connection, Key}),
-            {ok, fun() -> release_session(Owner, Pool, Token) end};
+            put({?MODULE, Pool}, [{Key, Token, Ref, Connection} | held_sessions(Pool)]),
+            {ok, fun() -> release_session(Owner, Pool, Key, Token) end};
         #{rows := [{false}]} ->
             pgo:checkin(Ref, Connection),
             {error, already_leading};
@@ -55,10 +65,13 @@ lock_session(Pool, Ref, Connection, Key) ->
             {error, coordinator_unavailable}
     end.
 
-release_session(Owner, Pool, Token) when Owner =:= self() ->
-    case get({?MODULE, Pool}) of
-        {Token, Ref, Connection, Key} ->
-            erase({?MODULE, Pool}),
+release_session(Owner, Pool, Key, Token) when Owner =:= self() ->
+    case lists:keytake(Key, 1, held_sessions(Pool)) of
+        {value, {Key, Token, Ref, Connection}, Remaining} ->
+            case Remaining of
+                [] -> erase({?MODULE, Pool});
+                _ -> put({?MODULE, Pool}, Remaining)
+            end,
             case advisory_query(Connection, "SELECT pg_advisory_unlock($1)", Key) of
                 #{rows := [{true}]} -> pgo:checkin(Ref, Connection);
                 _ -> disconnect_session(Ref, Connection)
@@ -66,13 +79,19 @@ release_session(Owner, Pool, Token) when Owner =:= self() ->
         _ -> ok
     end,
     nil;
-release_session(_, _, _) ->
+release_session(_, _, _, _) ->
     nil.
 
-projection_connection({pool, Pool} = Original) ->
+held_sessions(Pool) ->
     case get({?MODULE, Pool}) of
-        {_, _, Connection, _} -> {single_connection, Connection};
-        undefined -> Original
+        undefined -> [];
+        Sessions -> Sessions
+    end.
+
+projection_connection({pool, Pool} = Original) ->
+    case held_sessions(Pool) of
+        [{_, _, _, Connection} | _] -> {single_connection, Connection};
+        [] -> Original
     end;
 projection_connection(Original) ->
     Original.
