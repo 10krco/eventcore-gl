@@ -154,6 +154,12 @@ the event database for its progress or a separate checkpoint database.
 Views that share a checkpoint handle also share its named leases.
 See [ADR 0012](docs/decisions/0012-sqlite-projection-replay.md).
 
+The SQLite release backend reads a separate UUID index with native LIKE
+and GLOB predicates. Its migration backfills old rows and installs an
+insert trigger that assigns new identities atomically with the event.
+UUID checkpoints persist on the selected checkpoint database. See
+[ADR 0028](docs/decisions/0028-sqlite-release-projection-cursors.md).
+
 PostgreSQL strict delivery uses the committed event position counter as its
 watermark. The delivery migration adds persistent UUIDv7 identities and
 JSON metadata. Reapplying it replaces the default while preserving existing

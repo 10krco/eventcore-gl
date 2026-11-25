@@ -1,12 +1,15 @@
 //// SQLite event and projection checkpoint stores.
 
 import eventcore/internal/projection_scan
+import eventcore/internal/uuid_position
 import eventcore/projection
 import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError}
 import eventcore/stream.{type Id, type Version}
 import gleam/dict
+import gleam/int
+
 import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
@@ -50,6 +53,8 @@ pub type CheckpointError {
 type Schema {
   EventSchema
   CheckpointSchema
+  ReleaseEventSchema
+  ReleaseCheckpointSchema
 }
 
 pub fn open(
@@ -208,6 +213,124 @@ pub fn projection_reader(
   }
 }
 
+/// Add UUID identities to the migrated event database and future appends.
+pub fn migrate_release_delivery(
+  events: EventStore(payload),
+) -> Result(Nil, MigrationError) {
+  migrate_schema(events.server, ReleaseEventSchema)
+}
+
+/// Create the separate release UUID checkpoint namespace.
+pub fn migrate_release_checkpoints(
+  checkpoints: CheckpointStore,
+) -> Result(Nil, MigrationError) {
+  migrate_schema(checkpoints.server, ReleaseCheckpointSchema)
+}
+
+pub fn projection_release_reader(
+  events: EventStore(payload),
+  consumer_kind: String,
+) -> projection.Reader(payload) {
+  fn(filter, page) {
+    let failure = store.StoreFailure(store.ReadProjection)
+    let after = projection.page_after(page)
+    use cursor <- result.try(case after {
+      None -> Ok(None)
+      Some(position) ->
+        uuid_position.to_uuid(position)
+        |> result.map(Some)
+        |> result.replace_error(failure)
+    })
+    use rows <- result.try(release_read(
+      events.server,
+      option.unwrap(projection.event_kind(filter), consumer_kind),
+      cursor,
+      projection.stream_prefix(filter),
+      projection.stream_pattern(filter),
+      int.min(projection.page_limit(page), 9_223_372_036_854_775_807),
+    ))
+    release_page(events.codec, rows, after, [])
+  }
+}
+
+fn release_page(
+  codec: Codec(payload),
+  rows: List(#(String, Event(BitArray))),
+  after: Option(projection.Position),
+  reversed: List(projection.Delivery(payload)),
+) -> Result(projection.PageResult(payload), StoreError) {
+  case rows {
+    [] -> Ok(projection.PageResult(list.reverse(reversed), after))
+    [#(uuid, wire), ..rest] -> {
+      use position <- result.try(
+        uuid_position.from_uuid(uuid)
+        |> result.replace_error(store.StoreFailure(store.ReadProjection)),
+      )
+      use event <- result.try(unpack_projection(wire))
+      case decode_event(event, codec) {
+        Error(_) -> release_page(codec, rest, after, reversed)
+        Ok(value) ->
+          release_page(codec, rest, Some(position), [
+            projection.Delivery(value, position),
+            ..reversed
+          ])
+      }
+    }
+  }
+}
+
+pub fn projection_release_checkpoints(
+  checkpoints: CheckpointStore,
+) -> projection.Checkpoints {
+  projection.Checkpoints(
+    fn(name) {
+      let failure = store.StoreFailure(store.LoadCheckpoint)
+      use cursor <- result.try(
+        release_checkpoint(checkpoints.server, name)
+        |> result.replace_error(failure),
+      )
+      case cursor {
+        None -> Ok(None)
+        Some(uuid) ->
+          uuid_position.from_uuid(uuid)
+          |> result.map(Some)
+          |> result.replace_error(failure)
+      }
+    },
+    fn(name, position) {
+      let failure = store.StoreFailure(store.SaveCheckpoint)
+      use uuid <- result.try(
+        uuid_position.to_uuid(position)
+        |> result.replace_error(failure),
+      )
+      save_release_checkpoint(checkpoints.server, name, uuid)
+      |> result.replace_error(failure)
+    },
+  )
+}
+
+pub fn reset_release_checkpoint(
+  checkpoints: CheckpointStore,
+  name: String,
+) -> Result(Nil, CheckpointError) {
+  reset_release(checkpoints.server, name)
+}
+
+pub fn projection_release_backend(
+  events: EventStore(payload),
+  checkpoints: CheckpointStore,
+  consumer_kind: String,
+) -> projection_runner.Backend(payload) {
+  projection_runner.Backend(
+    projection_release_reader(events, consumer_kind),
+    projection_release_checkpoints(checkpoints),
+    fn(name) {
+      use release <- result.map(acquire_projection(checkpoints.server, name))
+      projection_runner.Lease(release)
+    },
+  )
+}
+
 pub fn projection_checkpoints(
   checkpoints: CheckpointStore,
 ) -> projection.Checkpoints {
@@ -358,3 +481,29 @@ fn acquire_projection(
   server: Server,
   name: String,
 ) -> Result(fn() -> Nil, projection_runner.LeadershipError)
+
+@external(erlang, "eventcore_sqlite_ffi", "release_read")
+fn release_read(
+  server: Server,
+  kind: String,
+  after: Option(String),
+  prefix: Option(String),
+  pattern: Option(String),
+  limit: Int,
+) -> Result(List(#(String, Event(BitArray))), StoreError)
+
+@external(erlang, "eventcore_sqlite_ffi", "release_checkpoint")
+fn release_checkpoint(
+  server: Server,
+  name: String,
+) -> Result(Option(String), CheckpointError)
+
+@external(erlang, "eventcore_sqlite_ffi", "save_release_checkpoint")
+fn save_release_checkpoint(
+  server: Server,
+  name: String,
+  uuid: String,
+) -> Result(Nil, CheckpointError)
+
+@external(erlang, "eventcore_sqlite_ffi", "reset_release_checkpoint")
+fn reset_release(server: Server, name: String) -> Result(Nil, CheckpointError)

@@ -3,7 +3,8 @@
 
 -export([start_file/2, start_memory/0, start_supplied/1, stop/1, migrate/2,
          read/3, append/3, load_snapshot/2, save_snapshot/4, checkpoint/2, save_checkpoint/3, reset_checkpoint/2,
-         projection_frontier/1, projection_fetch/3, unpack_projection/1]).
+         projection_frontier/1, projection_fetch/3, unpack_projection/1,
+         release_read/6, release_checkpoint/2, save_release_checkpoint/3, reset_release_checkpoint/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_file(Path, Encryption) -> start({file, Path, Encryption}).
@@ -39,6 +40,18 @@ projection_frontier(Server) ->
 
 projection_fetch(Server, First, Last) ->
     call(Server, {projection_fetch, First, Last}, {error, {store_failure, read_projection}}).
+
+release_read(Server, Kind, After, Prefix, Pattern, Limit) ->
+    call(Server, {release_read, Kind, After, Prefix, Pattern, Limit}, {error, {store_failure, read_projection}}).
+
+release_checkpoint(Server, Name) ->
+    call(Server, {release_checkpoint, Name}, {error, checkpoint_failed}).
+
+save_release_checkpoint(Server, Name, Uuid) ->
+    call(Server, {save_release_checkpoint, Name, Uuid}, {error, checkpoint_failed}).
+
+reset_release_checkpoint(Server, Name) ->
+    call(Server, {reset_release_checkpoint, Name}, {error, checkpoint_failed}).
 
 unpack_projection({event, Stream, Kind, Bytes}) ->
     read_event(Stream, Kind, Bytes).
@@ -124,6 +137,44 @@ handle_call({projection_fetch, First, Last}, _From, {Connection, _, _} = State) 
             "WHERE position BETWEEN ? AND ? ORDER BY position", [First, Last]),
         {ok, [{Position, {event, {id, Stream}, Kind, Bytes}} || {Position, Stream, Kind, Bytes} <- Rows]}
     end, {error, {store_failure, read_projection}}),
+    {reply, Reply, State};
+handle_call({release_read, Kind, After, Prefix, Pattern, Limit}, _From, {Connection, _, _} = State) ->
+    Reply = guard_query(fun() ->
+        {Filters, Values} = optional_filters([
+            {" AND p.uuid > ?", After},
+            {" AND e.stream LIKE ? || '%'", Prefix},
+            {" AND e.stream GLOB ?", Pattern}
+        ]),
+        Rows = sqlite:query(Connection, ["SELECT p.uuid, e.stream, e.kind, e.payload "
+            "FROM eventcore_release_ids p JOIN eventcore_events e ON e.position = p.position "
+            "WHERE e.kind = ?", Filters, " ORDER BY p.uuid LIMIT ?"],
+            [Kind | Values] ++ [Limit]),
+        {ok, lists:map(fun({Uuid, Stream, EventKind, Bytes}) ->
+            {Uuid, {event, {id, Stream}, EventKind, Bytes}}
+        end, Rows)}
+    end, {error, {store_failure, read_projection}}),
+    {reply, Reply, State};
+handle_call({release_checkpoint, Name}, _From, {Connection, _, _} = State) ->
+    Reply = guard_query(fun() ->
+        case sqlite:query(Connection, "SELECT uuid FROM eventcore_release_checkpoints WHERE name = ?", [Name]) of
+            [] -> {ok, none};
+            [{Uuid}] when is_binary(Uuid) -> {ok, {some, Uuid}};
+            _ -> {error, checkpoint_failed}
+        end
+    end, {error, checkpoint_failed}),
+    {reply, Reply, State};
+handle_call({save_release_checkpoint, Name, Uuid}, _From, {Connection, _, _} = State) ->
+    Reply = guard_query(fun() ->
+        ok = write_one(Connection, "INSERT INTO eventcore_release_checkpoints(name, uuid) VALUES(?, ?) "
+            "ON CONFLICT(name) DO UPDATE SET uuid = excluded.uuid", [Name, Uuid]),
+        {ok, nil}
+    end, {error, checkpoint_failed}),
+    {reply, Reply, State};
+handle_call({reset_release_checkpoint, Name}, _From, {Connection, _, _} = State) ->
+    Reply = guard_query(fun() ->
+        ok = write_query(Connection, "DELETE FROM eventcore_release_checkpoints WHERE name = ?", [Name]),
+        {ok, nil}
+    end, {error, checkpoint_failed}),
     {reply, Reply, State};
 handle_call(stop, _From, State) ->
     {stop, normal, {ok, nil}, State};
@@ -215,6 +266,27 @@ transaction(Connection, Work, Failure) ->
         _ -> Failure
     end.
 
+optional_filters(Options) ->
+    lists:unzip([{Fragment, Value} || {Fragment, {some, Value}} <- Options]).
+
+create_tables(Connection, release_event_schema) ->
+    [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_release_ids ("
+        "position INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE)"),
+    % Reserve 42 position bits for key order within a millisecond.
+    Clock = "CAST(round(unixepoch('subsec') * 1000) AS INTEGER)",
+    [] = sqlite:query(Connection, ["CREATE TRIGGER IF NOT EXISTS eventcore_assign_release_id "
+        "AFTER INSERT ON eventcore_events BEGIN "
+        "INSERT INTO eventcore_release_ids(position, uuid) VALUES (NEW.position, ",
+        release_uuid(Clock, "NEW.position"), "); "
+        "SELECT CASE WHEN changes() <> 1 THEN RAISE(ABORT, 'event UUID missing') END; END"]),
+    ok = write_query(Connection, ["INSERT INTO eventcore_release_ids(position, uuid) "
+        "SELECT e.position, ", release_uuid("0", "e.position"), " FROM eventcore_events e "
+        "WHERE NOT EXISTS (SELECT 1 FROM eventcore_release_ids p WHERE p.position = e.position)"], []),
+    {ok, nil};
+create_tables(Connection, release_checkpoint_schema) ->
+    [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_release_checkpoints ("
+        "name TEXT PRIMARY KEY NOT NULL, uuid TEXT NOT NULL)"),
+    {ok, nil};
 create_tables(Connection, event_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_events ("
         "position INTEGER PRIMARY KEY, stream TEXT NOT NULL, version INTEGER NOT NULL, "
@@ -226,6 +298,13 @@ create_tables(Connection, checkpoint_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_checkpoints ("
         "name TEXT PRIMARY KEY NOT NULL, position INTEGER NOT NULL CHECK(position >= 0))"),
     {ok, nil}.
+
+release_uuid(Clock, Position) ->
+    ["substr(printf('%012x', ", Clock, "), 1, 8) || '-' || "
+     "substr(printf('%012x', ", Clock, "), 9, 4) || "
+     "printf('-7%03x-%x%03x-%04x', (", Position, " >> 30) & 4095, "
+     "8 | ((", Position, " >> 28) & 3), (", Position, " >> 16) & 4095, ",
+     Position, " & 65535) || lower(hex(randomblob(4)))"].
 
 read_snapshot(Connection, Name) ->
     case sqlite:query(Connection, "SELECT body FROM eventcore_command_snapshots WHERE name = ?", [Name]) of

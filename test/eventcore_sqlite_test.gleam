@@ -486,3 +486,62 @@ pub fn legacy_projection_skips_incompatible_rows_after_limit_test() {
   assert sqlite.close(db) == Ok(Nil)
   assert delete_database(path) == Nil
 }
+
+pub fn release_sqlite_uses_native_selection_and_resumes_uuid_after_reopen_test() {
+  let path = temp_database()
+  let checkpoint_path = temp_database()
+  let codec = integer_codec()
+  let assert Ok(events) = sqlite.open(path, codec)
+  let assert Ok(checkpoints) = sqlite.open_checkpoints(checkpoint_path, None)
+  assert sqlite.migrate(events) == Ok(Nil)
+  assert sqlite.migrate_checkpoints(checkpoints) == Ok(Nil)
+  let assert Ok(id) = stream.id("notes/ab")
+  let initial = stream.initial_version
+  let first = store.Event(id, "note", 12)
+  let last = store.Event(id, "note", 34)
+  let assert Ok(writes) =
+    store.writes()
+    |> store.register(id, initial)
+    |> result.try(store.append(_, first))
+  assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
+  assert sqlite.migrate_release_delivery(events) == Ok(Nil)
+  assert sqlite.migrate_release_checkpoints(checkpoints) == Ok(Nil)
+  let assert Ok(writes) =
+    store.writes()
+    |> store.register(id, stream.next_version(initial))
+    |> result.try(store.append(_, store.Event(id, "other", 99)))
+    |> result.try(store.append(_, last))
+  assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
+  let backend = sqlite.projection_release_backend(events, checkpoints, "note")
+  let assert Ok(prefix) = projection.prefix("NOTES/_")
+  let assert Ok(first_page) = projection.page(None, 1)
+  let assert Ok(projection.PageResult([delivery], Some(cursor))) =
+    backend.reader(prefix, first_page)
+  assert delivery.event == first
+  let assert Ok(native) = projection.position(1)
+  assert cursor != native
+  assert sqlite.save_checkpoint(checkpoints, "notes", 1) == Ok(Nil)
+  assert backend.checkpoints.save("notes", cursor) == Ok(Nil)
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+  assert sqlite.close(events) == Ok(Nil)
+
+  let assert Ok(events) = sqlite.open(path, codec)
+  let assert Ok(checkpoints) = sqlite.open_checkpoints(checkpoint_path, None)
+  let backend = sqlite.projection_release_backend(events, checkpoints, "note")
+  assert sqlite.migrate_release_delivery(events) == Ok(Nil)
+  assert sqlite.migrate_release_checkpoints(checkpoints) == Ok(Nil)
+  assert backend.checkpoints.load("notes") == Ok(Some(cursor))
+  let assert Ok(pattern) = projection.pattern("notes/a[b]")
+  let assert Ok(next_page) = projection.page(Some(cursor), 1)
+  let assert Ok(projection.PageResult([delivery], Some(through))) =
+    backend.reader(pattern, next_page)
+  assert delivery.event == last
+  assert projection.sequence(through) > projection.sequence(cursor)
+  assert sqlite.reset_release_checkpoint(checkpoints, "notes") == Ok(Nil)
+  assert backend.checkpoints.load("notes") == Ok(None)
+  assert sqlite.load_checkpoint(checkpoints, "notes") == Ok(Some(1))
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+  assert sqlite.close(events) == Ok(Nil)
+  assert delete_database(path) == Nil
+  assert delete_database(checkpoint_path) == Nil
+}
