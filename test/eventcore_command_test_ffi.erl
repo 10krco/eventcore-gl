@@ -1,5 +1,5 @@
 -module(eventcore_command_test_ffi).
--export([notifications/0, record/2, drain/1]).
+-export([observe_retry/1, end_at_retry/1, notifications/0, record/2, drain/1]).
 
 notifications() -> make_ref().
 
@@ -15,3 +15,11 @@ drain(Ref, Reversed) ->
     after 0 ->
         lists:reverse(Reversed)
     end.
+
+
+observe_retry(Execute) ->
+    try Execute() of _ -> none
+    catch throw:{observed_retry, Context} -> {some, Context}
+    end.
+
+end_at_retry(Context) -> throw({observed_retry, Context}).

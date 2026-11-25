@@ -5,7 +5,7 @@ import eventcore/store
 import eventcore/stream
 import gleam/dict
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 
 type Notifications(value)
@@ -223,10 +223,28 @@ pub fn retry_default_and_exhaustion_test() {
   assert command.execute(storage, operation, policy)
     == Error(command.ConcurrencyError(4))
 
-  let assert Ok(zero_delay) = command.retry_policy(65, command.Exponential(0))
+  let assert Ok(zero_delay) = command.retry_policy(64, command.Exponential(0))
   let zero_delay = command.with_trace(zero_delay, fn(_) { Nil })
   assert command.execute(storage, operation, zero_delay)
-    == Error(command.ConcurrencyError(65))
+    == Error(command.ConcurrencyError(64))
+
+  let assert Ok(overflow) = command.retry_policy(65, command.Exponential(0))
+  let overflow =
+    overflow
+    |> command.with_trace(fn(_) { Nil })
+    |> command.with_metrics(fn(context) {
+      case context.attempt {
+        65 -> end_at_retry(context)
+        _ -> {
+          assert context.delay_ms == 0
+        }
+      }
+    })
+  let assert Some(context) =
+    observe_retry(fn() { command.execute(storage, operation, overflow) })
+  assert context.attempt == 65
+  assert context.delay_ms >= 14_757_395_258_967_640_000
+  assert context.delay_ms <= 18_446_744_073_709_551_615
 }
 
 pub fn business_rejections_and_storage_errors_are_terminal_test() {
@@ -536,3 +554,9 @@ pub fn snapshot_refresh_threshold_applies_before_a_command_rejection_test() {
     )
   assert memory.close(pid) == Ok(Nil)
 }
+
+@external(erlang, "eventcore_command_test_ffi", "observe_retry")
+fn observe_retry(execute: fn() -> value) -> Option(command.RetryContext)
+
+@external(erlang, "eventcore_command_test_ffi", "end_at_retry")
+fn end_at_retry(context: command.RetryContext) -> Nil
