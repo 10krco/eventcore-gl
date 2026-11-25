@@ -84,9 +84,16 @@ pub fn modeled_command_projection_and_view_test() {
   assert command.execute(storage, operation, command.default_policy())
     == Ok(command.Execution(1))
 
+  let assert Ok(stored) = store.read_stream(storage, account)
+  assert store.collect(stored)
+    == Ok([
+      store.Event(account, "opened", Opened),
+      store.Event(account, "deposited", Deposited(40)),
+    ])
+
   let balance = model.read_model("Balance", Balance)
   let change = model.effect("Change", Change)
-  let assert Ok(sink) = runtime.memory_sink(model.build(balance, 0))
+  let assert Ok(sink) = runtime.memory_sink(model.build(balance, #(0, 0, 0)))
   let projector =
     runtime.Projection("balance", projection.all(), fn(delivery) {
       case model.value(delivery.event.payload) {
@@ -98,12 +105,36 @@ pub fn modeled_command_projection_and_view_test() {
     runtime.checked_projection(
       event,
       projector,
-      runtime.as_sink(sink, fn(previous, effect) {
-        model.build(balance, model.value(previous) + model.value(effect))
+      runtime.as_sink(sink, fn(previous, effect, position) {
+        let #(total, seen, deliveries) = model.value(previous)
+        let sequence = projection.sequence(position)
+        case sequence > seen {
+          True ->
+            model.build(balance, #(
+              total + model.value(effect),
+              sequence,
+              deliveries + 1,
+            ))
+          False -> model.build(balance, #(total, seen, deliveries + 1))
+        }
       }),
       fn(_) { runner.Fatal },
     )
   let backend = memory.projection_backend(memory)
+  let fail_checkpoint =
+    runner.Backend(
+      ..backend,
+      checkpoints: projection.Checkpoints(backend.checkpoints.load, fn(_, _) {
+        Error(store.StoreFailure(store.SaveCheckpoint))
+      }),
+    )
+  assert runner.run(
+      fail_checkpoint,
+      checked,
+      runner.default_config,
+      runner.uninterrupted(),
+    )
+    == Ok(Nil)
   assert runner.run(
       backend,
       checked,
@@ -112,10 +143,12 @@ pub fn modeled_command_projection_and_view_test() {
     )
     == Ok(Nil)
   let assert Ok(read_model) = runtime.read(sink)
+  assert model.value(read_model) == #(40, 2, 2)
   let statement = model.output("Statement", Statement)
   let output =
     runtime.render(read_model, fn(balance) {
-      model.build(statement, #("available", model.value(balance)))
+      let #(total, _, _) = model.value(balance)
+      model.build(statement, #("available", total))
     })
   assert model.value(output) == #("available", 40)
   assert runtime.close(sink) == Ok(Nil)

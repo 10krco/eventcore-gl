@@ -11,5 +11,6 @@ Adapt a modeled projection to the existing named projection runner. The
 projector explicitly chooses whether to apply an effect or ignore a delivery.
 Pass the effect and its source position to a typed sink, and distinguish
 projection errors from sink errors for retry policy. Provide a serialized
-in-memory sink for testing effect application and a typed view function that
-renders a modeled read model.
+in-memory sink for testing effect application with the delivery position in
+the same serialized update. A typed view function renders a modeled read
+model.

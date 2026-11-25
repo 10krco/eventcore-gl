@@ -202,15 +202,18 @@ pub fn memory_sink(
   start_server(initial) |> result.map(MemorySink)
 }
 
+/// Apply the effect and its delivery position in one serialized update.
+/// Keep the update idempotent when checkpoint failure can cause redelivery.
 pub fn as_sink(
   sink: MemorySink(read_model_witness, read_model),
   apply: fn(
     Modeled(model.ReadModel(read_model_witness), read_model),
     Modeled(model.Effect(effect_witness), effect),
+    projection.Position,
   ) -> Modeled(model.ReadModel(read_model_witness), read_model),
 ) -> Sink(effect_witness, effect, Nil) {
-  fn(effect, _) {
-    call(sink.server, fn(current) { #(apply(current, effect), Nil) })
+  fn(effect, position) {
+    call(sink.server, fn(current) { #(apply(current, effect, position), Nil) })
   }
 }
 

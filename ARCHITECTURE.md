@@ -158,6 +158,7 @@ Modeled commands adapt their typed declarations, replay logic, and emitted
 events to the ordinary command runtime. Modeled projections use the ordinary
 projection runner with a checked effect sink. The adapter reports projection
 errors separately from sink errors and passes the delivery position to the
-sink. Tests and examples can use the serialized in-memory sink and render its
-read model through a typed view. See
+sink. Tests and examples can use delivery positions to handle redelivery in
+the serialized in-memory sink, then render its read model through a typed
+view. See
 [ADR 0018](docs/decisions/0018-modeled-runtime.md).
