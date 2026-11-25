@@ -1123,3 +1123,32 @@ pub fn projector_stops_without_checkpointing_if_flock_process_exits_test() {
   next.release()
   remove_root(root)
 }
+
+pub fn stale_filesystem_holder_cannot_overwrite_replacement_checkpoint_test() {
+  let root = temp_root()
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let assert Ok(checkpoints) =
+    filesystem.open_projection_checkpoints(filesystem.Config(
+      root,
+      filesystem.Full,
+    ))
+  let name = "checkpoint-fence"
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(second) = projection.position(2)
+  let assert Ok(old) = coordinate(name)
+  assert projection_runner.check_lease(old) == Ok(Nil)
+  kill_projection_lock()
+  let replacement = await_lease(coordinate, name)
+  assert projection_runner.checkpoint_with_lease(replacement, fn() {
+      checkpoints.save(name, second)
+    })
+    == Ok(Ok(Nil))
+  assert projection_runner.checkpoint_with_lease(old, fn() {
+      checkpoints.save(name, first)
+    })
+    == Error(projection_runner.CoordinatorUnavailable)
+  assert checkpoints.load(name) == Ok(Some(second))
+  old.release()
+  replacement.release()
+  remove_root(root)
+}

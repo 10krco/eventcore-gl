@@ -117,7 +117,8 @@ the standalone and journal-backed coordinators use the same per-name lock
 files. Each lock worker monitors the lease holder and also monitors the
 local journal when the lease came through a journal handle. Full checkpoint
 opens sync newly created directory entries. The runner checks active leases
-before applying events and persisting progress. See
+before applying events. A separate per-name lock serializes checkpoint
+writes and lets each writer recheck leadership inside the write fence. See
 [ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md) and
 [ADR 0022](docs/decisions/0022-filesystem-projection-coordination.md).
 

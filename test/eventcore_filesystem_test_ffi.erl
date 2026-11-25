@@ -89,7 +89,7 @@ check_os_lock(Root, Name) ->
 check_holder_exit(Acquire, Name) ->
     Parent = self(),
     {Holder, Monitor} = spawn_monitor(fun() ->
-        {ok, {checked_lease, Release, _}} = Acquire(Name),
+        {ok, {checked_lease, Release, _, _}} = Acquire(Name),
         Parent ! {self(), Release},
         receive stop -> ok end
     end),
@@ -100,7 +100,7 @@ check_holder_exit(Acquire, Name) ->
             receive {'DOWN', Monitor, process, Holder, normal} -> ok
             after 5000 -> error(holder_exit_timeout)
             end,
-            {checked_lease, Release, _} = await_lease(Acquire, Name),
+            {checked_lease, Release, _, _} = await_lease(Acquire, Name),
             try
                 nil = StaleRelease(),
                 {error, already_leading} = Acquire(Name),

@@ -21,6 +21,8 @@ pub type Lease {
   CheckedLease(
     release: fn() -> Nil,
     check: fn() -> Result(Nil, LeadershipError),
+    checkpoint: fn(fn() -> Result(Nil, StoreError)) ->
+      Result(Result(Nil, StoreError), LeadershipError),
   )
 }
 
@@ -28,7 +30,18 @@ pub type Lease {
 pub fn check_lease(lease: Lease) -> Result(Nil, LeadershipError) {
   case lease {
     Lease(_) -> Ok(Nil)
-    CheckedLease(_, check) -> check()
+    CheckedLease(check:, ..) -> check()
+  }
+}
+
+/// Run a checkpoint write under the backend's lease fence.
+pub fn checkpoint_with_lease(
+  lease: Lease,
+  write: fn() -> Result(Nil, StoreError),
+) -> Result(Result(Nil, StoreError), LeadershipError) {
+  case lease {
+    Lease(_) -> Ok(write())
+    CheckedLease(checkpoint:, ..) -> checkpoint(write)
   }
 }
 
@@ -319,8 +332,13 @@ fn save(
   run: Run(payload, state, error),
   position: Position,
 ) -> Result(Nil, RunError(error)) {
-  use Nil <- result.try(check_lease(run.lease) |> result.map_error(Leadership))
-  case run.backend.checkpoints.save(run.projector.name, position) {
+  use saved <- result.try(
+    checkpoint_with_lease(run.lease, fn() {
+      run.backend.checkpoints.save(run.projector.name, position)
+    })
+    |> result.map_error(Leadership),
+  )
+  case saved {
     Ok(Nil) -> Ok(Nil)
     Error(_) -> {
       log(

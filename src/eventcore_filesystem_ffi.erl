@@ -108,9 +108,20 @@ projection_acquire(Pid, Name) ->
     end.
 
 acquire_projection_lock(Directory, Name, Journal) ->
+    Path = filename:join(Directory, <<(checksum(Name))/binary, ".lock">>),
+    case open_projection_lock(Directory, Path, Journal) of
+        {ok, Worker, Port, Token} ->
+            Release = fun() -> release_projection_lock(Worker, Token) end,
+            Check = fun() -> check_projection_lock(Worker, Port, Journal) end,
+            Fence = <<Path/binary, ".checkpoint">>,
+            Checkpoint = fun(Write) -> with_checkpoint_lock(Directory, Fence, Check, Write) end,
+            {ok, {checked_lease, Release, Check, Checkpoint}};
+        Error -> Error
+    end.
+
+open_projection_lock(Directory, Path, Journal) ->
     Owner = self(),
     Reference = make_ref(),
-    Path = filename:join(Directory, <<(checksum(Name))/binary, ".lock">>),
     {Worker, Monitor} = spawn_monitor(fun() ->
         projection_lock_worker(Owner, Reference, Directory, Path, Journal)
     end),
@@ -137,9 +148,7 @@ projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
         {ok, Port} ->
             Worker = self(),
             Token = make_ref(),
-            Release = fun() -> release_projection_lock(Worker, Token) end,
-            Check = fun() -> check_projection_lock(Worker, Port, Journal) end,
-            Owner ! {Reference, {ok, {checked_lease, Release, Check}}},
+            Owner ! {Reference, {ok, Worker, Port, Token}},
             receive
                 {release, Token} -> release_lock(Port);
                 {'DOWN', OwnerMonitor, process, _, _} -> release_lock(Port);
@@ -149,6 +158,31 @@ projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
             end;
         {error, store_locked} -> Owner ! {Reference, {error, already_leading}};
         _ -> Owner ! {Reference, {error, coordinator_unavailable}}
+    end.
+
+with_checkpoint_lock(Directory, Path, Check, Write) ->
+    Deadline = erlang:monotonic_time(millisecond) + 5000,
+    with_checkpoint_lock(Directory, Path, Check, Write, Deadline).
+
+with_checkpoint_lock(Directory, Path, Check, Write, Deadline) ->
+    case open_projection_lock(Directory, Path, none) of
+        {ok, Worker, _, Token} ->
+            try
+                case Check() of
+                    {ok, nil} -> {ok, Write()};
+                    Error -> Error
+                end
+            after
+                release_projection_lock(Worker, Token)
+            end;
+        {error, already_leading} ->
+            case erlang:monotonic_time(millisecond) < Deadline of
+                true ->
+                    timer:sleep(10),
+                    with_checkpoint_lock(Directory, Path, Check, Write, Deadline);
+                false -> {error, coordinator_unavailable}
+            end;
+        Error -> Error
     end.
 
 check_projection_lock(Worker, Port, Journal) ->

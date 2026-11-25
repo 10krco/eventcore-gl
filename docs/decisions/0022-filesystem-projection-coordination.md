@@ -21,7 +21,9 @@ lock through the existing flock port, monitors the holder, and also monitors
 the journal for journal-backed leases. Journal-backed coordination requires a
 local journal handle. The runner checks the lock before processing or saving
 progress and returns a leadership error when the port or journal dies.
-Release waits for the worker to exit.
+A separate per-name OS lock serializes checkpoint writes across leadership
+changes. The writer rechecks its lease while holding that lock. Release
+waits for the worker to exit.
 Lock files stay in place so all contenders use the same inode.
 
 ## Consequences
@@ -29,3 +31,7 @@ Lock files stay in place so all contenders use the same inode.
 A projector can persist and reopen progress without creating or opening an
 event journal. Competing OS processes contend for the same name. Independent
 names can advance in parallel, and holder exit releases its lease.
+
+Existing coordinators can still construct `Lease(release)`. Lease consumers
+can call `lease.release()` with either variant. Exhaustive matches on
+`Lease` must also cover `CheckedLease`.
