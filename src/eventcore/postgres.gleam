@@ -514,12 +514,13 @@ pub fn projection_release_reader(
     }
     use returned <- result.try(
       pog.query(
-        "SELECT event_id::text, stream, kind, payload FROM eventcore_events
+        "SELECT events.event_id::text AS id_text, stream, kind, payload
+         FROM eventcore_events AS events
          WHERE kind = $1
-           AND ($2::text IS NULL OR event_id > $2::text::uuid)
+           AND ($2::text IS NULL OR events.event_id > $2::text::uuid)
            AND ($3::text IS NULL OR stream LIKE $3::text || '%')
            AND ($4::text IS NULL OR stream ~ $4::text)
-         ORDER BY event_id LIMIT $5",
+         ORDER BY events.event_id LIMIT $5",
       )
       |> pog.parameter(pog.text(kind))
       |> pog.parameter(pog.nullable(pog.text, cursor))
