@@ -327,7 +327,10 @@ pub fn projection_checkpoints(
 pub fn open_projection_checkpoints(
   config: Config,
 ) -> Result(projection.Checkpoints, OpenError) {
-  use directory <- result.map(open_checkpoint_directory(config.root))
+  use directory <- result.map(open_checkpoint_directory(
+    config.root,
+    config.sync,
+  ))
   projection.Checkpoints(
     standalone_projection_load(directory, _),
     fn(name, position) {
@@ -341,10 +344,7 @@ pub fn open_projection_coordinator(
   root: String,
 ) -> Result(projection_runner.Coordinator, OpenError) {
   use directory <- result.map(open_lock_directory(root))
-  fn(name) {
-    use release <- result.map(standalone_projection_acquire(directory, name))
-    projection_runner.Lease(release)
-  }
+  standalone_projection_acquire(directory, _)
 }
 
 /// Uses named OS advisory locks for the legacy runner.
@@ -354,10 +354,7 @@ pub fn projection_backend(
   projection_runner.Backend(
     projection_reader(filesystem),
     projection_checkpoints(filesystem),
-    fn(name) {
-      use release <- result.map(acquire_projection(filesystem.server, name))
-      projection_runner.Lease(release)
-    },
+    acquire_projection(filesystem.server, _),
   )
 }
 
@@ -512,10 +509,13 @@ fn projection_save(
 fn acquire_projection(
   server: Server,
   name: String,
-) -> Result(fn() -> Nil, projection_runner.LeadershipError)
+) -> Result(projection_runner.Lease, projection_runner.LeadershipError)
 
 @external(erlang, "eventcore_filesystem_ffi", "open_projection_checkpoints")
-fn open_checkpoint_directory(root: String) -> Result(String, OpenError)
+fn open_checkpoint_directory(
+  root: String,
+  sync: Sync,
+) -> Result(String, OpenError)
 
 @external(erlang, "eventcore_filesystem_ffi", "standalone_projection_load")
 fn standalone_projection_load(
@@ -538,4 +538,4 @@ fn open_lock_directory(root: String) -> Result(String, OpenError)
 fn standalone_projection_acquire(
   directory: String,
   name: String,
-) -> Result(fn() -> Nil, projection_runner.LeadershipError)
+) -> Result(projection_runner.Lease, projection_runner.LeadershipError)

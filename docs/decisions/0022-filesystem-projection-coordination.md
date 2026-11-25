@@ -14,10 +14,14 @@ writer lock, and competing processes contend for the same subscription.
 
 Expose standalone checkpoint and coordinator constructors. Checkpoints reuse
 the journal's replica-local checkpoint format, atomic replacement, and
-configured sync policy. The journal-backed coordinator and standalone
+configured sync policy. Opening a Full checkpoint store syncs the ancestor
+entries for new directories. The journal-backed coordinator and standalone
 coordinator use the same named OS advisory lock files. A worker holds each
 lock through the existing flock port, monitors the holder, and also monitors
-the journal for journal-backed leases. Release waits for the worker to exit.
+the journal for journal-backed leases. Journal-backed coordination requires a
+local journal handle. The runner checks the lock before processing or saving
+progress and returns a leadership error when the port or journal dies.
+Release waits for the worker to exit.
 Lock files stay in place so all contenders use the same inode.
 
 ## Consequences

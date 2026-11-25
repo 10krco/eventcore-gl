@@ -1,7 +1,7 @@
 -module(eventcore_filesystem_test_ffi).
 -export([temp_root/0, remove_root/1, transaction_paths/1, tamper/1, remove/1,
          copy_transactions/2, copy_replica/2, downgrade_transaction/1, add_malformed_transaction/2,
-         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2]).
+         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2, await_lease/2, kill_projection_lock/0]).
 
 temp_root() ->
     Random = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
@@ -89,7 +89,7 @@ check_os_lock(Root, Name) ->
 check_holder_exit(Acquire, Name) ->
     Parent = self(),
     {Holder, Monitor} = spawn_monitor(fun() ->
-        {ok, {lease, Release}} = Acquire(Name),
+        {ok, {checked_lease, Release, _}} = Acquire(Name),
         Parent ! {self(), Release},
         receive stop -> ok end
     end),
@@ -100,7 +100,7 @@ check_holder_exit(Acquire, Name) ->
             receive {'DOWN', Monitor, process, Holder, normal} -> ok
             after 5000 -> error(holder_exit_timeout)
             end,
-            {lease, Release} = await_release(Acquire, Name, 250),
+            {checked_lease, Release, _} = await_lease(Acquire, Name),
             try
                 nil = StaleRelease(),
                 {error, already_leading} = Acquire(Name),
@@ -121,4 +121,29 @@ await_release(Acquire, Name, Attempts) ->
         {error, already_leading} ->
             timer:sleep(10),
             await_release(Acquire, Name, Attempts - 1)
+    end.
+
+
+await_lease(Acquire, Name) -> await_release(Acquire, Name, 250).
+
+kill_projection_lock() ->
+    {monitored_by, Monitors} = process_info(self(), monitored_by),
+    Workers = [Pid || Pid <- Monitors,
+                      process_info(Pid, current_function) =:=
+                          {current_function, {eventcore_filesystem_ffi, projection_lock_worker, 5}}],
+    Ports = lists:flatmap(fun(Worker) ->
+        {links, Links} = process_info(Worker, links),
+        [Port || Port <- Links, is_port(Port)]
+    end, Workers),
+    [Port] = Ports,
+    {os_pid, Pid} = erlang:port_info(Port, os_pid),
+    Monitor = monitor(port, Port),
+    Executable = os:find_executable("kill"),
+    Killer = open_port({spawn_executable, Executable},
+                       [exit_status, {args, ["-KILL", integer_to_list(Pid)]}]),
+    receive {Killer, {exit_status, 0}} -> ok
+    after 2000 -> error(lock_kill_failed)
+    end,
+    receive {'DOWN', Monitor, port, Port, _} -> nil
+    after 2000 -> error(lock_port_still_alive)
     end.

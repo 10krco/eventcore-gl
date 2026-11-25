@@ -1061,8 +1061,65 @@ pub fn standalone_projection_state_shares_journal_checkpoint_and_os_lock_test() 
   assert backend.acquire(name) == Error(projection_runner.AlreadyLeading)
   lease.release()
   check_holder_exit(coordinate, name)
+  let assert Ok(active) = backend.acquire(name)
   assert filesystem.close(journal) == Ok(Nil)
-  let assert Ok(after_close) = coordinate(name)
+  let after_close = await_lease(coordinate, name)
+  assert projection_runner.check_lease(active)
+    == Error(projection_runner.CoordinatorUnavailable)
+  active.release()
+  assert coordinate(name) == Error(projection_runner.AlreadyLeading)
   after_close.release()
+  remove_root(root)
+}
+
+@external(erlang, "eventcore_filesystem_test_ffi", "await_lease")
+fn await_lease(
+  acquire: projection_runner.Coordinator,
+  name: String,
+) -> projection_runner.Lease
+
+@external(erlang, "eventcore_filesystem_test_ffi", "kill_projection_lock")
+fn kill_projection_lock() -> Nil
+
+pub fn projector_stops_without_checkpointing_if_flock_process_exits_test() {
+  let root = temp_root()
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let assert Ok(id) = stream.id("projected")
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(second) = projection.position(2)
+  let event = store.Event(id, "created", 1)
+  let reader = fn(_, _) {
+    Ok(projection.PageResult(
+      [projection.Delivery(event, first), projection.Delivery(event, second)],
+      Some(second),
+    ))
+  }
+  let checkpoints =
+    projection.Checkpoints(fn(_) { Ok(None) }, fn(_, _) {
+      panic as "a projector without leadership cannot save progress"
+    })
+  let projector =
+    projection_runner.Projector(
+      name: "lock-loss",
+      filter: projection.all(),
+      initial: Nil,
+      apply: fn(_, delivery) {
+        assert delivery.position == first
+        kill_projection_lock()
+        #(Nil, Ok(Nil))
+      },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      projection_runner.Backend(reader, checkpoints, coordinate),
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Error(projection_runner.Leadership(
+      projection_runner.CoordinatorUnavailable,
+    ))
+  let next = await_lease(coordinate, "lock-loss")
+  next.release()
   remove_root(root)
 }

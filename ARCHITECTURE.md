@@ -115,7 +115,9 @@ Named checkpoints use atomic local files. Callers can open these checkpoints
 and named OS advisory locks independently of the journal writer lock. Both
 the standalone and journal-backed coordinators use the same per-name lock
 files. Each lock worker monitors the lease holder and also monitors the
-journal when the lease came through a journal handle. See
+local journal when the lease came through a journal handle. Full checkpoint
+opens sync newly created directory entries. The runner checks active leases
+before applying events and persisting progress. See
 [ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md) and
 [ADR 0022](docs/decisions/0022-filesystem-projection-coordination.md).
 

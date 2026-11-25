@@ -4,7 +4,7 @@
          event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/5,
          replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4,
          projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3,
-         open_projection_checkpoints/1, standalone_projection_load/2, standalone_projection_save/4,
+         open_projection_checkpoints/2, standalone_projection_load/2, standalone_projection_save/4,
          open_projection_coordinator/1, standalone_projection_acquire/2, projection_acquire/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
@@ -71,12 +71,15 @@ projection_load(Pid, Name) ->
 projection_save(Pid, Name, Position) ->
     guarded_call(Pid, none, {projection_save, Name, Position}, save_checkpoint).
 
-open_projection_checkpoints(Root) -> open_projection_directory(Root, <<"checkpoints">>).
-open_projection_coordinator(Root) -> open_projection_directory(Root, <<"locks">>).
+open_projection_checkpoints(Root, Sync) ->
+    open_projection_directory(Root, <<"checkpoints">>, Sync).
 
-open_projection_directory(Root, Name) ->
+open_projection_coordinator(Root) ->
+    open_projection_directory(Root, <<"locks">>, unsynced).
+
+open_projection_directory(Root, Name, Sync) ->
     Directory = filename:join([filename:absname(Root), <<".eventcore">>, <<"projection">>, Name]),
-    case filelib:ensure_path(Directory) of
+    case ensure_directory(Directory, Sync, fun(Parent) -> sync_directory(Parent, Sync) end) of
         ok -> {ok, Directory};
         _ -> {error, cannot_open}
     end.
@@ -96,6 +99,8 @@ standalone_projection_save(Directory, Sync, Name, Position) ->
 standalone_projection_acquire(Directory, Name) ->
     acquire_projection_lock(Directory, Name, none).
 
+projection_acquire(Pid, _Name) when node(Pid) =/= node() ->
+    {error, remote_holder};
 projection_acquire(Pid, Name) ->
     case call(Pid, projection_lock_directory, {error, coordinator_unavailable}) of
         {ok, Directory} -> acquire_projection_lock(Directory, Name, {some, Pid});
@@ -132,7 +137,9 @@ projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
         {ok, Port} ->
             Worker = self(),
             Token = make_ref(),
-            Owner ! {Reference, {ok, fun() -> release_projection_lock(Worker, Token) end}},
+            Release = fun() -> release_projection_lock(Worker, Token) end,
+            Check = fun() -> check_projection_lock(Worker, Port, Journal) end,
+            Owner ! {Reference, {ok, {checked_lease, Release, Check}}},
             receive
                 {release, Token} -> release_lock(Port);
                 {'DOWN', OwnerMonitor, process, _, _} -> release_lock(Port);
@@ -143,6 +150,16 @@ projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
         {error, store_locked} -> Owner ! {Reference, {error, already_leading}};
         _ -> Owner ! {Reference, {error, coordinator_unavailable}}
     end.
+
+check_projection_lock(Worker, Port, Journal) ->
+    case is_process_alive(Worker) andalso erlang:port_info(Port) =/= undefined
+         andalso journal_alive(Journal) of
+        true -> {ok, nil};
+        false -> {error, coordinator_unavailable}
+    end.
+
+journal_alive(none) -> true;
+journal_alive({some, Pid}) -> is_process_alive(Pid).
 
 release_projection_lock(Worker, Token) ->
     Monitor = monitor(process, Worker),
