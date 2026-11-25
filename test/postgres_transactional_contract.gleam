@@ -206,7 +206,29 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   check_idle_fencing(destination, source, config, second)
   check_error_policy_after_rollback(destination, source, config, second)
   check_leadership_loss(destination, source, config, second)
-  check_commit_rejection(destination, source, config, second, position1)
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE projection_effects ADD CONSTRAINT projection_amount_unique
+      UNIQUE (amount) DEFERRABLE INITIALLY DEFERRED",
+    )
+    |> pog.execute(second)
+  check_commit_rejection(destination, source, config, second, position1, 1)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION reject_projection() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        RAISE EXCEPTION 'projection commit rejected by deferred trigger';
+      END $$",
+    )
+    |> pog.execute(second)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER reject_projection
+      AFTER INSERT ON projection_effects DEFERRABLE INITIALLY DEFERRED
+      FOR EACH ROW WHEN (NEW.amount = 600) EXECUTE FUNCTION reject_projection()",
+    )
+    |> pog.execute(second)
+  check_commit_rejection(destination, source, config, second, position1, 600)
   check_commit_disconnect(destination, source, config, second, position1)
 }
 
@@ -301,20 +323,21 @@ fn check_error_policy_after_rollback(destination, source, config, observer) {
     == Ok(transactional.Stopped(position, 0, 0))
 }
 
-fn check_commit_rejection(destination, source, config, observer, position) {
-  let assert Ok(_) =
-    pog.query(
-      "ALTER TABLE projection_effects ADD CONSTRAINT projection_amount_unique
-      UNIQUE (amount) DEFERRABLE INITIALLY DEFERRED",
-    )
-    |> pog.execute(observer)
+fn check_commit_rejection(
+  destination,
+  source,
+  config,
+  observer,
+  position,
+  amount,
+) {
   let assert Ok(name) = delivery.projector_name("transactional-rejected")
   let projector =
     transactional.Projector(
       name,
       fn(_) { Ok(Nil) },
       fn(_, _, tx) {
-        let assert Ok(_) = insert(tx, 1)
+        let assert Ok(_) = insert(tx, amount)
         Ok(fn() { panic as "rejected commit ran the after-commit hook" })
       },
       fn(_) { transactional.Fatal },
@@ -327,7 +350,7 @@ fn check_commit_rejection(destination, source, config, observer, position) {
       source.id,
       delivery.selection_identity(config.selection),
       fn(tx) {
-        let assert Ok(_) = insert(tx, 1)
+        let assert Ok(_) = insert(tx, amount)
         Ok(Nil)
       },
     )

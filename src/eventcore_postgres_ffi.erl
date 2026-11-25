@@ -238,9 +238,11 @@ run_transaction_command(Pool, Key, Ref, Connection, StateKey, Command, Sql) ->
             failed_transaction_command(Pool, Key, Ref, Connection, StateKey)
     end.
 
-%% Integrity violations and transaction rollback SQLSTATEs prove that
-%% PostgreSQL rejected COMMIT. 40003 explicitly leaves completion unknown.
+%% Integrity violations, the default RAISE EXCEPTION from a deferred trigger,
+%% and transaction rollback SQLSTATEs prove that PostgreSQL rejected COMMIT.
+%% 40003 explicitly leaves completion unknown.
 commit_rejected(<<"23", _/binary>>) -> true;
+commit_rejected(<<"P0001">>) -> true;
 commit_rejected(<<"40003">>) -> false;
 commit_rejected(<<"40", _/binary>>) -> true;
 commit_rejected(_) -> false.
