@@ -334,7 +334,10 @@ fn check_progress_write_and_reset_failures(
       source,
       config,
     )
-    == Error(transactional.ProgressFailed(Some(first), progress.UnexpectedRows))
+    == Error(transactional.ProgressFailed(
+      Some(first),
+      transactional.ProgressUnexpectedRows,
+    ))
   assert progress.load(observer, blocked) == Ok(None)
   assert count(observer) == 4
 
@@ -353,7 +356,9 @@ fn check_progress_write_and_reset_failures(
       clear(tx)
       Ok(Nil)
     })
-    == Error(transactional.ResetProgressFailed(progress.UnexpectedRows))
+    == Error(transactional.ResetProgressFailed(
+      transactional.ProgressUnexpectedRows,
+    ))
   assert progress.load(observer, saved) == Ok(Some(committed))
   assert count(observer) == 5
   let assert Ok(_) =
