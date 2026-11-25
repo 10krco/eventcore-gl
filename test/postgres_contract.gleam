@@ -99,7 +99,24 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   assert postgres.load_checkpoint(checkpoints, "standalone") == Ok(Some(1))
   check_legacy_projection(events, reopened, second_checkpoints)
   check_committed_delivery(first, events, reopened)
-  check_monotonic_uuids(first, events, reopened, second_checkpoints)
+  check_monotonic_uuids(
+    first,
+    events,
+    reopened,
+    second_checkpoints,
+    "v4",
+    "7fffffff-ffff-4fff-bfff-ffffffffffff",
+    140_737_488_355_327,
+  )
+  check_monotonic_uuids(
+    first,
+    events,
+    reopened,
+    second_checkpoints,
+    "non-rfc",
+    "80000000-0000-7000-c000-000000000000",
+    140_737_488_355_329,
+  )
   check_release_projection(first, events, second_checkpoints)
 
   let assert Ok(key) = snapshot.key("ledger/v1")
@@ -340,8 +357,16 @@ fn check_committed_delivery(
   Nil
 }
 
-fn check_monotonic_uuids(pool, events, reopened, checkpoints) {
-  // Restore the pre-clock schema and a v4 ID whose prefix exceeds wall time.
+fn check_monotonic_uuids(
+  pool,
+  events,
+  reopened,
+  checkpoints,
+  fixture,
+  retained_id,
+  expected_milliseconds,
+) {
+  // Restore the pre-clock schema and an ID whose prefix exceeds wall time.
   let assert Ok(_) =
     pog.query(
       "ALTER TABLE eventcore_events ALTER COLUMN event_id SET DEFAULT gen_random_uuid()",
@@ -349,7 +374,7 @@ fn check_monotonic_uuids(pool, events, reopened, checkpoints) {
     |> pog.execute(pool)
   let assert Ok(_) =
     pog.query("DROP TABLE eventcore_uuid_clock") |> pog.execute(pool)
-  let assert Ok(id) = stream.id("monotonic/uuid")
+  let assert Ok(id) = stream.id("monotonic/" <> fixture)
   let assert Ok(initial_batch) =
     store.writes()
     |> store.register(id, stream.initial_version)
@@ -358,21 +383,22 @@ fn check_monotonic_uuids(pool, events, reopened, checkpoints) {
   let assert Ok(_) =
     pog.query(
       "UPDATE eventcore_events
-       SET event_id = '7fffffff-ffff-4fff-bfff-ffffffffffff'::uuid
+       SET event_id = $2::text::uuid
        WHERE stream = $1",
     )
     |> pog.parameter(pog.text(stream.name(id)))
+    |> pog.parameter(pog.text(retained_id))
     |> pog.execute(pool)
   assert postgres.migrate_release_checkpoints(checkpoints) == Ok(Nil)
   let backend =
     postgres.projection_release_backend(reopened, checkpoints, "ordered")
   let read = backend.reader
-  let assert Ok(filter) = projection.prefix("monotonic/")
+  let assert Ok(filter) = projection.prefix(stream.name(id))
   let assert Ok(initial_page) = projection.page(None, 1)
   let assert Ok(projection.PageResult([one], Some(first_cursor))) =
     read(filter, initial_page)
   assert one.event.payload == 1
-  assert backend.checkpoints.save("monotonic", first_cursor) == Ok(Nil)
+  assert backend.checkpoints.save(fixture, first_cursor) == Ok(Nil)
   assert postgres.migrate_delivery(events) == Ok(Nil)
   assert read(filter, initial_page)
     == Ok(projection.PageResult([one], Some(first_cursor)))
@@ -390,7 +416,7 @@ fn check_monotonic_uuids(pool, events, reopened, checkpoints) {
     )
     |> result.try(store.append(_, store.Event(id, "ordered", 3)))
   assert postgres.as_store(reopened).append_events(third) == Ok(Nil)
-  let assert Ok(Some(saved)) = backend.checkpoints.load("monotonic")
+  let assert Ok(Some(saved)) = backend.checkpoints.load(fixture)
   assert saved == first_cursor
   let assert Ok(next_page) = projection.page(Some(saved), 2)
   let assert Ok(projection.PageResult([two, three], Some(last_cursor))) =
@@ -398,10 +424,11 @@ fn check_monotonic_uuids(pool, events, reopened, checkpoints) {
   assert [two.event.payload, three.event.payload] == [2, 3]
   assert projection.sequence(saved) < projection.sequence(two.position)
   assert projection.sequence(two.position) < projection.sequence(last_cursor)
-  let assert Ok(pog.Returned(rows: [140_737_488_355_327], ..)) =
+  let assert Ok(pog.Returned(rows: [milliseconds], ..)) =
     pog.query("SELECT milliseconds FROM eventcore_uuid_clock")
     |> pog.returning(decode.at([0], decode.int))
     |> pog.execute(pool)
+  assert milliseconds == expected_milliseconds
   Nil
 }
 
