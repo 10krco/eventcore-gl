@@ -1023,3 +1023,46 @@ pub fn recovered_ingestion_requires_the_journal_directory_sync_test() {
   remove_root(other)
   remove_root(local)
 }
+
+@external(erlang, "eventcore_filesystem_test_ffi", "check_os_lock")
+fn check_os_lock(root: String, name: String) -> Nil
+
+@external(erlang, "eventcore_filesystem_test_ffi", "check_holder_exit")
+fn check_holder_exit(
+  acquire: projection_runner.Coordinator,
+  name: String,
+) -> Nil
+
+pub fn standalone_projection_state_shares_journal_checkpoint_and_os_lock_test() {
+  let root = temp_root()
+  let config = filesystem.Config(root, filesystem.Full)
+  let assert Ok(checkpoints) = filesystem.open_projection_checkpoints(config)
+  let assert Ok(coordinate) = filesystem.open_projection_coordinator(root)
+  let name = "projection/日本語"
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(second) = projection.position(2)
+  assert checkpoints.load(name) == Ok(None)
+  assert checkpoints.save(name, first) == Ok(Nil)
+  let assert Ok(journal) = filesystem.open(root, codec())
+  let backend = filesystem.projection_backend(journal)
+  assert backend.checkpoints.load(name) == Ok(Some(first))
+  assert backend.checkpoints.save(name, second) == Ok(Nil)
+  let assert Ok(reopened) = filesystem.open_projection_checkpoints(config)
+  assert reopened.load(name) == Ok(Some(second))
+  assert reopened.load("other") == Ok(None)
+
+  let assert Ok(lease) = backend.acquire(name)
+  assert coordinate(name) == Error(projection_runner.AlreadyLeading)
+  check_os_lock(root, name)
+  let assert Ok(other) = coordinate("other")
+  other.release()
+  lease.release()
+  let assert Ok(lease) = coordinate(name)
+  assert backend.acquire(name) == Error(projection_runner.AlreadyLeading)
+  lease.release()
+  check_holder_exit(coordinate, name)
+  assert filesystem.close(journal) == Ok(Nil)
+  let assert Ok(after_close) = coordinate(name)
+  after_close.release()
+  remove_root(root)
+}

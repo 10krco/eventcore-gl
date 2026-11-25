@@ -323,7 +323,31 @@ pub fn projection_checkpoints(
   )
 }
 
-/// Uses named leases on the journal's BEAM node for the legacy runner.
+/// Open checkpoints independently of the event journal's writer lock.
+pub fn open_projection_checkpoints(
+  config: Config,
+) -> Result(projection.Checkpoints, OpenError) {
+  use directory <- result.map(open_checkpoint_directory(config.root))
+  projection.Checkpoints(
+    standalone_projection_load(directory, _),
+    fn(name, position) {
+      standalone_projection_save(directory, config.sync, name, position)
+    },
+  )
+}
+
+/// Open named OS advisory locks without opening the event journal.
+pub fn open_projection_coordinator(
+  root: String,
+) -> Result(projection_runner.Coordinator, OpenError) {
+  use directory <- result.map(open_lock_directory(root))
+  fn(name) {
+    use release <- result.map(standalone_projection_acquire(directory, name))
+    projection_runner.Lease(release)
+  }
+}
+
+/// Uses named OS advisory locks for the legacy runner.
 pub fn projection_backend(
   filesystem: Filesystem(payload),
 ) -> projection_runner.Backend(payload) {
@@ -484,8 +508,34 @@ fn projection_save(
   position: projection.Position,
 ) -> Result(Nil, StoreError)
 
-@external(erlang, "eventcore_projection_leases", "request")
+@external(erlang, "eventcore_filesystem_ffi", "projection_acquire")
 fn acquire_projection(
   server: Server,
+  name: String,
+) -> Result(fn() -> Nil, projection_runner.LeadershipError)
+
+@external(erlang, "eventcore_filesystem_ffi", "open_projection_checkpoints")
+fn open_checkpoint_directory(root: String) -> Result(String, OpenError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_load")
+fn standalone_projection_load(
+  directory: String,
+  name: String,
+) -> Result(Option(projection.Position), StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_save")
+fn standalone_projection_save(
+  directory: String,
+  sync: Sync,
+  name: String,
+  position: projection.Position,
+) -> Result(Nil, StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "open_projection_coordinator")
+fn open_lock_directory(root: String) -> Result(String, OpenError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_acquire")
+fn standalone_projection_acquire(
+  directory: String,
   name: String,
 ) -> Result(fn() -> Nil, projection_runner.LeadershipError)

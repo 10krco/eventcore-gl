@@ -1,7 +1,7 @@
 -module(eventcore_filesystem_test_ffi).
 -export([temp_root/0, remove_root/1, transaction_paths/1, tamper/1, remove/1,
          copy_transactions/2, copy_replica/2, downgrade_transaction/1, add_malformed_transaction/2,
-         open_with_failed_ancestor_sync/2, is_directory/1]).
+         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2]).
 
 temp_root() ->
     Random = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
@@ -70,3 +70,55 @@ downgrade_transaction(Path) ->
     ok = file:write_file(Destination, Original),
     ok = file:delete(Path),
     nil.
+
+check_os_lock(Root, Name) ->
+    Stem = binary:encode_hex(crypto:hash(sha256, Name), lowercase),
+    Path = filename:join([Root, <<".eventcore">>, <<"projection">>, <<"locks">>,
+                          <<Stem/binary, ".lock">>]),
+    Executable = os:find_executable("flock"),
+    Port = open_port({spawn_executable, Executable},
+                     [exit_status, {args, ["-n", "-E", "75", "--", Path, "true"]}]),
+    receive
+        {Port, {exit_status, 75}} -> nil;
+        {Port, {exit_status, Status}} -> error({expected_lock_contention, Status})
+    after 5000 ->
+        catch port_close(Port),
+        error(lock_probe_timeout)
+    end.
+
+check_holder_exit(Acquire, Name) ->
+    Parent = self(),
+    {Holder, Monitor} = spawn_monitor(fun() ->
+        {ok, {lease, Release}} = Acquire(Name),
+        Parent ! {self(), Release},
+        receive stop -> ok end
+    end),
+    receive
+        {Holder, StaleRelease} ->
+            {error, already_leading} = Acquire(Name),
+            Holder ! stop,
+            receive {'DOWN', Monitor, process, Holder, normal} -> ok
+            after 5000 -> error(holder_exit_timeout)
+            end,
+            {lease, Release} = await_release(Acquire, Name, 250),
+            try
+                nil = StaleRelease(),
+                {error, already_leading} = Acquire(Name),
+                nil
+            after
+                Release()
+            end;
+        {'DOWN', Monitor, process, Holder, Reason} -> error({holder_failed, Reason})
+    after 5000 ->
+        Holder ! stop,
+        error(holder_acquire_timeout)
+    end.
+
+await_release(_, _, 0) -> error(lease_not_released);
+await_release(Acquire, Name, Attempts) ->
+    case Acquire(Name) of
+        {ok, Lease} -> Lease;
+        {error, already_leading} ->
+            timer:sleep(10),
+            await_release(Acquire, Name, Attempts - 1)
+    end.

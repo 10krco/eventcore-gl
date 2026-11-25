@@ -3,7 +3,9 @@
 -export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
          event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/5,
          replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4,
-         projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3]).
+         projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3,
+         open_projection_checkpoints/1, standalone_projection_load/2, standalone_projection_save/4,
+         open_projection_coordinator/1, standalone_projection_acquire/2, projection_acquire/2]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
@@ -11,7 +13,7 @@
     transactions = #{}, ordered = [], revision = 0, history_revision = 0,
     streams = #{}, tips = [], contested = #{},
     integrity_failures = [], dangling = [],
-    projection_directory, ingestion, sync_journal, leases = #{}
+    projection_directory, ingestion, sync_journal
 }).
 
 start(Root, Sync) ->
@@ -68,6 +70,86 @@ projection_load(Pid, Name) ->
 
 projection_save(Pid, Name, Position) ->
     guarded_call(Pid, none, {projection_save, Name, Position}, save_checkpoint).
+
+open_projection_checkpoints(Root) -> open_projection_directory(Root, <<"checkpoints">>).
+open_projection_coordinator(Root) -> open_projection_directory(Root, <<"locks">>).
+
+open_projection_directory(Root, Name) ->
+    Directory = filename:join([filename:absname(Root), <<".eventcore">>, <<"projection">>, Name]),
+    case filelib:ensure_path(Directory) of
+        ok -> {ok, Directory};
+        _ -> {error, cannot_open}
+    end.
+
+standalone_projection_load(Directory, Name) ->
+    case read_projection_checkpoint(Directory, Name) of
+        {error, nil} -> {error, {store_failure, load_checkpoint}};
+        Reply -> Reply
+    end.
+
+standalone_projection_save(Directory, Sync, Name, Position) ->
+    case write_projection_checkpoint(Directory, Sync, Name, Position) of
+        {error, nil} -> {error, {store_failure, save_checkpoint}};
+        Reply -> Reply
+    end.
+
+standalone_projection_acquire(Directory, Name) ->
+    acquire_projection_lock(Directory, Name, none).
+
+projection_acquire(Pid, Name) ->
+    case call(Pid, projection_lock_directory, {error, coordinator_unavailable}) of
+        {ok, Directory} -> acquire_projection_lock(Directory, Name, {some, Pid});
+        Error -> Error
+    end.
+
+acquire_projection_lock(Directory, Name, Journal) ->
+    Owner = self(),
+    Reference = make_ref(),
+    Path = filename:join(Directory, <<(checksum(Name))/binary, ".lock">>),
+    {Worker, Monitor} = spawn_monitor(fun() ->
+        projection_lock_worker(Owner, Reference, Directory, Path, Journal)
+    end),
+    receive
+        {Reference, Reply} ->
+            erlang:demonitor(Monitor, [flush]),
+            Reply;
+        {'DOWN', Monitor, process, Worker, _} ->
+            {error, coordinator_unavailable}
+    end.
+
+projection_lock_worker(Owner, Reference, Directory, Path, Journal) ->
+    process_flag(trap_exit, true),
+    OwnerMonitor = monitor(process, Owner),
+    JournalMonitor = case Journal of
+        none -> none;
+        {some, JournalPid} -> monitor(process, JournalPid)
+    end,
+    Lock = case filelib:ensure_path(Directory) of
+        ok -> acquire_lock(Path);
+        Error -> Error
+    end,
+    case Lock of
+        {ok, Port} ->
+            Worker = self(),
+            Token = make_ref(),
+            Owner ! {Reference, {ok, fun() -> release_projection_lock(Worker, Token) end}},
+            receive
+                {release, Token} -> release_lock(Port);
+                {'DOWN', OwnerMonitor, process, _, _} -> release_lock(Port);
+                {'DOWN', JournalMonitor, process, _, _} -> release_lock(Port);
+                {Port, {exit_status, _}} -> ok;
+                {'EXIT', Port, _} -> ok
+            end;
+        {error, store_locked} -> Owner ! {Reference, {error, already_leading}};
+        _ -> Owner ! {Reference, {error, coordinator_unavailable}}
+    end.
+
+release_projection_lock(Worker, Token) ->
+    Monitor = monitor(process, Worker),
+    Worker ! {release, Token},
+    receive
+        {'DOWN', Monitor, process, Worker, _} -> nil
+    end.
 
 load_snapshot(Pid, Revision, Name) ->
     guarded_call(Pid, {some, Revision}, {load_snapshot, Name}, load_snapshot).
@@ -227,16 +309,10 @@ handle_info({Port, {exit_status, _}}, #state{lock = Port} = State) ->
     {stop, lock_lost, State};
 handle_info({'EXIT', Port, _}, #state{lock = Port} = State) ->
     {stop, lock_lost, State};
-handle_info({'DOWN', Holder, process, _, _}, #state{leases = Leases} = State) ->
-    {noreply, State#state{leases = eventcore_projection_leases:down(Holder, Leases)}};
 handle_info(_Info, State) -> {noreply, State}.
 
-handle_call({acquire, Name}, {Holder, _}, #state{leases = Leases} = State) ->
-    {Reply, Updated} = eventcore_projection_leases:acquire(Name, Holder, Leases),
-    {reply, Reply, State#state{leases = Updated}};
-handle_call({release, Name, Token}, _From, #state{leases = Leases} = State) ->
-    Updated = eventcore_projection_leases:release(Name, Token, Leases),
-    {reply, nil, State#state{leases = Updated}};
+handle_call(projection_lock_directory, _From, #state{projection_directory = Root} = State) ->
+    {reply, {ok, filename:join(Root, <<"locks">>)}, State};
 handle_call(projection_frontier, _From, State) ->
     case sync_and_flush_ingestion(State) of
         {ok, High, Updated} -> {reply, {ok, High}, Updated};
@@ -244,21 +320,11 @@ handle_call(projection_frontier, _From, State) ->
     end;
 handle_call({projection_fetch, First, Last}, _From, #state{ingestion = Index} = State) ->
     {reply, eventcore_filesystem_ingestion:fetch(First, Last, Index), State};
-handle_call({projection_load, Name}, _From, State) ->
-    {_, Path} = projection_checkpoint(Name, State),
-    Reply = case file:read_file(Path) of
-        {ok, <<Sequence:64>>} when Sequence > 0 -> {ok, {some, {position, Sequence}}};
-        {error, enoent} -> {ok, none};
-        _ -> {error, nil}
-    end,
-    {reply, Reply, State};
-handle_call({projection_save, Name, {position, Sequence}}, _From, #state{sync = Sync} = State) ->
-    {Directory, Path} = projection_checkpoint(Name, State),
-    Reply = case Sequence > 0 andalso Sequence < (1 bsl 64) of
-        true -> publish_snapshot(Directory, Path, <<Sequence:64>>, Sync);
-        false -> {error, nil}
-    end,
-    {reply, Reply, State};
+handle_call({projection_load, Name}, _From, #state{projection_directory = Root} = State) ->
+    {reply, read_projection_checkpoint(filename:join(Root, <<"checkpoints">>), Name), State};
+handle_call({projection_save, Name, Position}, _From,
+            #state{projection_directory = Root, sync = Sync} = State) ->
+    {reply, write_projection_checkpoint(filename:join(Root, <<"checkpoints">>), Sync, Name, Position), State};
 handle_call(status, _From, #state{integrity_failures = Bad, dangling = [_ | _] = Dangling,
                                  transactions = Transactions, ordered = Reversed} = State) ->
     Forks = [Fork || {Fork, _} <- eventcore_filesystem_graph:stream_forks(Transactions, lists:reverse(Reversed))],
@@ -433,9 +499,21 @@ flush_ingestion(#state{ingestion = Index, sync = Sync} = State) ->
         Error -> Error
     end.
 
-projection_checkpoint(Name, #state{projection_directory = Root}) ->
-    Directory = filename:join(Root, <<"checkpoints">>),
-    {Directory, filename:join(Directory, <<(checksum(Name))/binary, ".checkpoint">>)}.
+read_projection_checkpoint(Directory, Name) ->
+    Path = projection_checkpoint_path(Directory, Name),
+    case file:read_file(Path) of
+        {ok, <<Sequence:64>>} when Sequence > 0 -> {ok, {some, {position, Sequence}}};
+        {error, enoent} -> {ok, none};
+        _ -> {error, nil}
+    end.
+
+write_projection_checkpoint(Directory, Sync, Name, {position, Sequence})
+    when Sequence > 0, Sequence < (1 bsl 64) ->
+    publish_snapshot(Directory, projection_checkpoint_path(Directory, Name), <<Sequence:64>>, Sync);
+write_projection_checkpoint(_, _, _, _) -> {error, nil}.
+
+projection_checkpoint_path(Directory, Name) ->
+    filename:join(Directory, <<(checksum(Name))/binary, ".checkpoint">>).
 
 snapshot_path(Name, #state{snapshot_directory = Directory}) ->
     filename:join(Directory, <<(checksum(Name))/binary, ".snapshot">>).
