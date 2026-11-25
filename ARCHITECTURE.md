@@ -163,12 +163,14 @@ UUID checkpoints persist on the selected checkpoint database. See
 
 PostgreSQL strict delivery uses the committed event position counter as its
 watermark. The delivery migration adds persistent UUIDv7 identities and
-JSON metadata. Reapplying it replaces the default while preserving existing
-IDs. The delivery source scans bounded position ranges,
+JSON metadata. The default advances a database-local clock inside each
+append transaction, including when multiple writers share a millisecond.
+Reapplying the migration preserves existing IDs and the clock. The delivery source scans bounded position ranges,
 applies its validated selection before counting deliveries, and returns the
 original payload bytes and JSON metadata for application decoding.
 See [ADR 0013](docs/decisions/0013-postgres-projection-delivery.md) and
-[ADR 0025](docs/decisions/0025-postgres-delivery-uuid-v7.md).
+[ADR 0025](docs/decisions/0025-postgres-delivery-uuid-v7.md) and
+[ADR 0029](docs/decisions/0029-postgres-monotonic-uuid.md).
 
 Legacy PostgreSQL projectors hold a session advisory lock in the checkpoint
 database. Named checkpoint operations use the lock-owning session. Reads can
