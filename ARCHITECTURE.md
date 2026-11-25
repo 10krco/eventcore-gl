@@ -24,6 +24,11 @@ Command execution folds each participating stream into state as events arrive.
 It reads initial declarations in order and enqueues discovered participants
 after each stream. An append conflict restarts the fold and discovery from the
 original declarations. See [ADR 0003](docs/decisions/0003-command-replay.md).
+Commands can build initial declarations from a typed primary stream and its
+participants, retaining first-seen order across repeated identifiers. Hand-written
+declarations validate uniqueness. Requirement guards compose with the handler
+result and defer constructing a typed rejection until the rule fails.
+See [ADR 0016](docs/decisions/0016-typed-command-helpers.md).
 
 ## Filesystem journal
 
