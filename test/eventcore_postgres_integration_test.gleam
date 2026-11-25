@@ -1,3 +1,4 @@
+import bank_account_example
 import eventcore/internal/postgres_projection_progress as progress
 import eventcore/internal/postgres_projection_session as session
 import eventcore/postgres
@@ -109,4 +110,26 @@ pub fn postgres_transactional_projection_contract_test() {
   use first <- with_pool(socket, "eventcore_transactional_first", 1)
   use second <- with_pool(socket, "eventcore_transactional_second", 1)
   postgres_transactional_contract.check(first, second)
+}
+
+pub fn bank_account_postgres_example_test() {
+  use socket <- with_database()
+  use writes <- with_pool(socket, "bank_writes", 1)
+  use replay <- with_pool(socket, "bank_replay", 1)
+  let codec =
+    postgres.Codec(fn(_, cents) { Ok(<<cents:64>>) }, fn(_, bytes) {
+      case bytes {
+        <<cents:64-signed>> -> Ok(cents)
+        _ -> Error("invalid account event")
+      }
+    })
+  let events = postgres.from_pool(writes, codec)
+  let reopened = postgres.from_pool(replay, codec)
+  assert postgres.migrate(events) == Ok(Nil)
+  assert postgres.migrate_checkpoints(postgres.checkpoints_from_pool(replay))
+    == Ok(Nil)
+  bank_account_example.check(
+    postgres.as_store(events),
+    postgres.projection_backend(reopened),
+  )
 }
