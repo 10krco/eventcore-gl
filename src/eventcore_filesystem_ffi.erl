@@ -2,14 +2,16 @@
 -behaviour(gen_server).
 -export([start/2, start/3, start_with_replica/3, stop/1, status/1, read/3, append/3,
          event_prefix_token/2, history_revision/1, read/4, append/4, load_snapshot/3, save_snapshot/5,
-         replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4]).
+         replica_id/1, forks/1, topology_generation/1, fork_snapshot/1, resolve/4,
+         projection_frontier/1, projection_fetch/3, projection_load/2, projection_save/3]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 -record(state, {
     owner, lock, directory, snapshot_directory, sync, replica,
     transactions = #{}, ordered = [], revision = 0, history_revision = 0,
     streams = #{}, tips = [], contested = #{},
-    integrity_failures = [], dangling = []
+    integrity_failures = [], dangling = [],
+    projection_directory, ingestion, sync_journal, leases = #{}
 }).
 
 start(Root, Sync) ->
@@ -18,7 +20,7 @@ start(Root, Sync) ->
 start_with_replica(Root, Sync, Replica) ->
     start_server(Root, Sync, Replica, fun(Directory) -> sync_directory(Directory, Sync) end).
 
-% Accept a sync function to exercise open failures in the Erlang tests.
+% Accept a directory sync function to exercise failures in tests.
 start(Root, Sync, SyncAncestor) ->
     start_server(Root, Sync, none, SyncAncestor).
 
@@ -55,6 +57,18 @@ append(Pid, Expected, Events) -> append(Pid, none, Expected, Events).
 append(Pid, Revision, Expected, Events) ->
     guarded_call(Pid, Revision, {append, Expected, Events}, append_events).
 
+projection_frontier(Pid) ->
+    guarded_call(Pid, none, projection_frontier, read_projection).
+
+projection_fetch(Pid, First, Last) ->
+    guarded_call(Pid, none, {projection_fetch, First, Last}, read_projection).
+
+projection_load(Pid, Name) ->
+    guarded_call(Pid, none, {projection_load, Name}, load_checkpoint).
+
+projection_save(Pid, Name, Position) ->
+    guarded_call(Pid, none, {projection_save, Name, Position}, save_checkpoint).
+
 load_snapshot(Pid, Revision, Name) ->
     guarded_call(Pid, {some, Revision}, {load_snapshot, Name}, load_snapshot).
 
@@ -84,6 +98,8 @@ init({Owner, RequestedRoot, Sync, Replica, SyncAncestor}) ->
                 {ok, Lock} ->
                     State = #state{owner = monitor(process, Owner), lock = Lock,
                                    directory = Directory, sync = Sync,
+                                   sync_journal = fun() -> SyncAncestor(Directory) end,
+                                   projection_directory = filename:join([Root, <<".eventcore">>, <<"projection">>]),
                                    snapshot_directory = filename:join([Root, <<".eventcore">>, <<"snapshots">>])},
                     case prepare(Root, Replica, State) of
                         {ok, Loaded} -> {ok, Loaded};
@@ -122,13 +138,26 @@ prepare(Root, Replica, #state{sync = Sync} = State) ->
             case eventcore_filesystem_replica:load(Root, Replica, Publish) of
                 {ok, Id} ->
                     case sync_metadata(Root, Replica, Sync) of
-                        ok -> scan(State#state{replica = Id});
+                        ok -> open_ingestion(scan(State#state{replica = Id}));
                         Error -> Error
                     end;
                 Error -> Error
             end;
         Error -> Error
     end.
+
+open_ingestion({ok, #state{projection_directory = Directory, transactions = Transactions,
+                           ordered = Reversed} = State}) ->
+    IngestionDirectory = filename:join(Directory, <<"ingestion">>),
+    case eventcore_filesystem_ingestion:open(IngestionDirectory, lists:reverse(Reversed), Transactions) of
+        {ok, Index} ->
+            case sync_and_flush_ingestion(State#state{ingestion = Index}) of
+                {ok, _, Updated} -> {ok, Updated};
+                _ -> {error, ingestion_unavailable}
+            end;
+        Error -> Error
+    end;
+open_ingestion(Error) -> Error.
 
 publish_identity(Path, Bytes, Sync) ->
     Nonce = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
@@ -198,8 +227,38 @@ handle_info({Port, {exit_status, _}}, #state{lock = Port} = State) ->
     {stop, lock_lost, State};
 handle_info({'EXIT', Port, _}, #state{lock = Port} = State) ->
     {stop, lock_lost, State};
+handle_info({'DOWN', Holder, process, _, _}, #state{leases = Leases} = State) ->
+    {noreply, State#state{leases = eventcore_projection_leases:down(Holder, Leases)}};
 handle_info(_Info, State) -> {noreply, State}.
 
+handle_call({acquire, Name}, {Holder, _}, #state{leases = Leases} = State) ->
+    {Reply, Updated} = eventcore_projection_leases:acquire(Name, Holder, Leases),
+    {reply, Reply, State#state{leases = Updated}};
+handle_call({release, Name, Token}, _From, #state{leases = Leases} = State) ->
+    Updated = eventcore_projection_leases:release(Name, Token, Leases),
+    {reply, nil, State#state{leases = Updated}};
+handle_call(projection_frontier, _From, State) ->
+    case sync_and_flush_ingestion(State) of
+        {ok, High, Updated} -> {reply, {ok, High}, Updated};
+        _ -> {reply, {error, nil}, State}
+    end;
+handle_call({projection_fetch, First, Last}, _From, #state{ingestion = Index} = State) ->
+    {reply, eventcore_filesystem_ingestion:fetch(First, Last, Index), State};
+handle_call({projection_load, Name}, _From, State) ->
+    {_, Path} = projection_checkpoint(Name, State),
+    Reply = case file:read_file(Path) of
+        {ok, <<Sequence:64>>} when Sequence > 0 -> {ok, {some, {position, Sequence}}};
+        {error, enoent} -> {ok, none};
+        _ -> {error, nil}
+    end,
+    {reply, Reply, State};
+handle_call({projection_save, Name, {position, Sequence}}, _From, #state{sync = Sync} = State) ->
+    {Directory, Path} = projection_checkpoint(Name, State),
+    Reply = case Sequence > 0 andalso Sequence < (1 bsl 64) of
+        true -> publish_snapshot(Directory, Path, <<Sequence:64>>, Sync);
+        false -> {error, nil}
+    end,
+    {reply, Reply, State};
 handle_call(status, _From, #state{integrity_failures = Bad, dangling = [_ | _] = Dangling,
                                  transactions = Transactions, ordered = Reversed} = State) ->
     Forks = [Fork || {Fork, _} <- eventcore_filesystem_graph:stream_forks(Transactions, lists:reverse(Reversed))],
@@ -329,7 +388,8 @@ fork_contexts(#state{transactions = Transactions, ordered = Reversed}) ->
     eventcore_filesystem_graph:forks(Transactions, lists:reverse(Reversed)).
 
 persist(Expected, Events, Parents, Resolution, #state{directory = Directory, sync = Sync,
-                                         replica = Replica, transactions = Transactions} = State) ->
+                                         replica = Replica, transactions = Transactions,
+                                         sync_journal = SyncJournal} = State) ->
     Time = os:system_time(nanosecond),
     Nonce = crypto:strong_rand_bytes(16),
     Bases = lists:sort(Expected),
@@ -342,13 +402,40 @@ persist(Expected, Events, Parents, Resolution, #state{directory = Directory, syn
     case write_transaction(Temp, Path, Bytes, Sync) of
         ok ->
             Record = transaction_record(Time, Replica, Nonce, Parents, Bases, Events, Resolution),
-            Updated = index_new_transaction(Id, Record, Transactions#{Id => Record}, State),
-            case sync_directory(Directory, Sync) of
-                ok -> {{ok, nil}, Updated};
+            #state{ingestion = Index} = State,
+            Ingested = State#state{ingestion = eventcore_filesystem_ingestion:add(Id, Events, Index)},
+            Updated = index_new_transaction(Id, Record, Transactions#{Id => Record}, Ingested),
+            case SyncJournal() of
+                ok ->
+                    case flush_ingestion(Updated) of
+                        {ok, _, Flushed} -> {{ok, nil}, Flushed};
+                        _ -> {Failure, Updated}
+                    end;
                 {error, _} -> {Failure, Updated}
             end;
         {error, _} -> {Failure, State}
     end.
+
+sync_and_flush_ingestion(#state{ingestion = Index, sync_journal = SyncJournal} = State) ->
+    case eventcore_filesystem_ingestion:needs_flush(Index) of
+        false -> flush_ingestion(State);
+        true ->
+            case SyncJournal() of
+                ok -> flush_ingestion(State);
+                Error -> Error
+            end
+    end.
+
+flush_ingestion(#state{ingestion = Index, sync = Sync} = State) ->
+    Publish = fun(Directory, Path, Data) -> publish_snapshot(Directory, Path, Data, Sync) end,
+    case eventcore_filesystem_ingestion:flush(Publish, Index) of
+        {ok, High, Updated} -> {ok, High, State#state{ingestion = Updated}};
+        Error -> Error
+    end.
+
+projection_checkpoint(Name, #state{projection_directory = Root}) ->
+    Directory = filename:join(Root, <<"checkpoints">>),
+    {Directory, filename:join(Directory, <<(checksum(Name))/binary, ".checkpoint">>)}.
 
 snapshot_path(Name, #state{snapshot_directory = Directory}) ->
     filename:join(Directory, <<(checksum(Name))/binary, ".snapshot">>).

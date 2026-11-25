@@ -1,6 +1,7 @@
 //// In-memory event store backed by an OTP process. The store stops when its
 //// creating process exits. Call close to release it earlier.
 
+import eventcore/internal/projection_scan
 import eventcore/projection
 import eventcore/projection_runner
 import eventcore/snapshot
@@ -9,7 +10,6 @@ import eventcore/store.{
 }
 import eventcore/stream.{type Id, type Version}
 import gleam/dict.{type Dict}
-import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
@@ -175,8 +175,6 @@ fn record_event(
   )
 }
 
-const projection_chunk_size = 128
-
 const read_projection_failure = store.StoreFailure(store.ReadProjection)
 
 /// Enumerates events in append order across streams.
@@ -185,67 +183,23 @@ pub fn projection_reader(
 ) -> projection.Reader(payload) {
   let Memory(server) = memory
   fn(filter, page) {
-    let after = case projection.page_after(page) {
-      Some(position) -> projection.sequence(position)
-      None -> 0
-    }
     use high <- result.try(
       call(server, fn(state) { #(state, state.last_position) })
       |> result.replace_error(read_projection_failure),
     )
-    scan_page(
-      server,
+    projection_scan.read(
       filter,
+      page,
       high,
-      after + 1,
-      projection.page_limit(page),
-      [],
-      [],
-    )
-  }
-}
-
-fn scan_page(
-  server: Server(State(payload)),
-  filter: projection.Filter,
-  high: Int,
-  next: Int,
-  remaining: Int,
-  chunk: List(Event(payload)),
-  reversed: List(projection.Delivery(payload)),
-) -> Result(projection.PageResult(payload), StoreError) {
-  case remaining == 0 || next > high, chunk {
-    True, _ ->
-      Ok(projection.PageResult(
-        list.reverse(reversed),
-        option.from_result(projection.position(next - 1)),
-      ))
-    False, [] -> {
-      let through = int.min(high, next + projection_chunk_size - 1)
-      use chunk <- result.try(
+      fn(first, last) {
         call(server, fn(state) {
-          #(state, fetch_chunk(state.projection_events, next, through, []))
+          #(state, fetch_chunk(state.projection_events, first, last, []))
         })
         |> result.replace_error(read_projection_failure)
-        |> result.flatten,
-      )
-      scan_page(server, filter, high, next, remaining, chunk, reversed)
-    }
-    False, [event, ..rest] ->
-      case projection.matches(filter, event.stream, event.kind) {
-        False ->
-          scan_page(server, filter, high, next + 1, remaining, rest, reversed)
-        True -> {
-          use position <- result.try(
-            projection.position(next)
-            |> result.replace_error(read_projection_failure),
-          )
-          scan_page(server, filter, high, next + 1, remaining - 1, rest, [
-            projection.Delivery(event, position),
-            ..reversed
-          ])
-        }
-      }
+        |> result.flatten
+      },
+      Ok,
+    )
   }
 }
 
@@ -253,15 +207,18 @@ fn fetch_chunk(
   by_position: Dict(Int, Event(payload)),
   next: Int,
   through: Int,
-  reversed: List(Event(payload)),
-) -> Result(List(Event(payload)), StoreError) {
+  reversed: List(#(Int, Event(payload))),
+) -> Result(List(#(Int, Event(payload))), StoreError) {
   case next > through {
     True -> Ok(list.reverse(reversed))
     False ->
       case dict.get(by_position, next) {
         Error(Nil) -> Error(read_projection_failure)
         Ok(event) ->
-          fetch_chunk(by_position, next + 1, through, [event, ..reversed])
+          fetch_chunk(by_position, next + 1, through, [
+            #(next, event),
+            ..reversed
+          ])
       }
   }
 }
@@ -307,7 +264,7 @@ pub fn projection_backend(
   )
 }
 
-@external(erlang, "eventcore_memory_ffi", "acquire")
+@external(erlang, "eventcore_projection_leases", "request")
 fn acquire(
   server: Server(state),
   name: String,

@@ -1,6 +1,9 @@
 //// Filesystem store with immutable checksummed transactions.
 //// The host must provide the util-linux flock executable on PATH.
 
+import eventcore/internal/projection_scan
+import eventcore/projection
+import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/store.{
   type Event, type EventStream, type Store, type StoreError,
@@ -294,6 +297,55 @@ fn event_store(
   )
 }
 
+/// Enumerates events in this replica's persistent ingestion order.
+pub fn projection_reader(
+  filesystem: Filesystem(payload),
+) -> projection.Reader(payload) {
+  fn(filter, page) {
+    use high <- result.try(projection_frontier(filesystem.server))
+    projection_scan.read(
+      filter,
+      page,
+      high,
+      fn(first, last) { projection_fetch(filesystem.server, first, last) },
+      decode_event(_, filesystem.codec),
+    )
+  }
+}
+
+/// Stores progress under the journal's local metadata directory.
+pub fn projection_checkpoints(
+  filesystem: Filesystem(payload),
+) -> projection.Checkpoints {
+  projection.Checkpoints(
+    projection_load(filesystem.server, _),
+    fn(name, position) { projection_save(filesystem.server, name, position) },
+  )
+}
+
+/// Uses named leases on the journal's BEAM node for the legacy runner.
+pub fn projection_backend(
+  filesystem: Filesystem(payload),
+) -> projection_runner.Backend(payload) {
+  projection_runner.Backend(
+    projection_reader(filesystem),
+    projection_checkpoints(filesystem),
+    fn(name) {
+      use release <- result.map(acquire_projection(filesystem.server, name))
+      projection_runner.Lease(release)
+    },
+  )
+}
+
+fn decode_event(
+  event: Event(BitArray),
+  codec: Codec(payload),
+) -> Result(Event(payload), StoreError) {
+  codec.decode(event.kind, event.payload)
+  |> result.map(store.Event(event.stream, event.kind, _))
+  |> result.map_error(store.DeserializationFailed(event.stream, _))
+}
+
 fn decode_events(
   events: List(Event(BitArray)),
   codec: Codec(payload),
@@ -302,14 +354,8 @@ fn decode_events(
     case events {
       [] -> Ok(store.End)
       [event, ..rest] -> {
-        use payload <- result.try(
-          codec.decode(event.kind, event.payload)
-          |> result.map_error(store.DeserializationFailed(event.stream, _)),
-        )
-        Ok(store.Next(
-          store.Event(event.stream, event.kind, payload),
-          decode_events(rest, codec),
-        ))
+        use event <- result.try(decode_event(event, codec))
+        Ok(store.Next(event, decode_events(rest, codec)))
       }
     }
   })
@@ -414,3 +460,32 @@ fn save_snapshot(
 
 @external(erlang, "eventcore_filesystem_ffi", "history_revision")
 fn history_revision(server: Server) -> Result(Int, StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "projection_frontier")
+fn projection_frontier(server: Server) -> Result(Int, StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "projection_fetch")
+fn projection_fetch(
+  server: Server,
+  first: Int,
+  last: Int,
+) -> Result(List(#(Int, Event(BitArray))), StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "projection_load")
+fn projection_load(
+  server: Server,
+  name: String,
+) -> Result(Option(projection.Position), StoreError)
+
+@external(erlang, "eventcore_filesystem_ffi", "projection_save")
+fn projection_save(
+  server: Server,
+  name: String,
+  position: projection.Position,
+) -> Result(Nil, StoreError)
+
+@external(erlang, "eventcore_projection_leases", "request")
+fn acquire_projection(
+  server: Server,
+  name: String,
+) -> Result(fn() -> Nil, projection_runner.LeadershipError)
