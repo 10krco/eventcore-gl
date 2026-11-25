@@ -1,11 +1,14 @@
 //// SQLite event and projection checkpoint stores.
 
+import eventcore/internal/projection_scan
+import eventcore/projection
+import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/store.{type Event, type Store, type StoreError}
 import eventcore/stream.{type Id, type Version}
 import gleam/dict
 import gleam/list
-import gleam/option.{type Option, None}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 
 pub type Codec(payload) {
@@ -186,6 +189,80 @@ pub fn as_store(events: EventStore(payload)) -> Store(payload) {
   )
 }
 
+/// Reads bounded pages in committed insertion order.
+pub fn projection_reader(
+  events: EventStore(payload),
+) -> projection.Reader(payload) {
+  fn(filter, page) {
+    use high <- result.try(projection_frontier(events.server))
+    projection_scan.read(
+      filter,
+      page,
+      high,
+      fn(first, last) { projection_fetch(events.server, first, last) },
+      fn(wire) {
+        use event <- result.try(unpack_projection(wire))
+        decode_event(event, events.codec)
+      },
+    )
+  }
+}
+
+pub fn projection_checkpoints(
+  checkpoints: CheckpointStore,
+) -> projection.Checkpoints {
+  projection.Checkpoints(
+    fn(name) {
+      load_checkpoint(checkpoints, name)
+      |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
+      |> result.try(fn(cursor) {
+        case cursor {
+          Some(sequence) ->
+            projection.position(sequence)
+            |> result.map(Some)
+            |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
+          None -> Ok(None)
+        }
+      })
+    },
+    fn(name, position) {
+      save_checkpoint(checkpoints, name, projection.sequence(position))
+      |> result.replace_error(store.StoreFailure(store.SaveCheckpoint))
+    },
+  )
+}
+
+/// Keeps progress and leadership on the event store handle.
+pub fn projection_backend(
+  events: EventStore(payload),
+) -> projection_runner.Backend(payload) {
+  projection_backend_with_checkpoints(events, CheckpointStore(events.server))
+}
+
+/// Shares progress and leadership through the given checkpoint handle.
+pub fn projection_backend_with_checkpoints(
+  events: EventStore(payload),
+  checkpoints: CheckpointStore,
+) -> projection_runner.Backend(payload) {
+  projection_runner.Backend(
+    projection_reader(events),
+    projection_checkpoints(checkpoints),
+    fn(name) {
+      use release <- result.map(acquire_projection(checkpoints.server, name))
+      projection_runner.Lease(release)
+    },
+  )
+}
+
+fn decode_event(
+  event: Event(BitArray),
+  codec: Codec(payload),
+) -> Result(Event(payload), StoreError) {
+  codec.decode(event.kind, event.payload)
+  |> result.map(store.Event(event.stream, event.kind, _))
+  |> result.map_error(store.DeserializationFailed(event.stream, _))
+}
+
 fn decode(
   items: List(Result(Event(BitArray), StoreError)),
   codec: Codec(payload),
@@ -195,14 +272,8 @@ fn decode(
       [] -> Ok(store.End)
       [item, ..rest] -> {
         use event <- result.try(item)
-        use payload <- result.try(
-          codec.decode(event.kind, event.payload)
-          |> result.map_error(store.DeserializationFailed(event.stream, _)),
-        )
-        Ok(store.Next(
-          store.Event(event.stream, event.kind, payload),
-          decode(rest, codec),
-        ))
+        use event <- result.try(decode_event(event, codec))
+        Ok(store.Next(event, decode(rest, codec)))
       }
     }
   })
@@ -266,3 +337,24 @@ fn save_snapshot(
   observed: Option(snapshot.Snapshot),
   value: snapshot.Snapshot,
 ) -> Result(Nil, Nil)
+
+@external(erlang, "eventcore_sqlite_ffi", "projection_frontier")
+fn projection_frontier(server: Server) -> Result(Int, StoreError)
+
+@external(erlang, "eventcore_sqlite_ffi", "projection_fetch")
+fn projection_fetch(
+  server: Server,
+  first: Int,
+  last: Int,
+) -> Result(List(#(Int, Event(BitArray))), StoreError)
+
+@external(erlang, "eventcore_sqlite_ffi", "unpack_projection")
+fn unpack_projection(
+  event: Event(BitArray),
+) -> Result(Event(BitArray), StoreError)
+
+@external(erlang, "eventcore_projection_leases", "request")
+fn acquire_projection(
+  server: Server,
+  name: String,
+) -> Result(fn() -> Nil, projection_runner.LeadershipError)

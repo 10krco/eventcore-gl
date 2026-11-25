@@ -2,7 +2,8 @@
 -behaviour(gen_server).
 
 -export([start_file/2, start_memory/0, start_supplied/1, stop/1, migrate/2,
-         read/3, append/3, load_snapshot/2, save_snapshot/4, checkpoint/2, save_checkpoint/3, reset_checkpoint/2]).
+         read/3, append/3, load_snapshot/2, save_snapshot/4, checkpoint/2, save_checkpoint/3, reset_checkpoint/2,
+         projection_frontier/1, projection_fetch/3, unpack_projection/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 start_file(Path, Encryption) -> start({file, Path, Encryption}).
@@ -32,6 +33,15 @@ save_checkpoint(Server, Name, Position) ->
 reset_checkpoint(Server, Name) ->
     call(Server, {reset_checkpoint, Name}, {error, checkpoint_failed}).
 
+projection_frontier(Server) ->
+    call(Server, projection_frontier, {error, {store_failure, read_projection}}).
+
+projection_fetch(Server, First, Last) ->
+    call(Server, {projection_fetch, First, Last}, {error, {store_failure, read_projection}}).
+
+unpack_projection({event, Stream, Kind, Bytes}) ->
+    read_event(Stream, Kind, Bytes).
+
 call(Server, Request, Failure) ->
     try gen_server:call(Server, Request, infinity)
     catch
@@ -40,7 +50,7 @@ call(Server, Request, Failure) ->
 
 init({Owner, Source}) ->
     case open(Source) of
-        {ok, Connection} -> {ok, {Connection, monitor(process, Owner)}};
+        {ok, Connection} -> {ok, {Connection, monitor(process, Owner), #{}}};
         {error, Reason} -> {stop, {shutdown, Reason}}
     end.
 
@@ -95,18 +105,37 @@ apply_key(Connection, {some, Password}) ->
 valid_password(Password) ->
     byte_size(Password) > 0 andalso binary:match(Password, <<0>>) =:= nomatch.
 
+handle_call({acquire, Name}, {Holder, _}, {Connection, Owner, Leases}) ->
+    {Reply, Updated} = eventcore_projection_leases:acquire(Name, Holder, Leases),
+    {reply, Reply, {Connection, Owner, Updated}};
+handle_call({release, Name, Token}, _From, {Connection, Owner, Leases}) ->
+    Updated = eventcore_projection_leases:release(Name, Token, Leases),
+    {reply, nil, {Connection, Owner, Updated}};
+handle_call(projection_frontier, _From, {Connection, _, _} = State) ->
+    Reply = guard_query(fun() ->
+        [{High}] = sqlite:query(Connection, "SELECT COALESCE(MAX(position), 0) FROM eventcore_events"),
+        {ok, High}
+    end, {error, {store_failure, read_projection}}),
+    {reply, Reply, State};
+handle_call({projection_fetch, First, Last}, _From, {Connection, _, _} = State) ->
+    Reply = guard_query(fun() ->
+        Rows = sqlite:query(Connection, "SELECT position, stream, kind, payload FROM eventcore_events "
+            "WHERE position BETWEEN ? AND ? ORDER BY position", [First, Last]),
+        {ok, [{Position, {event, {id, Stream}, Kind, Bytes}} || {Position, Stream, Kind, Bytes} <- Rows]}
+    end, {error, {store_failure, read_projection}}),
+    {reply, Reply, State};
 handle_call(stop, _From, State) ->
     {stop, normal, {ok, nil}, State};
-handle_call({migrate, Mode}, _From, {Connection, _} = State) ->
+handle_call({migrate, Mode}, _From, {Connection, _, _} = State) ->
     Reply = transaction(Connection, fun() -> create_tables(Connection, Mode) end,
                         {error, migration_failed}),
     reply_or_stop(Reply, State);
 handle_call({read, _Stream, After}, _From, State) when After > 9223372036854775807 ->
     {reply, {ok, []}, State};
-handle_call({read, Stream, After}, _From, {Connection, _} = State) ->
+handle_call({read, Stream, After}, _From, {Connection, _, _} = State) ->
     Reply = guard_query(fun() -> read_events(Connection, Stream, After) end, {error, nil}),
     {reply, Reply, State};
-handle_call({append, Expected, Events}, _From, {Connection, _} = State) ->
+handle_call({append, Expected, Events}, _From, {Connection, _, _} = State) ->
     Reply = transaction(Connection, fun() ->
         case stream_versions(Connection, Expected, #{}) of
             {ok, Versions} -> insert_events(Connection, Events, Versions);
@@ -114,14 +143,14 @@ handle_call({append, Expected, Events}, _From, {Connection, _} = State) ->
         end
     end, {error, {store_failure, append_events}}),
     reply_or_stop(Reply, State);
-handle_call({load_snapshot, Name}, _From, {Connection, _} = State) ->
+handle_call({load_snapshot, Name}, _From, {Connection, _, _} = State) ->
     Reply = guard_query(fun() -> read_snapshot(Connection, Name) end, {error, nil}),
     {reply, Reply, State};
-handle_call({save_snapshot, Name, Observed, Value}, _From, {Connection, _} = State) ->
+handle_call({save_snapshot, Name, Observed, Value}, _From, {Connection, _, _} = State) ->
     Reply = transaction(Connection, fun() -> write_snapshot(Connection, Name, Observed, Value) end,
                         {error, nil}),
     reply_or_stop(Reply, State);
-handle_call({checkpoint, Name}, _From, {Connection, _} = State) ->
+handle_call({checkpoint, Name}, _From, {Connection, _, _} = State) ->
     Reply = guard_query(fun() ->
         case sqlite:query(Connection, "SELECT position FROM eventcore_checkpoints WHERE name = ?", [Name]) of
             [] -> {ok, none};
@@ -130,14 +159,14 @@ handle_call({checkpoint, Name}, _From, {Connection, _} = State) ->
         end
     end, {error, checkpoint_failed}),
     {reply, Reply, State};
-handle_call({save_checkpoint, Name, Position}, _From, {Connection, _} = State) ->
+handle_call({save_checkpoint, Name, Position}, _From, {Connection, _, _} = State) ->
     Reply = guard_query(fun() ->
         ok = write_one(Connection, "INSERT INTO eventcore_checkpoints(name, position) VALUES(?, ?) "
                          "ON CONFLICT(name) DO UPDATE SET position = excluded.position", [Name, Position]),
         {ok, nil}
     end, {error, checkpoint_failed}),
     {reply, Reply, State};
-handle_call({reset_checkpoint, Name}, _From, {Connection, _} = State) ->
+handle_call({reset_checkpoint, Name}, _From, {Connection, _, _} = State) ->
     Reply = guard_query(fun() ->
         ok = write_query(Connection, "DELETE FROM eventcore_checkpoints WHERE name = ?", [Name]),
         {ok, nil}
@@ -148,10 +177,13 @@ reply_or_stop({rollback_failed, Failure}, State) -> {stop, normal, Failure, Stat
 reply_or_stop(Reply, State) -> {reply, Reply, State}.
 
 handle_cast(_, State) -> {noreply, State}.
-handle_info({'DOWN', Monitor, process, _, _}, {_, Monitor} = State) -> {stop, normal, State};
+handle_info({'DOWN', Owner, process, _, _}, {_, Owner, _} = State) ->
+    {stop, normal, State};
+handle_info({'DOWN', Holder, process, _, _}, {Connection, Owner, Leases}) ->
+    {noreply, {Connection, Owner, eventcore_projection_leases:down(Holder, Leases)}};
 handle_info(_, State) -> {noreply, State}.
 
-terminate(_, {Connection, _}) -> close_connection(Connection).
+terminate(_, {Connection, _, _}) -> close_connection(Connection).
 close_connection(Connection) -> guard_query(fun() -> sqlite:close(Connection) end, ok).
 
 guard_query(Work, Failure) ->
