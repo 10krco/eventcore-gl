@@ -1,5 +1,7 @@
 //// Run against two independently opened pools on the same fresh database.
 
+import gleam/string
+
 import eventcore/postgres
 import eventcore/projection
 import eventcore/projection_delivery as delivery
@@ -10,6 +12,7 @@ import eventcore/stream
 import eventcore/testing/adapter_contract as store_contract
 import gleam/dynamic/decode
 import gleam/erlang/process
+import gleam/int
 import gleam/option.{None, Some}
 import gleam/result
 import pog
@@ -252,8 +255,26 @@ fn check_committed_delivery(
   assert first.payload == <<100:64>>
   assert first.metadata == "{}"
   assert first.version == stream.next_version(stream.initial_version)
+  assert string.slice(first.event_id, 14, 1) == "7"
+
+  // Simulate a database created before the UUIDv7 default was installed.
+  let prior_id = "41db1265-8bc1-4ab3-992f-e85799a4af1d"
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE eventcore_events ALTER COLUMN event_id SET DEFAULT gen_random_uuid()",
+    )
+    |> pog.execute(pool)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE eventcore_events SET event_id = $1::text::uuid WHERE event_id = $2::text::uuid",
+    )
+    |> pog.parameter(pog.text(prior_id))
+    |> pog.parameter(pog.text(first.event_id))
+    |> pog.execute(pool)
+  let assert Ok([previous]) = source.read(selection, page, delivery.Unbounded)
+  assert previous.event_id == prior_id
   assert postgres.migrate_delivery(reopened) == Ok(Nil)
-  assert source.read(selection, page, delivery.Unbounded) == Ok([first])
+  assert source.read(selection, page, delivery.Unbounded) == Ok([previous])
 
   let assert Ok(_) =
     pog.query(
@@ -261,11 +282,12 @@ fn check_committed_delivery(
       WHERE event_id = $2::text::uuid",
     )
     |> pog.parameter(pog.text("{\"precision\":0.12345678901234567890123456789}"))
-    |> pog.parameter(pog.text(first.event_id))
+    |> pog.parameter(pog.text(prior_id))
     |> pog.execute(pool)
   let assert Ok([raw]) = source.read(selection, page, delivery.Unbounded)
   assert raw.metadata == "{\"precision\":0.12345678901234567890123456789}"
 
+  let before_ms = database_time_ms(pool)
   let assert Ok(Some(before)) = source.high_watermark()
   let assert Ok(new_stream) = stream.id("contract/debit/after")
   let assert Ok(batch) =
@@ -288,19 +310,46 @@ fn check_committed_delivery(
   let assert Ok(later) = delivery.event_type("created")
   let assert Ok(exact_selection) =
     delivery.selection(selection_id, prefix, [persisted, later])
+  let assert Ok(all) = projection.page(Some(before), 2)
+  let assert Ok([new_first, new_second]) =
+    source.read(exact_selection, all, delivery.Unbounded)
+  assert string.slice(new_first.event_id, 14, 1) == "7"
+  assert string.slice(new_second.event_id, 14, 1) == "7"
+  assert new_first.event_id != new_second.event_id
+  let after_ms = database_time_ms(pool)
+  let variant = string.slice(new_first.event_id, 19, 1)
+  assert variant == "8" || variant == "9" || variant == "a" || variant == "b"
+  let timestamp = string.slice(new_first.event_id, 0, 13)
+  let assert Ok(timestamp_ms) =
+    timestamp |> string.replace("-", "") |> int.base_parse(16)
+  assert timestamp_ms >= before_ms && timestamp_ms <= after_ms
   store_contract.check_delivery_boundary(
     source,
     exact_selection,
     before,
     boundary,
     following,
-    first.event_id,
+    prior_id,
     persisted,
     <<200:64>>,
     <<300:64>>,
   )
 
   Nil
+}
+
+fn database_time_ms(pool: pog.Connection) -> Int {
+  let decoder = {
+    use time <- decode.field(0, decode.int)
+    decode.success(time)
+  }
+  let assert Ok(pog.Returned(count: _, rows: [time])) =
+    pog.query(
+      "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+    )
+    |> pog.returning(decoder)
+    |> pog.execute(pool)
+  time
 }
 
 fn check_legacy_projection(events, reopened, second_checkpoints) {

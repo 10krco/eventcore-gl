@@ -122,14 +122,24 @@ pub type DeliveryError {
   InvalidDeliveryPayload(projection.Position, String)
 }
 
+// Replace the leading 48 bits and the version nibble of a random UUID.
+// The remaining 74 random bits and the RFC variant are retained.
+const uuid_v7_default =
+  "(
+  lpad(to_hex(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint), 12, '0')
+  || '7' || substr(gen_random_uuid()::text, 16)
+)::uuid"
+
 /// Adds persisted event identities to the existing committed event sequence.
+/// Reapplying this migration updates the default without rewriting existing IDs.
 pub fn migrate_delivery(
   events: EventStore(payload),
 ) -> Result(Nil, MigrationError) {
   migrate_tables(events.pool, [
     "ALTER TABLE eventcore_events
-      ADD COLUMN IF NOT EXISTS event_id uuid NOT NULL DEFAULT gen_random_uuid(),
-      ADD COLUMN IF NOT EXISTS metadata json NOT NULL DEFAULT '{}'::json",
+      ADD COLUMN IF NOT EXISTS event_id uuid NOT NULL DEFAULT " <> uuid_v7_default <> ", ADD COLUMN IF NOT EXISTS metadata json NOT NULL DEFAULT '{}'::json",
+    "ALTER TABLE eventcore_events ALTER COLUMN event_id SET DEFAULT "
+      <> uuid_v7_default,
     "CREATE UNIQUE INDEX IF NOT EXISTS eventcore_events_event_id ON eventcore_events(event_id)",
   ])
 }
