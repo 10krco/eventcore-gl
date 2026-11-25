@@ -56,7 +56,9 @@ pub fn given_events(
 }
 
 /// Execute the command and collect one replay batch from a fresh checkpoint.
-/// The scenario is single-use. Close it after collecting the observation.
+/// EventCore 2.1.0 runs one legacy batch of up to 1,000 deliveries.
+/// Setup events count toward that limit. Close the scenario after collecting
+/// its single observation.
 pub fn when(
   scenario: Scenario(payload),
   command: command.Command(state, payload, error),

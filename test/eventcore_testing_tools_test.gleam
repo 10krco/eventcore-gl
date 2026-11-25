@@ -92,3 +92,16 @@ fn deposit(id: stream.Id, amount: Int) -> command.Command(Int, Int, Int) {
     },
   )
 }
+
+pub fn scenario_preserves_the_release_batch_boundary_test() {
+  let assert Ok(id) = stream.id("account")
+  let given_events = list.repeat(store.Event(id, "opened", 5), 1000)
+  let assert Ok(initial) = scenario.start()
+  let assert Ok(given) = scenario.given_events(initial, id, given_events)
+  let assert Ok(observation) = scenario.when(given, deposit(id, 20))
+  observation
+  |> scenario.succeeded
+  |> scenario.then_events(given_events)
+  |> scenario.then_event_count(1000)
+  assert scenario.close(given) == Ok(Nil)
+}
