@@ -84,10 +84,10 @@ open uses `FullBranches`. The [journal architecture](../ARCHITECTURE.md) and
 [reconciliation decision](decisions/0023-filesystem-release-reconciliation.md)
 describe both policies.
 
-Use an explicit event-kind filter for a projection that consumes one event
-type. The Gleam event store and projection APIs use caller-supplied codecs and
-filters. The Rust APIs derive the discriminator from the event type when a
-legacy projection omits it.
+Use `projection.rust_release_pagination` with the consumer's event kind for
+release-style legacy page limits, decode skips and checkpoint progress.
+A kind already set on the filter takes precedence. The [projection tests](../test/eventcore_projection_test.gleam)
+and [SQLite test](../test/eventcore_sqlite_test.gleam) exercise this behavior.
 
 The release's Rust macros and contract test macros are represented by typed
 Gleam functions, compiler rejection fixtures, and reusable runtime assertions.

@@ -2,7 +2,7 @@ import eventcore/projection
 import eventcore/store
 import gleam/int
 import gleam/list
-import gleam/option.{None, Some}
+import gleam/option.{type Option, None, Some}
 import gleam/result
 
 const chunk_size = 128
@@ -21,7 +21,7 @@ pub fn read(
     None -> 0
   }
   scan(
-    Reader(filter, high, fetch, decode),
+    Reader(filter, high, fetch, decode, projection.page_after(page)),
     after,
     projection.page_limit(page),
     [],
@@ -36,6 +36,7 @@ type Reader(wire, payload) {
       Result(List(#(Int, store.Event(wire))), store.StoreError),
     decode: fn(store.Event(wire)) ->
       Result(store.Event(payload), store.StoreError),
+    input_cursor: Option(projection.Position),
   )
 }
 
@@ -46,8 +47,7 @@ fn scan(
   reversed: List(projection.Delivery(payload)),
 ) -> Result(projection.PageResult(payload), store.StoreError) {
   case remaining == 0 || after >= reader.high {
-    True ->
-      Ok(projection.PageResult(list.reverse(reversed), option_position(after)))
+    True -> finish(reader, after, reversed)
     False -> {
       let through = int.min(reader.high, after + chunk_size)
       use events <- result.try(reader.fetch(after + 1, through))
@@ -68,21 +68,49 @@ fn consume(
     [#(sequence, event), ..rest] ->
       case projection.matches(reader.filter, event.stream, event.kind) {
         False -> consume(reader, rest, through, remaining, reversed)
-        True -> {
-          use event <- result.try(reader.decode(event))
-          use position <- result.try(
-            projection.position(sequence)
-            |> result.replace_error(store.StoreFailure(store.ReadProjection)),
-          )
-          let reversed = [projection.Delivery(event, position), ..reversed]
-          case remaining {
-            1 ->
-              Ok(projection.PageResult(list.reverse(reversed), Some(position)))
-            _ -> consume(reader, rest, through, remaining - 1, reversed)
+        True ->
+          case reader.decode(event) {
+            Error(store.DeserializationFailed(_, _) as error) ->
+              case
+                projection.uses_release_pagination(reader.filter),
+                remaining
+              {
+                False, _ -> Error(error)
+                True, 1 -> finish(reader, sequence, reversed)
+                True, _ ->
+                  consume(reader, rest, through, remaining - 1, reversed)
+              }
+            Error(error) -> Error(error)
+            Ok(event) -> {
+              use position <- result.try(
+                projection.position(sequence)
+                |> result.replace_error(store.StoreFailure(store.ReadProjection)),
+              )
+              let reversed = [projection.Delivery(event, position), ..reversed]
+              case remaining {
+                1 -> finish(reader, sequence, reversed)
+                _ -> consume(reader, rest, through, remaining - 1, reversed)
+              }
+            }
           }
-        }
       }
   }
+}
+
+fn finish(
+  reader: Reader(wire, payload),
+  scanned: Int,
+  reversed: List(projection.Delivery(payload)),
+) -> Result(projection.PageResult(payload), store.StoreError) {
+  let cursor = case
+    projection.uses_release_pagination(reader.filter),
+    reversed
+  {
+    False, _ -> option_position(scanned)
+    True, [delivery, ..] -> Some(delivery.position)
+    True, [] -> reader.input_cursor
+  }
+  Ok(projection.PageResult(list.reverse(reversed), cursor))
 }
 
 fn option_position(sequence: Int) {

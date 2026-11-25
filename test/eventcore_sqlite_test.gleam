@@ -455,3 +455,34 @@ pub fn sqlite_projection_frontier_excludes_concurrent_commits_until_next_page_te
   assert sqlite.close(writer) == Ok(Nil)
   assert delete_database(path) == Nil
 }
+
+pub fn legacy_projection_skips_incompatible_rows_after_limit_test() {
+  let path = temp_database()
+  let assert Ok(writer) = sqlite.open(path, binary_codec())
+  assert sqlite.migrate(writer) == Ok(Nil)
+  let assert Ok(id) = stream.id("legacy")
+  let assert Ok(batch) =
+    store.writes()
+    |> store.register(id, stream.initial_version)
+    |> result.try(store.append(_, store.Event(id, "created", <<10:32>>)))
+    |> result.try(store.append(_, store.Event(id, "created", <<20:8>>)))
+    |> result.try(store.append(_, store.Event(id, "created", <<30:32>>)))
+  assert sqlite.as_store(writer).append_events(batch) == Ok(Nil)
+  assert sqlite.close(writer) == Ok(Nil)
+
+  let assert Ok(db) = sqlite.open(path, integer_codec())
+  let read = sqlite.projection_reader(db)
+  let filter = projection.rust_release_pagination(projection.all(), "created")
+  let assert Ok(page) = projection.page(None, 2)
+  let assert Ok(projection.PageResult([first], Some(after))) =
+    read(filter, page)
+  assert first.event == store.Event(id, "created", 10)
+  assert first.position == after
+  let assert Ok(page) = projection.page(Some(after), 2)
+  let assert Ok(projection.PageResult([last], Some(through))) =
+    read(filter, page)
+  assert last.event == store.Event(id, "created", 30)
+  assert last.position == through
+  assert sqlite.close(db) == Ok(Nil)
+  assert delete_database(path) == Nil
+}
