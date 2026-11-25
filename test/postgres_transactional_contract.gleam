@@ -86,6 +86,16 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     )
   check_idle_fencing(destination, source, config, second)
   check_error_policy_after_rollback(destination, source, config, second)
+  check_decode_and_backoff(destination, source, config, second, position1)
+  check_progress_write_and_reset_failures(
+    destination,
+    source,
+    config,
+    second,
+    position1,
+    position2,
+  )
+  check_retry_reloads_progress(destination, source, config, second, position1)
   check_leadership_loss(destination, source, config, second)
   let assert Ok(_) =
     pog.query(
@@ -212,6 +222,173 @@ fn check_error_policy_after_rollback(destination, source, config, observer) {
   let assert Ok(position) = projection.position(1)
   assert transactional.run(destination, projector, source, config)
     == Ok(transactional.Stopped(position, 0, 0))
+}
+
+fn check_decode_and_backoff(destination, source, config, observer, position) {
+  let assert Ok(name) = delivery.projector_name("transactional-invalid-input")
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Error("bad input") },
+      fn(_, _, _) { panic as "invalid input reached apply" },
+      fn(_) { panic as "invalid input reached the application error policy" },
+    )
+  assert transactional.run(destination, projector, source, config)
+    == Error(transactional.DecodeFailed(position, "bad input"))
+  assert progress.load(observer, name) == Ok(None)
+
+  let waits = process.new_subject()
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, _, tx) {
+        let assert Ok(_) = insert(tx, 777)
+        Error("retry")
+      },
+      fn(_) { transactional.Retry },
+    )
+  let assert Ok(policy) = transactional.retry_policy(3, 10, 3.0, 75)
+  let config =
+    transactional.Config(..config, retry_policy: policy, retry_wait: fn(ms) {
+      process.send(waits, ms)
+    })
+  assert transactional.run(destination, projector, source, config)
+    == Error(transactional.RetryExhausted(position, 4, "retry"))
+  assert process.receive(waits, 0) == Ok(10)
+  assert process.receive(waits, 0) == Ok(30)
+  assert process.receive(waits, 0) == Ok(75)
+  assert process.receive(waits, 0) == Error(Nil)
+
+  let assert Ok(policy) =
+    transactional.retry_policy(2, 1000, 1.7976931348623157e308, 5000)
+  let config = transactional.Config(..config, retry_policy: policy)
+  assert transactional.run(destination, projector, source, config)
+    == Error(transactional.RetryExhausted(position, 3, "retry"))
+  assert process.receive(waits, 0) == Ok(1000)
+  assert process.receive(waits, 0) == Ok(5000)
+  assert process.receive(waits, 0) == Error(Nil)
+  assert progress.load(observer, name) == Ok(None)
+  assert count(observer) == 4
+}
+
+fn check_progress_write_and_reset_failures(
+  destination,
+  source,
+  config,
+  observer,
+  first,
+  second,
+) {
+  let assert Ok(blocked) = delivery.projector_name("blocked-progress")
+  let assert Ok(saved) = delivery.projector_name("blocked-reset")
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION ignore_projection_progress() RETURNS trigger
+     LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$",
+    )
+    |> pog.execute(observer)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER ignore_progress_insert BEFORE INSERT ON eventcore_projection_progress
+     FOR EACH ROW WHEN (NEW.projector_name = 'blocked-progress')
+     EXECUTE FUNCTION ignore_projection_progress()",
+    )
+    |> pog.execute(observer)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE TRIGGER ignore_progress_delete BEFORE DELETE ON eventcore_projection_progress
+     FOR EACH ROW WHEN (OLD.projector_name = 'blocked-reset')
+     EXECUTE FUNCTION ignore_projection_progress()",
+    )
+    |> pog.execute(observer)
+
+  let projector = fn(name, after_commit) {
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, position, tx) {
+        case position == first {
+          False -> Error("pause")
+          True -> {
+            let assert Ok(_) = insert(tx, 777)
+            Ok(after_commit)
+          }
+        }
+      },
+      fn(_) { transactional.Stop },
+    )
+  }
+  assert transactional.run(
+      destination,
+      projector(blocked, fn() {
+        panic as "progress failure ran after-commit hook"
+      }),
+      source,
+      config,
+    )
+    == Error(transactional.ProgressFailed(Some(first), progress.UnexpectedRows))
+  assert progress.load(observer, blocked) == Ok(None)
+  assert count(observer) == 4
+
+  assert transactional.run(
+      destination,
+      projector(saved, transactional.no_after_commit),
+      source,
+      config,
+    )
+    == Ok(transactional.Stopped(second, 1, 0))
+  let selection = delivery.selection_identity(config.selection)
+  let committed = progress.Progress(source.id, selection, first)
+  assert progress.load(observer, saved) == Ok(Some(committed))
+  assert count(observer) == 5
+  assert transactional.reset(destination, saved, source.id, selection, fn(tx) {
+      clear(tx)
+      Ok(Nil)
+    })
+    == Error(transactional.ResetProgressFailed(progress.UnexpectedRows))
+  assert progress.load(observer, saved) == Ok(Some(committed))
+  assert count(observer) == 5
+  let assert Ok(_) =
+    pog.query("DELETE FROM projection_effects WHERE amount = 777")
+    |> pog.execute(observer)
+  Nil
+}
+
+fn check_retry_reloads_progress(
+  destination,
+  source: delivery.Source(error),
+  config: transactional.Config,
+  observer,
+  first,
+) {
+  let assert Ok(name) = delivery.projector_name("retry-observes-progress")
+  let bound =
+    delivery.Source(..source, high_watermark: fn() { Ok(Some(first)) })
+  let selection = delivery.selection_identity(config.selection)
+  let committed = progress.Progress(source.id, selection, first)
+  let attempts = process.new_subject()
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, _, tx) {
+        process.send(attempts, Nil)
+        let assert Ok(_) = insert(tx, 777)
+        Error("retry")
+      },
+      fn(_) { transactional.Retry },
+    )
+  let config =
+    transactional.Config(..config, retry_wait: fn(_) {
+      assert progress.advance(observer, name, committed) == Ok(Nil)
+    })
+  assert transactional.run(destination, projector, bound, config)
+    == Ok(transactional.CaughtUp(0, 0, Some(first)))
+  assert process.receive(attempts, 0) == Ok(Nil)
+  assert process.receive(attempts, 0) == Error(Nil)
+  assert progress.load(observer, name) == Ok(Some(committed))
+  assert count(observer) == 4
 }
 
 fn check_commit_rejection(
