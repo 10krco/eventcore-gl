@@ -252,3 +252,33 @@ pub fn check_preserves_release_temporal_traversal_and_seed_rule_test() {
       checker.mapping(carry_to_b),
     ])
 }
+
+pub fn check_traverses_producers_in_release_name_order_test() {
+  let state = model.state("State", State)
+  let target = model.field(state, "a_target", Amount, fn(n: Int) { n })
+  let first = model.field(state, "b_first", Amount, fn(n: Int) { n })
+  let second = model.field(state, "c_second", Amount, fn(n: Int) { n })
+  let missing = model.field(state, "d_missing", Amount, fn(n: Int) { n })
+  let producer_z =
+    model.mapping("z_producer", model.source(first), target, fn(n) { n })
+  let producer_a =
+    model.mapping("a_producer", model.source(second), target, fn(n) { n })
+  let from_missing_first =
+    model.mapping("first", model.source(missing), first, fn(n) { n })
+  let from_missing_second =
+    model.mapping("second", model.source(missing), second, fn(n) { n })
+  let assert Error(checker.Incomplete([error])) =
+    checker.check([
+      checker.field(target),
+      checker.field(first),
+      checker.field(second),
+      checker.field(missing),
+      checker.mapping(producer_z),
+      checker.mapping(producer_a),
+      checker.mapping(from_missing_first),
+      checker.mapping(from_missing_second),
+    ])
+  assert error.code == "ECM003"
+  assert error.trace
+    == ["state State.a_target", "state State.c_second", "state State.d_missing"]
+}
