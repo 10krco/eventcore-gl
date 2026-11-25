@@ -16,7 +16,7 @@ Owning Tiber task `20261124-vkzx`.
 | [Retry conflicts and instrument attempts](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore/tests/retry_policy_test.rs) | Exercise default, custom and exhausted retries, fixed and exponential backoff with jitter, the retry metrics hook, trace fields and the successful attempt count. | [Retry tests](../test/eventcore_command_test.gleam) |
 | [Exercise store vocabulary and isolation](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-testing/src/contract.rs) | Read missing and existing streams, preserve per-stream order, allow repeated registrations with identical expected versions, reject contradictory versions and unregistered appends, propagate the first stream error and preserve batch atomicity. Pass the shared adapter contracts in memory. | [Store tests](../test/eventcore_store_test.gleam) and [shared adapter contract](../test/store_contract.gleam) |
 
-Gleam keeps zero exponential backoff at zero. The Rust 2.1.0 implementation overflows its intermediate power calculation starting at retry 65, yielding a saturated delay.
+The retry regression matches the release calculation at retry 65, where overflow of the intermediate power saturates the delay before jitter even when the exponential base is zero.
 
 ## Durable storage and command state
 
