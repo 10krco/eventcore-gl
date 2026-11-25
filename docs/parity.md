@@ -94,6 +94,8 @@ For PostgreSQL legacy release order, run `postgres.migrate_delivery` and
 `postgres.projection_release_backend`. The
 [two-pool test](../test/postgres_contract.gleam) verifies UUID ordering,
 native LIKE and regex matching, checkpoint resume, and isolated reset.
+It pins the database clock and verifies that a same-millisecond append through
+a second pool stays visible beyond a saved cursor.
 
 The release's Rust macros and contract test macros are represented by typed
 Gleam functions, compiler rejection fixtures, and reusable runtime assertions.

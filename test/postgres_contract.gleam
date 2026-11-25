@@ -99,6 +99,7 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   assert postgres.load_checkpoint(checkpoints, "standalone") == Ok(Some(1))
   check_legacy_projection(events, reopened, second_checkpoints)
   check_committed_delivery(first, events, reopened)
+  check_monotonic_uuids(first, events, reopened)
   check_release_projection(first, events, second_checkpoints)
 
   let assert Ok(key) = snapshot.key("ledger/v1")
@@ -336,6 +337,45 @@ fn check_committed_delivery(
     <<300:64>>,
   )
 
+  Nil
+}
+
+fn check_monotonic_uuids(pool, events, reopened) {
+  // Hold the persisted clock ahead of wall time so every UUID uses the same
+  // millisecond, including the append through the independently opened pool.
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE eventcore_uuid_clock SET milliseconds = 140737488355327,
+        sequence = 0 WHERE singleton",
+    )
+    |> pog.execute(pool)
+  let assert Ok(id) = stream.id("monotonic/uuid")
+  let assert Ok(initial_batch) =
+    store.writes()
+    |> store.register(id, stream.initial_version)
+    |> result.try(store.append(_, store.Event(id, "ordered", 1)))
+    |> result.try(store.append(_, store.Event(id, "ordered", 2)))
+  assert postgres.as_store(events).append_events(initial_batch) == Ok(Nil)
+  let read = postgres.projection_release_reader(reopened, "ordered")
+  let assert Ok(filter) = projection.prefix("monotonic/")
+  let assert Ok(initial_page) = projection.page(None, 1)
+  let assert Ok(projection.PageResult([one], Some(first_cursor))) =
+    read(filter, initial_page)
+  assert one.event.payload == 1
+  let assert Ok(rest) =
+    store.writes()
+    |> store.register(
+      id,
+      stream.next_version(stream.next_version(stream.initial_version)),
+    )
+    |> result.try(store.append(_, store.Event(id, "ordered", 3)))
+  assert postgres.as_store(reopened).append_events(rest) == Ok(Nil)
+  let assert Ok(next_page) = projection.page(Some(first_cursor), 2)
+  let assert Ok(projection.PageResult([two, three], Some(last_cursor))) =
+    read(filter, next_page)
+  assert [two.event.payload, three.event.payload] == [2, 3]
+  assert projection.sequence(first_cursor) < projection.sequence(two.position)
+  assert projection.sequence(two.position) < projection.sequence(last_cursor)
   Nil
 }
 

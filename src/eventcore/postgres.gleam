@@ -124,24 +124,58 @@ pub type DeliveryError {
   InvalidDeliveryPayload(projection.Position, String)
 }
 
-// Replace the leading 48 bits and the version nibble of a random UUID.
-// The remaining 74 random bits and the RFC variant are retained.
-const uuid_v7_default =
-  "(
-  lpad(to_hex(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint), 12, '0')
-  || '7' || substr(gen_random_uuid()::text, 16)
-)::uuid"
+// A single database-local counter serializes writes through the default.
+const next_event_id_sql =
+  "CREATE OR REPLACE FUNCTION eventcore_next_event_id()
+RETURNS uuid LANGUAGE sql VOLATILE AS $body$
+  UPDATE eventcore_uuid_clock AS clock SET
+    milliseconds = GREATEST(current.milliseconds, clock.milliseconds +
+      CASE WHEN clock.sequence = 4398046511103 THEN 1 ELSE 0 END),
+    sequence = CASE WHEN current.milliseconds > clock.milliseconds
+      THEN floor(random() * 2199023255552)::bigint
+      ELSE (clock.sequence + 1) & 4398046511103 END
+  FROM (SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint
+          AS milliseconds) AS current
+  WHERE clock.singleton
+  RETURNING (
+    lpad(to_hex(clock.milliseconds), 12, '0') ||
+    '7' || lpad(to_hex(clock.sequence >> 30), 3, '0') ||
+    to_hex(8 | ((clock.sequence >> 28) & 3)) ||
+    lpad(to_hex(clock.sequence & 268435455), 7, '0') ||
+    right(gen_random_uuid()::text, 8)
+  )::uuid
+$body$"
 
 /// Adds persisted event identities to the existing committed event sequence.
-/// Reapplying this migration updates the default without rewriting existing IDs.
+/// Reapplying the migration retains existing IDs and the UUID clock.
 pub fn migrate_delivery(
   events: EventStore(payload),
 ) -> Result(Nil, MigrationError) {
   migrate_tables(events.pool, [
     "ALTER TABLE eventcore_events
-      ADD COLUMN IF NOT EXISTS event_id uuid NOT NULL DEFAULT " <> uuid_v7_default <> ", ADD COLUMN IF NOT EXISTS metadata json NOT NULL DEFAULT '{}'::json",
-    "ALTER TABLE eventcore_events ALTER COLUMN event_id SET DEFAULT "
-      <> uuid_v7_default,
+      ADD COLUMN IF NOT EXISTS event_id uuid,
+      ADD COLUMN IF NOT EXISTS metadata json NOT NULL DEFAULT '{}'::json",
+    "CREATE TABLE IF NOT EXISTS eventcore_uuid_clock (
+      singleton boolean PRIMARY KEY CHECK (singleton),
+      milliseconds bigint NOT NULL,
+      sequence bigint NOT NULL)",
+    "INSERT INTO eventcore_uuid_clock(singleton, milliseconds, sequence)
+      SELECT true, COALESCE(MAX(('x' || left(replace(event_id::text, '-', ''), 12))
+        ::bit(48)::bigint), 0), 4398046511103 FROM eventcore_events
+      WHERE substr(event_id::text, 15, 1) = '7'
+      ON CONFLICT (singleton) DO NOTHING",
+    next_event_id_sql,
+    "DO $body$ DECLARE event_position bigint; BEGIN
+      FOR event_position IN SELECT position FROM eventcore_events
+        WHERE event_id IS NULL ORDER BY position
+      LOOP
+        UPDATE eventcore_events SET event_id = eventcore_next_event_id()
+          WHERE position = event_position;
+      END LOOP;
+    END $body$",
+    "ALTER TABLE eventcore_events
+      ALTER COLUMN event_id SET NOT NULL,
+      ALTER COLUMN event_id SET DEFAULT eventcore_next_event_id()",
     "CREATE UNIQUE INDEX IF NOT EXISTS eventcore_events_event_id ON eventcore_events(event_id)",
   ])
 }
