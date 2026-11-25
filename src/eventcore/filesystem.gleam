@@ -24,6 +24,11 @@ pub type Config {
   Config(root: String, sync: Sync)
 }
 
+pub type Reconciliation {
+  FullBranches
+  RustRelease
+}
+
 /// Supply a stable binary representation for each event kind.
 pub type Codec(payload) {
   Codec(
@@ -81,7 +86,11 @@ pub type JournalError {
 }
 
 pub opaque type Filesystem(payload) {
-  Filesystem(server: Server, codec: Codec(payload))
+  Filesystem(
+    server: Server,
+    codec: Codec(payload),
+    reconciliation: Reconciliation,
+  )
 }
 
 type Server
@@ -97,7 +106,7 @@ pub fn open_with_config(
   config: Config,
   codec: Codec(payload),
 ) -> Result(Filesystem(payload), OpenError) {
-  open_journal(config, None, codec)
+  open_with_reconciliation(config, None, FullBranches, codec)
 }
 
 pub fn open_with_replica(
@@ -105,19 +114,25 @@ pub fn open_with_replica(
   replica: String,
   codec: Codec(payload),
 ) -> Result(Filesystem(payload), OpenError) {
-  case string.trim(replica) {
-    "" -> Error(InvalidReplicaId)
-    id -> open_journal(config, Some(id), codec)
-  }
+  open_with_reconciliation(config, Some(replica), FullBranches, codec)
 }
 
-fn open_journal(
+/// Select the fork and append semantics for this journal handle. RustRelease
+/// replays the published release rules, including an ordinary append closing
+/// a fork when it joins all the claiming transactions.
+pub fn open_with_reconciliation(
   config: Config,
   replica: Option(String),
+  reconciliation: Reconciliation,
   codec: Codec(payload),
 ) -> Result(Filesystem(payload), OpenError) {
-  start(config.root, config.sync, replica)
-  |> result.map(Filesystem(_, codec))
+  let replica = option.map(replica, string.trim)
+  case replica {
+    Some("") -> Error(InvalidReplicaId)
+    _ ->
+      start(config.root, config.sync, replica, reconciliation)
+      |> result.map(Filesystem(_, codec, reconciliation))
+  }
 }
 
 pub fn close(filesystem: Filesystem(payload)) -> Result(Nil, StoreError) {
@@ -224,20 +239,33 @@ fn reconcile_forks(
                 fork,
                 events,
               ))
-              use #(current, refreshed) <- result.try(fork_snapshot(
-                filesystem.server,
-              ))
-              case current == next {
-                False -> Error(ReconciliationChanged)
-                True ->
+              case filesystem.reconciliation {
+                RustRelease ->
                   reconcile_forks(
                     filesystem,
                     resolver,
                     next,
-                    refreshed,
+                    rest,
                     resolved + 1,
                     declined,
                   )
+                FullBranches -> {
+                  use #(current, refreshed) <- result.try(fork_snapshot(
+                    filesystem.server,
+                  ))
+                  case current == next {
+                    False -> Error(ReconciliationChanged)
+                    True ->
+                      reconcile_forks(
+                        filesystem,
+                        resolver,
+                        next,
+                        refreshed,
+                        resolved + 1,
+                        declined,
+                      )
+                  }
+                }
               }
             }
           }
@@ -418,11 +446,12 @@ fn encode_events(
   })
 }
 
-@external(erlang, "eventcore_filesystem_ffi", "start_with_replica")
+@external(erlang, "eventcore_filesystem_ffi", "start_with_reconciliation")
 fn start(
   root: String,
   sync: Sync,
   replica: Option(String),
+  reconciliation: Reconciliation,
 ) -> Result(Server, OpenError)
 
 @external(erlang, "eventcore_filesystem_ffi", "stop")
