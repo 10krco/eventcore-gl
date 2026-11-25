@@ -5,50 +5,86 @@ import gleam/list
 import gleam/option.{type Option, None}
 import gleam/result
 
-pub type Input
+pub type Input(witness)
 
-pub type Command
+pub type Command(witness)
 
-pub type Event
+pub type Event(witness)
 
-pub type State
+pub type State(witness)
 
-pub type ReadModel
+pub type ReadModel(witness)
 
-pub type Effect
+pub type Effect(witness)
 
-pub type Output
+pub type Output(witness)
+
+pub type Role {
+  InputRole
+  CommandRole
+  EventRole
+  StateRole
+  ReadModelRole
+  EffectRole
+  OutputRole
+}
+
+/// Component names identify declarations within a role in a checker registry.
+pub type FieldId {
+  FieldId(role: Role, component: String, name: String)
+}
 
 pub opaque type Component(role, value) {
-  Component(name: String)
+  Component(role: Role, name: String)
 }
 
-pub fn input(name: String) -> Component(Input, value) {
-  Component(name)
+pub fn input(
+  name: String,
+  _witness: witness,
+) -> Component(Input(witness), value) {
+  Component(InputRole, name)
 }
 
-pub fn command(name: String) -> Component(Command, value) {
-  Component(name)
+pub fn command(
+  name: String,
+  _witness: witness,
+) -> Component(Command(witness), value) {
+  Component(CommandRole, name)
 }
 
-pub fn event(name: String) -> Component(Event, value) {
-  Component(name)
+pub fn event(
+  name: String,
+  _witness: witness,
+) -> Component(Event(witness), value) {
+  Component(EventRole, name)
 }
 
-pub fn state(name: String) -> Component(State, value) {
-  Component(name)
+pub fn state(
+  name: String,
+  _witness: witness,
+) -> Component(State(witness), value) {
+  Component(StateRole, name)
 }
 
-pub fn read_model(name: String) -> Component(ReadModel, value) {
-  Component(name)
+pub fn read_model(
+  name: String,
+  _witness: witness,
+) -> Component(ReadModel(witness), value) {
+  Component(ReadModelRole, name)
 }
 
-pub fn effect(name: String) -> Component(Effect, value) {
-  Component(name)
+pub fn effect(
+  name: String,
+  _witness: witness,
+) -> Component(Effect(witness), value) {
+  Component(EffectRole, name)
 }
 
-pub fn output(name: String) -> Component(Output, value) {
-  Component(name)
+pub fn output(
+  name: String,
+  _witness: witness,
+) -> Component(Output(witness), value) {
+  Component(OutputRole, name)
 }
 
 pub opaque type Modeled(role, value) {
@@ -69,7 +105,7 @@ pub fn value(modeled: Modeled(role, value)) -> value {
 }
 
 pub opaque type Field(role, owner, occurrence, value) {
-  Field(name: String, get: fn(owner) -> value)
+  Field(id: FieldId, get: fn(owner) -> value)
 }
 
 pub opaque type FieldValue(role, owner, occurrence, value) {
@@ -83,11 +119,11 @@ pub fn field(
   _occurrence: occurrence,
   get: fn(owner) -> value,
 ) -> Field(role, owner, occurrence, value) {
-  Field(component.name <> "." <> name, get)
+  Field(FieldId(component.role, component.name, name), get)
 }
 
-pub fn field_name(field: Field(role, owner, occurrence, value)) -> String {
-  field.name
+pub fn field_id(field: Field(role, owner, occurrence, value)) -> FieldId {
+  field.id
 }
 
 pub fn field_value(
@@ -96,60 +132,60 @@ pub fn field_value(
   field_value.inner
 }
 
-pub opaque type Origin(owner, occurrence, value) {
-  Origin(field: Field(Input, owner, occurrence, value))
+pub opaque type Origin(witness, owner, occurrence, value) {
+  Origin(field: Field(Input(witness), owner, occurrence, value))
 }
 
 pub fn origin(
-  component: Component(Input, owner),
+  component: Component(Input(witness), owner),
   name: String,
   occurrence: occurrence,
   get: fn(owner) -> value,
-) -> Origin(owner, occurrence, value) {
+) -> Origin(witness, owner, occurrence, value) {
   Origin(field(component, name, occurrence, get))
 }
 
 pub fn origin_field(
-  origin: Origin(owner, occurrence, value),
-) -> Field(Input, owner, occurrence, value) {
+  origin: Origin(witness, owner, occurrence, value),
+) -> Field(Input(witness), owner, occurrence, value) {
   origin.field
 }
 
 pub fn supply(
-  _origin: Origin(owner, occurrence, value),
+  _origin: Origin(witness, owner, occurrence, value),
   value: value,
-) -> FieldValue(Input, owner, occurrence, value) {
+) -> FieldValue(Input(witness), owner, occurrence, value) {
   FieldValue(value)
 }
 
 pub fn constant(
-  _field: Field(State, owner, occurrence, value),
+  _field: Field(State(witness), owner, occurrence, value),
   value: value,
-) -> FieldValue(State, owner, occurrence, value) {
+) -> FieldValue(State(witness), owner, occurrence, value) {
   FieldValue(value)
 }
 
 pub fn default(
-  field: Field(State, owner, occurrence, value),
+  field: Field(State(witness), owner, occurrence, value),
   make: fn() -> value,
-) -> FieldValue(State, owner, occurrence, value) {
+) -> FieldValue(State(witness), owner, occurrence, value) {
   constant(field, make())
 }
 
 pub fn absence(
-  field: Field(State, owner, occurrence, Option(value)),
-) -> FieldValue(State, owner, occurrence, Option(value)) {
+  field: Field(State(witness), owner, occurrence, Option(value)),
+) -> FieldValue(State(witness), owner, occurrence, Option(value)) {
   constant(field, None)
 }
 
 pub opaque type Source(input, value) {
-  Source(read: fn(input) -> value, fields: List(String))
+  Source(read: fn(input) -> value, fields: List(FieldId))
 }
 
 pub fn source(
   field: Field(role, owner, occurrence, value),
 ) -> Source(Modeled(role, owner), value) {
-  Source(fn(input) { field.get(value(input)) }, [field.name])
+  Source(fn(input) { field.get(value(input)) }, [field.id])
 }
 
 pub fn sources(
@@ -178,8 +214,8 @@ pub fn paired_sources(
 pub opaque type Mapping(input, output) {
   Mapping(
     name: String,
-    source_names: List(String),
-    target_name: String,
+    source_fields: List(FieldId),
+    target_field: FieldId,
     apply: fn(input) -> output,
   )
 }
@@ -190,7 +226,7 @@ pub fn try_mapping(
   target: Field(role, owner, occurrence, to),
   transform: fn(from) -> Result(to, error),
 ) -> Mapping(input, Result(FieldValue(role, owner, occurrence, to), error)) {
-  Mapping(name, source.fields, target.name, fn(input) {
+  Mapping(name, source.fields, target.id, fn(input) {
     transform(source.read(input)) |> result.map(FieldValue)
   })
 }
@@ -201,7 +237,7 @@ pub fn mapping(
   target: Field(role, owner, occurrence, to),
   transform: fn(from) -> to,
 ) -> Mapping(input, FieldValue(role, owner, occurrence, to)) {
-  Mapping(name, source.fields, target.name, fn(input) {
+  Mapping(name, source.fields, target.id, fn(input) {
     FieldValue(transform(source.read(input)))
   })
 }
@@ -212,8 +248,8 @@ pub fn apply(mapping: Mapping(input, output), input: input) -> output {
 
 pub fn mapping_fields(
   mapping: Mapping(input, output),
-) -> #(String, List(String), String) {
-  #(mapping.name, mapping.source_names, mapping.target_name)
+) -> #(String, List(FieldId), FieldId) {
+  #(mapping.name, mapping.source_fields, mapping.target_field)
 }
 
 pub opaque type StreamIdentity(role) {

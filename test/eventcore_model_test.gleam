@@ -1,6 +1,7 @@
 import eventcore/model
 import eventcore/stream
 import gleam/option.{type Option, None}
+import gleam/string
 
 type SourceField {
   SourceField
@@ -39,8 +40,8 @@ type Ledger {
 }
 
 pub fn typed_transfer_construction_and_fallible_mapping_test() {
-  let request = model.input("Request")
-  let transfer = model.command("Transfer")
+  let request = model.input("Request", RequestComponent)
+  let transfer = model.command("Transfer", TransferComponent)
   let source =
     model.origin(request, "source", SourceField, fn(r: Request) { r.source })
   let target =
@@ -111,21 +112,26 @@ pub fn typed_transfer_construction_and_fallible_mapping_test() {
 }
 
 fn build_transfer(
-  component: model.Component(model.Command, Transfer),
+  component: model.Component(model.Command(TransferComponent), Transfer),
   source: model.FieldValue(
-    model.Command,
+    model.Command(TransferComponent),
     Transfer,
     SourceField,
     model.StreamIdentity(DebitWitness),
   ),
   target: model.FieldValue(
-    model.Command,
+    model.Command(TransferComponent),
     Transfer,
     DestinationField,
     model.StreamIdentity(CreditWitness),
   ),
-  amount: model.FieldValue(model.Command, Transfer, AmountField, Int),
-) -> model.Modeled(model.Command, Transfer) {
+  amount: model.FieldValue(
+    model.Command(TransferComponent),
+    Transfer,
+    AmountField,
+    Int,
+  ),
+) -> model.Modeled(model.Command(TransferComponent), Transfer) {
   model.build(
     component,
     Transfer(
@@ -153,7 +159,7 @@ fn credit(id: stream.Id) -> model.StreamIdentity(CreditWitness) {
 }
 
 pub fn state_recipes_build_empty_state_test() {
-  let ledger = model.state("Ledger")
+  let ledger = model.state("Ledger", LedgerComponent)
   let total =
     model.field(ledger, "total", AmountField, fn(l: Ledger) { l.total })
   let memo = model.field(ledger, "memo", MemoField, fn(l: Ledger) { l.memo })
@@ -173,13 +179,13 @@ type Rate {
 }
 
 pub fn mapping_combines_fields_from_distinct_components_test() {
-  let transfer = model.command("Transfer")
-  let pricing = model.input("Rate")
+  let transfer = model.command("Transfer", TransferComponent)
+  let pricing = model.input("Rate", RateComponent)
   let amount =
     model.field(transfer, "amount", AmountField, fn(t: Transfer) { t.amount })
   let rate =
     model.origin(pricing, "percent", AmountField, fn(r: Rate) { r.percent })
-  let effect = model.effect("Fee")
+  let effect = model.effect("Fee", FeeComponent)
   let fee = model.field(effect, "amount", AmountField, fn(n: Int) { n })
 
   let calculator =
@@ -201,5 +207,67 @@ pub fn mapping_combines_fields_from_distinct_components_test() {
 
   assert model.apply(calculator, input) |> model.field_value == 6
   assert model.mapping_fields(calculator)
-    == #("fee", ["Transfer.amount", "Rate.percent"], "Fee.amount")
+    == #(
+      "fee",
+      [
+        model.FieldId(model.CommandRole, "Transfer", "amount"),
+        model.FieldId(model.InputRole, "Rate", "percent"),
+      ],
+      model.FieldId(model.EffectRole, "Fee", "amount"),
+    )
+}
+
+type RequestComponent {
+  RequestComponent
+}
+
+type TransferComponent {
+  TransferComponent
+}
+
+type LedgerComponent {
+  LedgerComponent
+}
+
+type RateComponent {
+  RateComponent
+}
+
+type FeeComponent {
+  FeeComponent
+}
+
+pub fn field_ids_preserve_component_and_field_boundaries_test() {
+  let first = model.command("A.B", TransferComponent)
+  let second = model.command("A", LedgerComponent)
+  let first_field =
+    model.field(first, "c", AmountField, fn(value: Int) { value })
+  let second_field =
+    model.field(second, "B.c", AmountField, fn(value: Int) { value })
+
+  assert model.field_id(first_field)
+    == model.FieldId(model.CommandRole, "A.B", "c")
+  assert model.field_id(second_field)
+    == model.FieldId(model.CommandRole, "A", "B.c")
+  assert model.field_id(first_field) != model.field_id(second_field)
+}
+
+@external(erlang, "eventcore_model_test_ffi", "compile_failure")
+fn compile_failure(fixture: String) -> #(Int, String)
+
+pub fn model_constraints_fail_at_compilation_test() {
+  expect_rejected("wrong_target", "Type mismatch", "Int, Credit, Int")
+  expect_rejected("wrong_component", "Type mismatch", "Command(Withdrawal)")
+  expect_rejected("missing_field", "Incorrect arity", "target")
+  expect_rejected("swapped_stream", "Type mismatch", "StreamIdentity(Credit)")
+  expect_rejected("wrong_transform", "Type mismatch", "String")
+  expect_rejected("invalid_origin", "Type mismatch", "model.Origin")
+}
+
+fn expect_rejected(fixture: String, diagnostic: String, detail: String) -> Nil {
+  let #(status, output) = compile_failure(fixture)
+  assert status == 1
+  assert string.contains(output, "error: " <> diagnostic)
+  assert string.contains(output, detail)
+  Nil
 }

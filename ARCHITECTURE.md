@@ -146,7 +146,9 @@ See [ADR 0015](docs/decisions/0015-postgres-transactional-projections.md).
 ## Typed model components
 
 The experimental model module wraps domain values in role-specific opaque types.
-A field value carries its component role, owner type, and occurrence witness.
+Each component has a distinct witness type. A field value carries that witness
+and its field occurrence, and checker identifiers preserve the role, component
+name, and field name as separate values.
 Domain modules combine required field values in private constructors. Input
 origins and state recipes provide roots. Mappings read one or more typed fields
 and produce the exact target field value, with fallible transformations

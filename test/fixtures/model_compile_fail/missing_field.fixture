@@ -1,0 +1,7 @@
+type Transfer {
+  Transfer(source: Int, target: Int)
+}
+
+pub fn missing_field() {
+  Transfer(source: 4)
+}

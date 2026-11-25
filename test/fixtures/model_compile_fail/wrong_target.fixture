@@ -1,0 +1,28 @@
+import eventcore/model
+
+type CommandWitness {
+  CommandWitness
+}
+
+type Debit {
+  Debit
+}
+
+type Credit {
+  Credit
+}
+
+fn accept_debit(
+  value: model.FieldValue(model.Command(CommandWitness), Int, Debit, Int),
+) -> Int {
+  model.field_value(value)
+}
+
+pub fn wrong_target() {
+  let component = model.command("Transfer", CommandWitness)
+  let source = model.field(component, "debit", Debit, fn(n: Int) { n })
+  let target = model.field(component, "credit", Credit, fn(n: Int) { n })
+  let rename =
+    model.mapping("rename", model.source(source), target, fn(n) { n })
+  accept_debit(model.apply(rename, model.build(component, 4)))
+}

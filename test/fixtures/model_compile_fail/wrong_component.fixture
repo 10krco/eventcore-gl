@@ -1,0 +1,29 @@
+import eventcore/model
+
+type Deposit {
+  Deposit
+}
+
+type Withdrawal {
+  Withdrawal
+}
+
+type Amount {
+  Amount
+}
+
+pub fn wrong_component() {
+  let deposit = model.command("Deposit", Deposit)
+  let withdrawal = model.command("Withdrawal", Withdrawal)
+  let deposit_amount = model.field(deposit, "amount", Amount, fn(n: Int) { n })
+  let withdrawal_amount =
+    model.field(withdrawal, "amount", Amount, fn(n: Int) { n })
+  let transfer =
+    model.mapping(
+      "copy",
+      model.source(deposit_amount),
+      withdrawal_amount,
+      fn(n) { n },
+    )
+  model.apply(transfer, model.build(withdrawal, 4))
+}

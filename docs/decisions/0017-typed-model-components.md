@@ -2,9 +2,10 @@
 
 The Rust modeling derives generate builders with required fields and typed
 mapping targets. Gleam domain modules declare their components and field
-occurrences with ordinary functions. Each field records its component, owner,
-and occurrence in its type, so two fields with the same underlying value type
-remain distinct.
+occurrences with ordinary functions. Give each component its own witness type,
+including components that share a domain value type. Each field carries its
+component witness and field occurrence in its type. The checker uses a structured
+field identifier containing the role, component name, and field name.
 
 Domain modules define typed builders over opaque field values and can keep
 their value constructors private. The builder extracts field values and wraps

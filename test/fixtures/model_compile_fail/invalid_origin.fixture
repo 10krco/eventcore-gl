@@ -1,0 +1,15 @@
+import eventcore/model
+
+type Input {
+  Input
+}
+
+type Amount {
+  Amount
+}
+
+pub fn invalid_origin() {
+  let input = model.input("Request", Input)
+  let ordinary_field = model.field(input, "amount", Amount, fn(n: Int) { n })
+  model.supply(ordinary_field, 4)
+}
