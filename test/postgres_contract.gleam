@@ -476,6 +476,9 @@ fn check_release_projection(pool, events, checkpoints) {
   assert release.load("legacy-uuid") == Ok(Some(cursor))
   assert native.load("legacy-uuid") == Ok(Some(native_cursor))
 
+  let assert Ok(empty) = projection.page(Some(cursor), 0)
+  assert read(filter, empty) == Ok(projection.PageResult([], Some(cursor)))
+
   let assert Ok(after) = projection.page(Some(cursor), 1)
   let assert Ok(pattern) = projection.pattern("legacy-*/create[d]")
   let assert Ok(projection.PageResult([last], Some(through))) =

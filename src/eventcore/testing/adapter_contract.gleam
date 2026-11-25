@@ -131,6 +131,8 @@ pub fn check_replay(
   )) = reader(prefix, page)
   assert event == second
   assert through == Some(cursor)
+  let assert Ok(empty) = projection.page(Some(cursor), 0)
+  assert reader(prefix, empty) == Ok(projection.PageResult([], Some(cursor)))
   let assert Ok(page) = projection.page(Some(cursor), 10)
   let assert Ok(result) = reader(prefix, page)
   assert list.map(result.deliveries, fn(delivery) { delivery.event })

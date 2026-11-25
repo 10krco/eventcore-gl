@@ -89,6 +89,10 @@ release-style legacy page limits, decode skips and checkpoint progress.
 A kind already set on the filter takes precedence. The [projection tests](../test/eventcore_projection_test.gleam)
 and [SQLite test](../test/eventcore_sqlite_test.gleam) exercise this behavior.
 
+A page limit of zero returns no deliveries and retains its input cursor. The
+[shared replay contract](../src/eventcore/testing/adapter_contract.gleam) checks
+all four native readers, and the SQL release suites exercise their UUID readers.
+
 For PostgreSQL legacy release order, run `postgres.migrate_delivery` and
 `postgres.migrate_release_checkpoints` before using
 `postgres.projection_release_backend`. The
