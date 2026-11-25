@@ -36,6 +36,42 @@ pub fn check_lease(lease: Lease) -> Result(Nil, LeadershipError) {
 pub type Coordinator =
   fn(String) -> Result(Lease, LeadershipError)
 
+/// Independent named leases for in-memory and SQLite projection backends.
+pub type LocalCoordinator
+
+@external(erlang, "eventcore_memory_ffi", "start")
+fn start_coordinator_server(initial: Nil) -> Result(LocalCoordinator, Nil)
+
+/// Starts a coordinator on the current BEAM node. The creating process owns
+/// its lifetime. Holders also release their named leases when they exit.
+pub fn start_local_coordinator() -> Result(LocalCoordinator, LeadershipError) {
+  start_coordinator_server(Nil)
+  |> result.replace_error(CoordinatorUnavailable)
+}
+
+@external(erlang, "eventcore_memory_ffi", "stop")
+fn stop_coordinator_server(handle: LocalCoordinator) -> Result(Nil, Nil)
+
+pub fn close_local_coordinator(
+  handle: LocalCoordinator,
+) -> Result(Nil, LeadershipError) {
+  stop_coordinator_server(handle)
+  |> result.replace_error(CoordinatorUnavailable)
+}
+
+pub fn local_coordinator(handle: LocalCoordinator) -> Coordinator {
+  fn(name) {
+    use release <- result.map(acquire_local(handle, name))
+    Lease(release)
+  }
+}
+
+@external(erlang, "eventcore_projection_leases", "request")
+fn acquire_local(
+  handle: LocalCoordinator,
+  name: String,
+) -> Result(fn() -> Nil, LeadershipError)
+
 pub type Backend(payload) {
   Backend(
     reader: Reader(payload),

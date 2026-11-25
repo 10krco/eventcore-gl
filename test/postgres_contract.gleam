@@ -55,6 +55,33 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     postgres.as_store(reopened),
   )
   check_trigger_rollback(first, postgres.as_store(reopened))
+  let acquire = postgres.projection_coordinator(first)
+  let competing_acquire = postgres.projection_coordinator(second)
+  let assert Ok(leader) = acquire("standalone")
+  assert competing_acquire("standalone") == Error(runner.AlreadyLeading)
+  leader.release()
+  let assert Ok(one) = projection.position(1)
+  let projection_checkpoints =
+    postgres.projection_checkpoints(second_checkpoints)
+  let saved = process.new_subject()
+  let released = process.new_subject()
+  // The integration fixture gives the second pool exactly one connection.
+  // The checkpoint save must finish while that connection holds the lock.
+  let _ =
+    process.spawn(fn() {
+      let assert Ok(leader) = competing_acquire("standalone")
+      let release = process.new_subject()
+      assert projection_checkpoints.save("standalone", one) == Ok(Nil)
+      process.send(saved, release)
+      assert process.receive(release, 3000) == Ok(Nil)
+      leader.release()
+      process.send(released, Nil)
+    })
+  let assert Ok(release) = process.receive(saved, 3000)
+  assert acquire("standalone") == Error(runner.AlreadyLeading)
+  process.send(release, Nil)
+  assert process.receive(released, 3000) == Ok(Nil)
+  assert postgres.load_checkpoint(checkpoints, "standalone") == Ok(Some(1))
   check_legacy_projection(events, reopened, second_checkpoints)
   check_committed_delivery(first, events, reopened)
 
