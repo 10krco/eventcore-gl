@@ -332,14 +332,17 @@ pub fn check_distinct_names(first: pog.Connection, second: pog.Connection) {
   let primary = postgres.projection_backend(postgres.from_pool(first, codec))
   let secondary = postgres.projection_backend(postgres.from_pool(second, codec))
   let assert Ok(one) = primary.acquire("independent-one")
+  let assert Ok(two) = primary.acquire("independent-two")
+  // The two OIDs are the high and low halves of FNV-1a("independent-one").
   let assert Ok(owned) =
     pog.query(
-      "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted",
+      "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted
+       AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+       AND objsubid = 1 AND classid = 4027170674::oid AND objid = 2137831580::oid",
     )
     |> pog.returning(decode.at([0], decode.int))
     |> pog.execute(second)
   let assert [owner_pid] = owned.rows
-  let assert Ok(two) = primary.acquire("independent-two")
   assert secondary.acquire("independent-one") == Error(runner.AlreadyLeading)
   assert secondary.acquire("independent-two") == Error(runner.AlreadyLeading)
   let assert Ok(terminated) =
