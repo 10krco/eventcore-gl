@@ -169,6 +169,12 @@ reuse a held session from the same pool. The projection reader scans committed p
 ranges and returns decoded events through the legacy event codec.
 See [ADR 0014](docs/decisions/0014-postgres-legacy-projections.md).
 
+The PostgreSQL release backend uses UUID order with PostgreSQL LIKE or
+regex filtering. It uses the delivery migration for event identities and a
+separate UUID checkpoint migration for resume and reset. The same coordinator
+locks either legacy profile by name. See
+[ADR 0027](docs/decisions/0027-postgres-release-projection-cursors.md).
+
 Transactional PostgreSQL projections use a separate destination progress table.
 A named advisory lock binds each runner to an exact PostgreSQL session. Every
 attempt reloads the source and selection identity and the committed cursor.

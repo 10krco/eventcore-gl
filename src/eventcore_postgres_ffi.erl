@@ -1,6 +1,6 @@
 -module(eventcore_postgres_ffi).
 -include_lib("kernel/include/logger.hrl").
--export([trace_read/2, trace_append/2, stop_pool/1, acquire_projection/2, projection_connection/1, checkpoint_connection/2,
+-export([release_glob_regex/1, trace_read/2, trace_append/2, stop_pool/1, acquire_projection/2, projection_connection/1, checkpoint_connection/2,
          with_transactional_leader/3, transactional_command/2,
          transactional_scope/1, transactional_connection/1]).
 
@@ -265,3 +265,24 @@ advisory_query_no_parameter(Connection, Sql) ->
 discard_session(Pool, Key, Ref, Connection) ->
     save_held_sessions(Pool, lists:keydelete(Key, 1, held_sessions(Pool))),
     disconnect_session(Ref, Connection).
+
+release_glob_regex(Glob) ->
+    iolist_to_binary([<<"^">>, glob_regex(Glob), <<"$">>]).
+
+glob_regex(<<>>) -> [];
+glob_regex(<<$*, Rest/binary>>) -> [<<".*">> | glob_regex(Rest)];
+glob_regex(<<$?, Rest/binary>>) -> [<<".">> | glob_regex(Rest)];
+glob_regex(<<$[, Rest/binary>>) ->
+    case binary:split(Rest, <<"]">>) of
+        [<<$!, Class/binary>>, Tail] ->
+            [<<"[^">>, Class, <<"]">> | glob_regex(Tail)];
+        [Class, Tail] ->
+            [<<"[">>, Class, <<"]">> | glob_regex(Tail)];
+        [_] -> [<<"\\[">> | glob_regex(Rest)]
+    end;
+glob_regex(<<Character, Rest/binary>>) ->
+    Literal = case lists:member(Character, ".^$*+?()[]{}|\\") of
+        true -> <<$\\, Character>>;
+        false -> <<Character>>
+    end,
+    [Literal | glob_regex(Rest)].

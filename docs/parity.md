@@ -89,6 +89,12 @@ release-style legacy page limits, decode skips and checkpoint progress.
 A kind already set on the filter takes precedence. The [projection tests](../test/eventcore_projection_test.gleam)
 and [SQLite test](../test/eventcore_sqlite_test.gleam) exercise this behavior.
 
+For PostgreSQL legacy release order, run `postgres.migrate_delivery` and
+`postgres.migrate_release_checkpoints` before using
+`postgres.projection_release_backend`. The
+[two-pool test](../test/postgres_contract.gleam) verifies UUID ordering,
+native LIKE and regex matching, checkpoint resume, and isolated reset.
+
 The release's Rust macros and contract test macros are represented by typed
 Gleam functions, compiler rejection fixtures, and reusable runtime assertions.
 Storage formats and toolchains are native to their respective implementations.
