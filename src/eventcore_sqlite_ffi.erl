@@ -272,6 +272,7 @@ optional_filters(Options) ->
 create_tables(Connection, release_event_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_release_ids ("
         "position INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, milliseconds INTEGER NOT NULL)"),
+    ok = upgrade_release_ids(Connection),
     % Reserve 42 position bits for key order within a millisecond.
     Clock = "max(CAST(round(unixepoch('subsec') * 1000) AS INTEGER), "
         "COALESCE((SELECT milliseconds FROM eventcore_release_ids ORDER BY uuid DESC LIMIT 1), 0)) "
@@ -303,6 +304,25 @@ create_tables(Connection, checkpoint_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_checkpoints ("
         "name TEXT PRIMARY KEY NOT NULL, position INTEGER NOT NULL CHECK(position >= 0))"),
     {ok, nil}.
+
+upgrade_release_ids(Connection) ->
+    Columns = sqlite:query(Connection, "SELECT name FROM pragma_table_info('eventcore_release_ids')"),
+    case lists:member({<<"milliseconds">>}, Columns) of
+        true -> ok;
+        false ->
+            [] = sqlite:query(Connection, "DROP TRIGGER IF EXISTS eventcore_assign_release_id"),
+            [] = sqlite:query(Connection, "ALTER TABLE eventcore_release_ids "
+                "ADD COLUMN milliseconds INTEGER NOT NULL DEFAULT 0"),
+            % SQLite casts dynamic hex strings to zero. Decode the timestamp's
+            % twelve nibbles directly while leaving the indexed UUID intact.
+            Timestamp = ["(", lists:join(" + ", [
+                io_lib:format("((instr('0123456789abcdef', lower(substr(uuid, ~B, 1))) - 1) << ~B)",
+                    [Offset, Shift])
+                || {Offset, Shift} <- lists:zip(lists:seq(1, 8) ++ lists:seq(10, 13),
+                    lists:seq(44, 0, -4))
+            ]), ")"],
+            write_query(Connection, ["UPDATE eventcore_release_ids SET milliseconds = ", Timestamp], [])
+    end.
 
 release_uuid(Clock, Position) ->
     ["substr(printf('%012x', ", Clock, "), 1, 8) || '-' || "
