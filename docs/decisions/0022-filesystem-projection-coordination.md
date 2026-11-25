@@ -21,10 +21,13 @@ lock through the existing flock port, monitors the holder, and also monitors
 the journal for journal-backed leases. Journal-backed coordination requires a
 local journal handle. The runner checks the lock before processing or saving
 progress and returns a leadership error when the port or journal dies.
-A separate per-name OS lock serializes checkpoint writes across leadership
-changes. The writer rechecks its lease while holding that lock. Release
-waits for the worker to exit.
-Lock files stay in place so all contenders use the same inode.
+Filesystem checkpoints offer a fenced save. The process holding a separate
+per-name OS lock performs the atomic rename after the runner rechecks its
+lease. A replacement waits for the rename or for the process to exit. If
+that process dies before the rename, the former holder cannot publish its
+prepared file. Use one coordinator root for all runners sharing a checkpoint.
+Release waits for the worker to exit. Lock files stay in place so all
+contenders use the same inode.
 
 ## Consequences
 
@@ -34,4 +37,6 @@ names can advance in parallel, and holder exit releases its lease.
 
 Existing coordinators can still construct `Lease(release)`. Lease consumers
 can call `lease.release()` with either variant. Exhaustive matches on
-`Lease` must also cover `CheckedLease`.
+`Lease` must also cover `CheckedLease`. Consumers can read `checkpoints.load`
+and `checkpoints.save` across both checkpoint variants. Exhaustive matches on
+`Checkpoints` must also cover `FencedCheckpoints`.

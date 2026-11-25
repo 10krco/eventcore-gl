@@ -21,8 +21,7 @@ pub type Lease {
   CheckedLease(
     release: fn() -> Nil,
     check: fn() -> Result(Nil, LeadershipError),
-    checkpoint: fn(fn() -> Result(Nil, StoreError)) ->
-      Result(Result(Nil, StoreError), LeadershipError),
+    fence: projection.CheckpointFence,
   )
 }
 
@@ -31,17 +30,6 @@ pub fn check_lease(lease: Lease) -> Result(Nil, LeadershipError) {
   case lease {
     Lease(_) -> Ok(Nil)
     CheckedLease(check:, ..) -> check()
-  }
-}
-
-/// Run a checkpoint write under the backend's lease fence.
-pub fn checkpoint_with_lease(
-  lease: Lease,
-  write: fn() -> Result(Nil, StoreError),
-) -> Result(Result(Nil, StoreError), LeadershipError) {
-  case lease {
-    Lease(_) -> Ok(write())
-    CheckedLease(checkpoint:, ..) -> checkpoint(write)
   }
 }
 
@@ -332,15 +320,22 @@ fn save(
   run: Run(payload, state, error),
   position: Position,
 ) -> Result(Nil, RunError(error)) {
-  use saved <- result.try(
-    checkpoint_with_lease(run.lease, fn() {
-      run.backend.checkpoints.save(run.projector.name, position)
-    })
-    |> result.map_error(Leadership),
-  )
+  let name = run.projector.name
+  let saved = case run.backend.checkpoints, run.lease {
+    projection.FencedCheckpoints(save_fenced:, ..), CheckedLease(fence:, ..) ->
+      save_fenced(name, position, fence)
+    checkpoints, lease ->
+      case check_lease(lease) {
+        Ok(Nil) ->
+          checkpoints.save(name, position)
+          |> result.map_error(projection.WriteFailed)
+        Error(_) -> Error(projection.LeaseLost)
+      }
+  }
   case saved {
     Ok(Nil) -> Ok(Nil)
-    Error(_) -> {
+    Error(projection.LeaseLost) -> Error(Leadership(CoordinatorUnavailable))
+    Error(projection.WriteFailed(_)) -> {
       log(
         run.projector.name,
         "checkpoint_save_failed",

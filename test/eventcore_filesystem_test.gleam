@@ -896,7 +896,22 @@ pub fn projection_resumes_after_import_with_stable_local_positions_test() {
   lease.release()
   let assert Ok(lease) = backend.acquire("notes")
   lease.release()
-  assert backend.checkpoints.save("notes", two) == Ok(Nil)
+  let projector =
+    projection_runner.Projector(
+      name: "notes",
+      filter: projection.all(),
+      initial: [],
+      apply: fn(events, delivery) { #([delivery.event, ..events], Ok(Nil)) },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      backend,
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Ok([local_last, local_first])
+  assert backend.checkpoints.load("notes") == Ok(Some(two))
   assert filesystem.close(journal) == Ok(Nil)
 
   copy_transactions(other, local)
@@ -1135,20 +1150,35 @@ pub fn stale_filesystem_holder_cannot_overwrite_replacement_checkpoint_test() {
   let name = "checkpoint-fence"
   let assert Ok(first) = projection.position(1)
   let assert Ok(second) = projection.position(2)
-  let assert Ok(old) = coordinate(name)
-  assert projection_runner.check_lease(old) == Ok(Nil)
-  kill_projection_lock()
-  let replacement = await_lease(coordinate, name)
-  assert projection_runner.checkpoint_with_lease(replacement, fn() {
-      checkpoints.save(name, second)
-    })
-    == Ok(Ok(Nil))
-  assert projection_runner.checkpoint_with_lease(old, fn() {
-      checkpoints.save(name, first)
-    })
-    == Error(projection_runner.CoordinatorUnavailable)
+  let assert projection.FencedCheckpoints(save_fenced:, ..) = checkpoints
+  exercise_checkpoint_handoff(
+    coordinate,
+    name,
+    save_fenced,
+    first,
+    second,
+    False,
+  )
   assert checkpoints.load(name) == Ok(Some(second))
-  old.release()
-  replacement.release()
+  exercise_checkpoint_handoff(
+    coordinate,
+    name,
+    save_fenced,
+    second,
+    first,
+    True,
+  )
+  assert checkpoints.load(name) == Ok(Some(first))
   remove_root(root)
 }
+
+@external(erlang, "eventcore_filesystem_test_ffi", "exercise_checkpoint_handoff")
+fn exercise_checkpoint_handoff(
+  coordinate: projection_runner.Coordinator,
+  name: String,
+  save: fn(String, projection.Position, projection.CheckpointFence) ->
+    Result(Nil, projection.CheckpointWriteError),
+  old: projection.Position,
+  new: projection.Position,
+  kill_fence: Bool,
+) -> Nil

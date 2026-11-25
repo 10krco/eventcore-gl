@@ -1,7 +1,7 @@
 -module(eventcore_filesystem_test_ffi).
 -export([temp_root/0, remove_root/1, transaction_paths/1, tamper/1, remove/1,
          copy_transactions/2, copy_replica/2, downgrade_transaction/1, add_malformed_transaction/2,
-         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2, await_lease/2, kill_projection_lock/0]).
+         open_with_failed_ancestor_sync/2, is_directory/1, check_os_lock/2, check_holder_exit/2, await_lease/2, kill_projection_lock/0, exercise_checkpoint_handoff/6]).
 
 temp_root() ->
     Random = binary:encode_hex(crypto:strong_rand_bytes(16), lowercase),
@@ -136,6 +136,9 @@ kill_projection_lock() ->
         [Port || Port <- Links, is_port(Port)]
     end, Workers),
     [Port] = Ports,
+    kill_port(Port).
+
+kill_port(Port) ->
     {os_pid, Pid} = erlang:port_info(Port, os_pid),
     Monitor = monitor(port, Port),
     Executable = os:find_executable("kill"),
@@ -147,3 +150,68 @@ kill_projection_lock() ->
     receive {'DOWN', Monitor, port, Port, _} -> nil
     after 2000 -> error(lock_port_still_alive)
     end.
+
+exercise_checkpoint_handoff(Acquire, Name, Save, OldPosition, NewPosition, KillFence) ->
+    Parent = self(),
+    Ref = make_ref(),
+    {Old, OldMonitor} = spawn_monitor(fun() ->
+        {ok, {checked_lease, Release, _, {Name, Lock, Check}}} = Acquire(Name),
+        Pause = fun() ->
+            {ok, nil} = Check(),
+            {links, Links} = process_info(self(), links),
+            [Port] = [Link || Link <- Links, is_port(Link)],
+            kill_projection_lock(),
+            Parent ! {Ref, old_paused, Port},
+            receive {Ref, resume} -> {ok, nil}
+            after 3000 -> error(old_resume_timeout)
+            end
+        end,
+        Result = Save(Name, OldPosition, {Name, Lock, Pause}),
+        Release(),
+        Parent ! {Ref, old_result, Result}
+    end),
+    Fence = receive {Ref, old_paused, Port} -> Port
+    after 4000 -> error(old_pause_timeout)
+    end,
+    {New, NewMonitor} = spawn_monitor(fun() ->
+        {checked_lease, Release, _, {Name, Lock, Check}} = await_lease(Acquire, Name),
+        Probe = fun() ->
+            Parent ! {Ref, new_checked},
+            Check()
+        end,
+        Parent ! {Ref, new_start},
+        Result = Save(Name, NewPosition, {Name, Lock, Probe}),
+        Release(),
+        Parent ! {Ref, new_result, Result}
+    end),
+    receive {Ref, new_start} -> ok after 3000 -> error(new_start_timeout) end,
+    receive {Ref, new_checked} -> error(replacement_entered_paused_fence)
+    after 100 -> ok
+    end,
+    ExpectedOld = case KillFence of
+        true ->
+            kill_port(Fence),
+            receive {Ref, new_result, {ok, nil}} -> ok
+            after 3000 -> error(replacement_blocked_after_fence_loss)
+            end,
+            {error, lease_lost};
+        false -> {ok, nil}
+    end,
+    Old ! {Ref, resume},
+    receive {Ref, old_result, ExpectedOld} -> ok
+    after 3000 -> error(old_result_timeout)
+    end,
+    case KillFence of
+        true -> ok;
+        false ->
+            receive {Ref, new_result, {ok, nil}} -> ok
+            after 3000 -> error(new_result_timeout)
+            end
+    end,
+    receive {'DOWN', OldMonitor, process, Old, normal} -> ok
+    after 3000 -> error(old_holder_timeout)
+    end,
+    receive {'DOWN', NewMonitor, process, New, normal} -> ok
+    after 3000 -> error(new_holder_timeout)
+    end,
+    receive {Ref, new_checked} -> nil after 0 -> error(new_check_missing) end.

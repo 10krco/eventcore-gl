@@ -63,10 +63,24 @@ pub type PageResult(payload) {
 pub type Reader(payload) =
   fn(Filter, Page) -> Result(PageResult(payload), StoreError)
 
+/// The filesystem adapter owns this capability and validates it at commit.
+pub type CheckpointFence
+
+pub type CheckpointWriteError {
+  LeaseLost
+  WriteFailed(StoreError)
+}
+
 pub type Checkpoints {
   Checkpoints(
     load: fn(String) -> Result(Option(Position), StoreError),
     save: fn(String, Position) -> Result(Nil, StoreError),
+  )
+  FencedCheckpoints(
+    load: fn(String) -> Result(Option(Position), StoreError),
+    save: fn(String, Position) -> Result(Nil, StoreError),
+    save_fenced: fn(String, Position, CheckpointFence) ->
+      Result(Nil, CheckpointWriteError),
   )
 }
 

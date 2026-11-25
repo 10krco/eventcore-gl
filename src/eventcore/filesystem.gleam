@@ -317,9 +317,12 @@ pub fn projection_reader(
 pub fn projection_checkpoints(
   filesystem: Filesystem(payload),
 ) -> projection.Checkpoints {
-  projection.Checkpoints(
+  projection.FencedCheckpoints(
     projection_load(filesystem.server, _),
     fn(name, position) { projection_save(filesystem.server, name, position) },
+    fn(name, position, fence) {
+      projection_fenced_save(filesystem.server, name, position, fence)
+    },
   )
 }
 
@@ -331,10 +334,19 @@ pub fn open_projection_checkpoints(
     config.root,
     config.sync,
   ))
-  projection.Checkpoints(
+  projection.FencedCheckpoints(
     standalone_projection_load(directory, _),
     fn(name, position) {
       standalone_projection_save(directory, config.sync, name, position)
+    },
+    fn(name, position, fence) {
+      standalone_projection_fenced_save(
+        directory,
+        config.sync,
+        name,
+        position,
+        fence,
+      )
     },
   )
 }
@@ -539,3 +551,20 @@ fn standalone_projection_acquire(
   directory: String,
   name: String,
 ) -> Result(projection_runner.Lease, projection_runner.LeadershipError)
+
+@external(erlang, "eventcore_filesystem_ffi", "projection_fenced_save")
+fn projection_fenced_save(
+  server: Server,
+  name: String,
+  position: projection.Position,
+  fence: projection.CheckpointFence,
+) -> Result(Nil, projection.CheckpointWriteError)
+
+@external(erlang, "eventcore_filesystem_ffi", "standalone_projection_fenced_save")
+fn standalone_projection_fenced_save(
+  directory: String,
+  sync: Sync,
+  name: String,
+  position: projection.Position,
+  fence: projection.CheckpointFence,
+) -> Result(Nil, projection.CheckpointWriteError)
