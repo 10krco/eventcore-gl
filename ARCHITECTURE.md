@@ -128,3 +128,12 @@ database. Named checkpoint operations use the lock-owning session. Reads can
 reuse a held session from the same pool. The projection reader scans committed positions in bounded
 ranges and returns decoded events through the legacy event codec.
 See [ADR 0014](docs/decisions/0014-postgres-legacy-projections.md).
+
+Transactional PostgreSQL projections use a separate destination progress table.
+A named advisory lock binds each runner to an exact PostgreSQL session. Every
+attempt reloads the source and selection identity and the committed cursor.
+Projector writes and cursor advancement commit together on that session.
+Retry and skip follow rollback, and after-commit work runs after acknowledgement.
+Reset uses the same lock and commits destination cleanup with cursor deletion.
+Reset-and-replay holds leadership while it moves from cleanup to replay.
+See [ADR 0015](docs/decisions/0015-postgres-transactional-projections.md).

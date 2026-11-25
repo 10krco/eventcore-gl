@@ -1,9 +1,17 @@
+import eventcore/internal/postgres_projection_progress as progress
+import eventcore/internal/postgres_projection_session as session
 import eventcore/postgres
+import eventcore/projection
+import eventcore/projection_delivery as delivery
+import eventcore/projection_runner
 import eventcore/store
 import gleam/erlang/process.{type Pid}
+import gleam/option.{None, Some}
 import gleam/otp/actor
+import gleam/result
 import pog
 import postgres_contract
+import postgres_transactional_contract
 
 pub fn postgres_two_pool_contract_test() {
   use socket <- with_database()
@@ -60,3 +68,45 @@ fn using_pool(pid: Pid, work: fn() -> Nil) -> Nil
 
 @external(erlang, "eventcore_postgres_test_ffi", "check_operations")
 fn check_operations(work: fn() -> Nil) -> Nil
+
+pub fn postgres_transactional_progress_contract_test() {
+  use socket <- with_database()
+  use first <- with_pool(socket, "eventcore_progress_first", 1)
+  use second <- with_pool(socket, "eventcore_progress_second", 1)
+  assert progress.migrate(first) == Ok(Nil)
+  assert progress.migrate(second) == Ok(Nil)
+  let assert Ok(name) = delivery.projector_name("transactional-progress")
+  let assert Ok(source) = delivery.source_id("events")
+  let assert Ok(selection) = delivery.selection_id("selected")
+  let assert Ok(position) = projection.position(1)
+  let candidate = progress.Progress(source, selection, position)
+  assert progress.load(second, name) == Ok(None)
+  assert session.with_leader(first, name, fn(leader) {
+      assert session.with_leader(second, name, fn(_) { Ok(Nil) })
+        == Error(session.AcquisitionFailed(projection_runner.AlreadyLeading))
+      let assert Ok(transaction) = session.begin(leader)
+      assert progress.advance(transaction, name, candidate) == Ok(Nil)
+      assert session.rollback(leader) == Ok(Nil)
+      assert progress.load(second, name) == Ok(None)
+      let assert Ok(transaction) = session.begin(leader)
+      assert progress.advance(transaction, name, candidate) == Ok(Nil)
+      assert session.commit(leader) == Ok(Nil)
+      Ok(Nil)
+    })
+    == Ok(Ok(Nil))
+  assert progress.load(second, name) == Ok(Some(candidate))
+  assert pog.transaction(second, fn(tx) {
+      use observed <- result.try(progress.lock(tx, name))
+      progress.delete(tx, name, observed)
+    })
+    == Ok(Nil)
+  assert progress.load(first, name) == Ok(None)
+  Nil
+}
+
+pub fn postgres_transactional_projection_contract_test() {
+  use socket <- with_database()
+  use first <- with_pool(socket, "eventcore_transactional_first", 1)
+  use second <- with_pool(socket, "eventcore_transactional_second", 1)
+  postgres_transactional_contract.check(first, second)
+}
