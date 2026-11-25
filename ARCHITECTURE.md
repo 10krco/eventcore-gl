@@ -109,3 +109,9 @@ an unavailable event.
 Named checkpoints use atomic local files, and the store process owns the
 named leases on its BEAM node. See
 [ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md).
+
+SQLite projection reads scan committed insertion positions in bounded ranges.
+Each page captures an upper position before scanning. A projector can use
+the event database for its progress or a separate checkpoint database.
+Views that share a checkpoint handle also share its named leases.
+See [ADR 0012](docs/decisions/0012-sqlite-projection-replay.md).

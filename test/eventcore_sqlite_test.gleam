@@ -1,8 +1,12 @@
+import eventcore/projection
+import eventcore/projection_runner
 import eventcore/snapshot
 import eventcore/sqlite
 import eventcore/store
 import eventcore/stream
+import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import store_contract
 
 fn binary_codec() -> sqlite.Codec(BitArray) {
@@ -258,5 +262,120 @@ pub fn command_snapshot_reopens_and_prevents_regression_test() {
   assert snapshots.load(name) == Ok(Some(newest))
   assert sqlite.close(other) == Ok(Nil)
   assert sqlite.close(db) == Ok(Nil)
+  assert delete_database(path) == Nil
+}
+
+pub fn projection_pages_resume_from_a_separate_sqlite_checkpoint_test() {
+  let path = temp_database()
+  let checkpoint_path = temp_database()
+  let codec = integer_codec()
+  let assert Ok(db) = sqlite.open(path, codec)
+  let assert Ok(checkpoints) = sqlite.open_checkpoints(checkpoint_path, None)
+  assert sqlite.migrate(db) == Ok(Nil)
+  assert sqlite.migrate_checkpoints(checkpoints) == Ok(Nil)
+  let assert Ok(id) = stream.id("notes/a")
+  let first = store.Event(id, "note", 1)
+  let last = store.Event(id, "note", 132)
+  let entries = [
+    first,
+    ..list.append(list.repeat(store.Event(id, "ignored", 0), 130), [last])
+  ]
+  let assert Ok(writes) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(writes) = list.try_fold(entries, writes, store.append)
+  assert sqlite.as_store(db).append_events(writes) == Ok(Nil)
+  let backend = sqlite.projection_backend_with_checkpoints(db, checkpoints)
+  let assert Ok(lease) = backend.acquire("notes")
+  let other_view = sqlite.projection_backend_with_checkpoints(db, checkpoints)
+  assert other_view.acquire("notes") == Error(projection_runner.AlreadyLeading)
+  lease.release()
+  let assert Ok(prefix) = projection.prefix("notes/")
+  let selection = projection.with_event_type(prefix, "note")
+  let assert Ok(page) = projection.page(None, 1)
+  let assert Ok(one) = projection.position(1)
+  let assert Ok(final) = projection.position(132)
+  assert backend.reader(selection, page)
+    == Ok(projection.PageResult(
+      [
+        projection.Delivery(first, one),
+      ],
+      Some(one),
+    ))
+  assert backend.checkpoints.save("notes", one) == Ok(Nil)
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+  assert sqlite.close(db) == Ok(Nil)
+
+  let assert Ok(db) = sqlite.open(path, codec)
+  let assert Ok(checkpoints) = sqlite.open_checkpoints(checkpoint_path, None)
+  let backend = sqlite.projection_backend_with_checkpoints(db, checkpoints)
+  assert backend.checkpoints.load("notes") == Ok(Some(one))
+  let assert Ok(page) = projection.page(Some(one), 2)
+  assert backend.reader(selection, page)
+    == Ok(projection.PageResult(
+      [
+        projection.Delivery(last, final),
+      ],
+      Some(final),
+    ))
+  assert sqlite.reset_checkpoint(checkpoints, "notes") == Ok(Nil)
+  assert backend.checkpoints.load("notes") == Ok(None)
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+  assert sqlite.close(db) == Ok(Nil)
+  assert delete_database(path) == Nil
+  assert delete_database(checkpoint_path) == Nil
+}
+
+pub fn sqlite_projection_frontier_excludes_concurrent_commits_until_next_page_test() {
+  let path = temp_database()
+  let codec = integer_codec()
+  let assert Ok(writer) = sqlite.open(path, codec)
+  assert sqlite.migrate(writer) == Ok(Nil)
+  let assert Ok(id) = stream.id("notes")
+  let first = store.Event(id, "note", 1)
+  let second = store.Event(id, "note", 2)
+  let assert Ok(initial) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(initial) = store.append(initial, first)
+  assert sqlite.as_store(writer).append_events(initial) == Ok(Nil)
+  let assert Ok(next) =
+    store.register(
+      store.writes(),
+      id,
+      stream.next_version(stream.initial_version),
+    )
+  let assert Ok(next) = store.append(next, second)
+  let reader_codec =
+    sqlite.Codec(codec.encode, fn(kind, bytes) {
+      use value <- result.try(codec.decode(kind, bytes))
+      case value {
+        1 -> {
+          let assert Ok(Nil) = sqlite.as_store(writer).append_events(next)
+          Ok(value)
+        }
+        _ -> Ok(value)
+      }
+    })
+  let assert Ok(db) = sqlite.open(path, reader_codec)
+  let reader = sqlite.projection_reader(db)
+  let assert Ok(page) = projection.page(None, 3)
+  let assert Ok(one) = projection.position(1)
+  assert reader(projection.all(), page)
+    == Ok(projection.PageResult(
+      [
+        projection.Delivery(first, one),
+      ],
+      Some(one),
+    ))
+  let assert Ok(page) = projection.page(Some(one), 3)
+  let assert Ok(two) = projection.position(2)
+  assert reader(projection.all(), page)
+    == Ok(projection.PageResult(
+      [
+        projection.Delivery(second, two),
+      ],
+      Some(two),
+    ))
+  assert sqlite.close(db) == Ok(Nil)
+  assert sqlite.close(writer) == Ok(Nil)
   assert delete_database(path) == Nil
 }
