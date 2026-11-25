@@ -13,8 +13,9 @@ Allocate UUIDv7 values through a database-local clock row in the append
 transaction. Keep the timestamp at or above the last allocated millisecond and
 advance the 42-bit sequence when multiple events share it. If the sequence
 wraps, advance the logical timestamp. Retain the RFC variant and random low
-bits. Initialize the clock from the newest persisted UUIDv7 timestamp and
-backfill missing values in committed position order.
+bits. Initialize the clock
+once from the greatest indexed UUID, including legacy v4 identities. Backfill
+missing values in committed position order.
 
 ## Consequences
 

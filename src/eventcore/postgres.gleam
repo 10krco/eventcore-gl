@@ -146,6 +146,25 @@ RETURNS uuid LANGUAGE sql VOLATILE AS $body$
   )::uuid
 $body$"
 
+// UUID ordering compares the timestamp, version, then sequence. A v4 ID
+// therefore precedes every v7 ID with the same 48-bit prefix.
+const seed_event_id_sql =
+  "DO $body$ DECLARE latest text; BEGIN
+  IF NOT EXISTS (SELECT 1 FROM eventcore_uuid_clock WHERE singleton) THEN
+    SELECT replace(event_id::text, '-', '') INTO latest
+    FROM eventcore_events WHERE event_id IS NOT NULL
+    ORDER BY event_id DESC LIMIT 1;
+    INSERT INTO eventcore_uuid_clock(singleton, milliseconds, sequence)
+    VALUES (true,
+      COALESCE(('x' || left(latest, 12))::bit(48)::bigint, 0)
+        + CASE WHEN substr(latest, 13, 1) > '7' THEN 1 ELSE 0 END,
+      CASE WHEN substr(latest, 13, 1) = '7' THEN
+        ((('x' || substr(latest, 14, 3))::bit(12)::bigint) << 30)
+          | ((('x' || substr(latest, 17, 8))::bit(32)::bigint) & 1073741823)
+        ELSE -1 END);
+  END IF;
+END $body$"
+
 /// Adds persisted event identities to the existing committed event sequence.
 /// Reapplying the migration retains existing IDs and the UUID clock.
 pub fn migrate_delivery(
@@ -157,13 +176,10 @@ pub fn migrate_delivery(
       ADD COLUMN IF NOT EXISTS metadata json NOT NULL DEFAULT '{}'::json",
     "CREATE TABLE IF NOT EXISTS eventcore_uuid_clock (
       singleton boolean PRIMARY KEY CHECK (singleton),
-      milliseconds bigint NOT NULL,
+      milliseconds bigint NOT NULL CHECK (milliseconds BETWEEN 0 AND 281474976710655),
       sequence bigint NOT NULL)",
-    "INSERT INTO eventcore_uuid_clock(singleton, milliseconds, sequence)
-      SELECT true, COALESCE(MAX(('x' || left(replace(event_id::text, '-', ''), 12))
-        ::bit(48)::bigint), 0), 4398046511103 FROM eventcore_events
-      WHERE substr(event_id::text, 15, 1) = '7'
-      ON CONFLICT (singleton) DO NOTHING",
+    "CREATE UNIQUE INDEX IF NOT EXISTS eventcore_events_event_id ON eventcore_events(event_id)",
+    seed_event_id_sql,
     next_event_id_sql,
     "DO $body$ DECLARE event_position bigint; BEGIN
       FOR event_position IN SELECT position FROM eventcore_events
@@ -176,7 +192,6 @@ pub fn migrate_delivery(
     "ALTER TABLE eventcore_events
       ALTER COLUMN event_id SET NOT NULL,
       ALTER COLUMN event_id SET DEFAULT eventcore_next_event_id()",
-    "CREATE UNIQUE INDEX IF NOT EXISTS eventcore_events_event_id ON eventcore_events(event_id)",
   ])
 }
 
