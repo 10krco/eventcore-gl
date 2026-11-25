@@ -20,6 +20,7 @@ start(Source) ->
 stop(Server) -> call(Server, stop, {error, nil}).
 migrate(Server, Mode) -> call(Server, {migrate, Mode}, {error, migration_failed}).
 read(Server, Stream, After) -> call(Server, {read, Stream, After}, {error, nil}).
+append(_Server, _Expected, []) -> {ok, nil};
 append(Server, Expected, Events) ->
     call(Server, {append, Expected, Events}, {error, {store_failure, append_events}}).
 load_snapshot(Server, Name) ->
