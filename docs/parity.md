@@ -98,3 +98,11 @@ native LIKE and regex matching, checkpoint resume, and isolated reset.
 The release's Rust macros and contract test macros are represented by typed
 Gleam functions, compiler rejection fixtures, and reusable runtime assertions.
 Storage formats and toolchains are native to their respective implementations.
+
+
+For SQLite legacy release order, run `sqlite.migrate_release_delivery`
+and `sqlite.migrate_release_checkpoints` before using
+`sqlite.projection_release_backend`. The
+[SQLite release test](../test/eventcore_sqlite_test.gleam) covers native
+LIKE and GLOB matching, catch-up across the migration, checkpoint reopen
+and isolated reset.
