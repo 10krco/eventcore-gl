@@ -168,3 +168,14 @@ record current and previous value dependencies alongside their executable
 transformations. The checker walks each required field in stable order,
 checks producers and temporal seeds, and reports accepted assumptions
 explicitly. See [ADR 0019](docs/decisions/0019-model-provenance-checker.md).
+
+## Backend contract testing
+
+Reusable assertion groups in `eventcore/testing/adapter_contract` exercise
+storage, snapshots, filtered replay, checkpoints, leadership, and strict
+delivery. Each adapter supplies the interfaces it supports from a fresh
+fixture. Transactional projector checks in
+`eventcore/testing/transactional_contract` drive the public runner through
+application effects and independent progress observations. The integration
+fixture owns SQL setup and backend fault injection.
+See [ADR 0020](docs/decisions/0020-reusable-contracts.md).
