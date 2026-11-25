@@ -1,0 +1,19 @@
+import eventcore/model
+import eventcore/stream
+
+type Debit {
+  Debit
+}
+
+type Credit {
+  Credit
+}
+
+fn debit_id(id: model.StreamIdentity(Debit)) -> stream.Id {
+  model.stream_id(id)
+}
+
+pub fn swapped_stream() {
+  let assert Ok(id) = stream.id("account")
+  debit_id(model.stream_identity(Credit, id))
+}

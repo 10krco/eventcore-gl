@@ -1,0 +1,15 @@
+import eventcore/model
+
+type Event {
+  Event
+}
+
+type Amount {
+  Amount
+}
+
+pub fn wrong_transform() {
+  let event = model.event("Deposit", Event)
+  let field = model.field(event, "amount", Amount, fn(n: Int) { n })
+  model.try_mapping("wrong", model.source(field), field, fn(_) { Ok("five") })
+}

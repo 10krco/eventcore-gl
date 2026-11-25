@@ -1,0 +1,24 @@
+import eventcore/model
+import eventcore/stream
+import model_transfer_example.{type Transfer, AmountField, SourceField, Transfer, TransferComponent, build_transfer, debit}
+
+type ExampleInput { ExampleInput }
+
+pub fn missing_field() {
+  let transfer = model.command("Transfer", TransferComponent)
+  let source = model.field(transfer, "source", SourceField, fn(t: Transfer) { t.source })
+  let amount = model.field(transfer, "amount", AmountField, fn(t: Transfer) { t.amount })
+  let assert Ok(id) = stream.id("from")
+  let input = model.input("ExampleInput", ExampleInput)
+  let incoming = model.build(input, Transfer(debit(id), model_transfer_example.credit(id), 4))
+  let source_value = model.origin(input, "source", SourceField, fn(t: Transfer) { t.source })
+  let amount_value = model.origin(input, "amount", AmountField, fn(t: Transfer) { t.amount })
+  let mapped_source = model.mapping("source", model.source(model.origin_field(source_value)), source, fn(value) { value })
+  let mapped_amount = model.mapping("amount", model.source(model.origin_field(amount_value)), amount, fn(value) { value })
+
+  build_transfer(
+    component: transfer,
+    source: model.apply(mapped_source, incoming),
+    amount: model.apply(mapped_amount, incoming),
+  )
+}

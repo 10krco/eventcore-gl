@@ -1,0 +1,212 @@
+import eventcore/model
+import eventcore/stream
+import gleam/option.{type Option, None}
+import gleam/string
+import model_transfer_example.{
+  type CreditWitness, type DebitWitness, type Transfer, AmountField,
+  DestinationField, SourceField, Transfer, TransferComponent, build_transfer,
+  credit, debit,
+}
+
+type MemoField {
+  MemoField
+}
+
+type Request {
+  Request(
+    source: model.StreamIdentity(DebitWitness),
+    target: model.StreamIdentity(CreditWitness),
+    amount: Int,
+  )
+}
+
+type Ledger {
+  Ledger(total: Int, memo: Option(String))
+}
+
+pub fn typed_transfer_construction_and_fallible_mapping_test() {
+  let request = model.input("Request", RequestComponent)
+  let transfer = model.command("Transfer", TransferComponent)
+  let source =
+    model.origin(request, "source", SourceField, fn(r: Request) { r.source })
+  let target =
+    model.origin(request, "target", DestinationField, fn(r: Request) {
+      r.target
+    })
+  let amount =
+    model.origin(request, "amount", AmountField, fn(r: Request) { r.amount })
+  let to_source =
+    model.field(transfer, "source", SourceField, fn(t: Transfer) { t.source })
+  let to_target =
+    model.field(transfer, "target", DestinationField, fn(t: Transfer) {
+      t.target
+    })
+  let to_amount =
+    model.field(transfer, "amount", AmountField, fn(t: Transfer) { t.amount })
+
+  // Keep role witnesses with their domain constructor.
+  let assert Ok(from_id) = stream.id("from")
+  let assert Ok(to_id) = stream.id("to")
+  let from = debit(from_id)
+  let to = credit(to_id)
+  let request_value =
+    model.build(
+      request,
+      Request(
+        model.supply(source, from) |> model.field_value,
+        model.supply(target, to) |> model.field_value,
+        model.supply(amount, 4) |> model.field_value,
+      ),
+    )
+
+  let map_source =
+    model.mapping(
+      "source",
+      model.source(model.origin_field(source)),
+      to_source,
+      fn(id) { id },
+    )
+  let map_target =
+    model.mapping(
+      "target",
+      model.source(model.origin_field(target)),
+      to_target,
+      fn(id) { id },
+    )
+  let map_amount =
+    model.try_mapping(
+      "amount",
+      model.source(model.origin_field(amount)),
+      to_amount,
+      fn(n) {
+        case n > 0 {
+          True -> Ok(n)
+          False -> Error("invalid amount")
+        }
+      },
+    )
+  let moved_source = model.apply(map_source, request_value)
+  let moved_target = model.apply(map_target, request_value)
+  let assert Ok(moved_amount) = model.apply(map_amount, request_value)
+  let transferred =
+    build_transfer(
+      component: transfer,
+      source: moved_source,
+      target: moved_target,
+      amount: moved_amount,
+    )
+  assert model.value(transferred) == Transfer(from, to, 4)
+  assert model.stream_id(model.value(transferred).source) == from_id
+  assert model.apply(map_amount, model.build(request, Request(from, to, 0)))
+    == Error("invalid amount")
+}
+
+pub fn state_recipes_build_empty_state_test() {
+  let ledger = model.state("Ledger", LedgerComponent)
+  let total =
+    model.field(ledger, "total", AmountField, fn(l: Ledger) { l.total })
+  let memo = model.field(ledger, "memo", MemoField, fn(l: Ledger) { l.memo })
+  let built =
+    model.build(
+      ledger,
+      Ledger(
+        model.default(total, fn() { 0 }) |> model.field_value,
+        model.absence(memo) |> model.field_value,
+      ),
+    )
+  assert model.value(built) == Ledger(0, None)
+}
+
+type Rate {
+  Rate(percent: Int)
+}
+
+pub fn mapping_combines_fields_from_distinct_components_test() {
+  let transfer = model.command("Transfer", TransferComponent)
+  let pricing = model.input("Rate", RateComponent)
+  let amount =
+    model.field(transfer, "amount", AmountField, fn(t: Transfer) { t.amount })
+  let rate =
+    model.origin(pricing, "percent", AmountField, fn(r: Rate) { r.percent })
+  let effect = model.effect("Fee", FeeComponent)
+  let fee = model.field(effect, "amount", AmountField, fn(n: Int) { n })
+
+  let calculator =
+    model.mapping(
+      "fee",
+      model.paired_sources(
+        model.source(amount),
+        model.source(model.origin_field(rate)),
+      ),
+      fee,
+      fn(values) { values.0 * values.1 / 100 },
+    )
+  let assert Ok(from) = stream.id("from")
+  let assert Ok(to) = stream.id("to")
+  let input = #(
+    model.build(transfer, Transfer(debit(from), credit(to), 120)),
+    model.build(pricing, Rate(5)),
+  )
+
+  assert model.apply(calculator, input) |> model.field_value == 6
+  assert model.mapping_fields(calculator)
+    == #(
+      "fee",
+      [
+        model.FieldId(model.CommandRole, "Transfer", "amount"),
+        model.FieldId(model.InputRole, "Rate", "percent"),
+      ],
+      model.FieldId(model.EffectRole, "Fee", "amount"),
+    )
+}
+
+type RequestComponent {
+  RequestComponent
+}
+
+type LedgerComponent {
+  LedgerComponent
+}
+
+type RateComponent {
+  RateComponent
+}
+
+type FeeComponent {
+  FeeComponent
+}
+
+pub fn field_ids_preserve_component_and_field_boundaries_test() {
+  let first = model.command("A.B", TransferComponent)
+  let second = model.command("A", LedgerComponent)
+  let first_field =
+    model.field(first, "c", AmountField, fn(value: Int) { value })
+  let second_field =
+    model.field(second, "B.c", AmountField, fn(value: Int) { value })
+
+  assert model.field_id(first_field)
+    == model.FieldId(model.CommandRole, "A.B", "c")
+  assert model.field_id(second_field)
+    == model.FieldId(model.CommandRole, "A", "B.c")
+  assert model.field_id(first_field) != model.field_id(second_field)
+}
+
+@external(erlang, "eventcore_model_test_ffi", "compile_failure")
+fn compile_failure(fixture: String) -> #(Int, String)
+
+pub fn model_constraints_fail_at_compilation_test() {
+  expect_rejected("wrong_target", "Type mismatch", "Int, Credit, Int")
+  expect_rejected("wrong_component", "Type mismatch", "Command(Withdrawal)")
+  expect_rejected("missing_field", "Incorrect arity", "  - target")
+  expect_rejected("swapped_stream", "Type mismatch", "StreamIdentity(Credit)")
+  expect_rejected("wrong_transform", "Type mismatch", "String")
+  expect_rejected("invalid_origin", "Type mismatch", "model.Origin")
+}
+
+fn expect_rejected(fixture: String, diagnostic: String, detail: String) -> Nil {
+  let #(status, output) = compile_failure(fixture)
+  assert status == 1
+  assert string.contains(output, "error: " <> diagnostic)
+  assert string.contains(output, detail)
+  Nil
+}

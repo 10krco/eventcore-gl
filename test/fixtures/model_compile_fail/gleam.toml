@@ -1,0 +1,6 @@
+name = "model_compile_fail"
+version = "1.0.0"
+target = "erlang"
+
+[dependencies]
+eventcore = ">= 0.1.0 and < 1.0.0"
