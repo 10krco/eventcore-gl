@@ -317,6 +317,9 @@ fn run_with_leader(runner: Runner(event, source_error, error)) {
 }
 
 fn cycle(runner: Runner(event, source_error, error), cursor: Cursor) {
+  use _ <- result.try(
+    session.check(runner.leader) |> result.replace_error(LeadershipLost),
+  )
   use through <- result.try(
     runner.source.high_watermark() |> result.map_error(SourceRead),
   )
@@ -340,14 +343,29 @@ fn cycle(runner: Runner(event, source_error, error), cursor: Cursor) {
   }
 }
 
-fn drain(runner: Runner(event, source_error, error), cursor: Cursor, bound) {
+fn drain(
+  runner: Runner(event, source_error, error),
+  cursor: Cursor,
+  bound: Position,
+) -> Result(Drain, RunError(source_error, error)) {
+  case later_than(bound, cursor.after) {
+    True -> read_page(runner, cursor, bound)
+    False -> Ok(Drained(cursor))
+  }
+}
+
+fn read_page(
+  runner: Runner(event, source_error, error),
+  cursor: Cursor,
+  bound,
+) {
   let assert Ok(page) = projection.page(cursor.after, runner.config.batch_size)
   use envelopes <- result.try(
     runner.source.read(runner.config.selection, page, delivery.Inclusive(bound))
     |> result.map_error(SourceRead),
   )
   case envelopes {
-    [] -> Ok(Drained(cursor))
+    [] -> Ok(Drained(Cursor(..cursor, after: Some(bound))))
     _ -> {
       use next <- result.try(deliver(runner, cursor, bound, envelopes))
       case next {
@@ -444,10 +462,8 @@ fn attempt(
           Ok(Applied)
         }
         Error(error) -> {
-          let decision =
-            runner.projector.on_error(Failure(position, error, number))
           use _ <- result.try(rollback(runner.leader))
-          case decision {
+          case runner.projector.on_error(Failure(position, error, number)) {
             Stop -> Ok(Pending)
             Fatal -> Error(ApplicationFailed(position, error))
             Skip -> skip(runner, position)

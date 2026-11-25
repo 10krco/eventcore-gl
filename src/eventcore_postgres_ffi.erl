@@ -178,6 +178,8 @@ finish_transactional_session(Pool, Key, Token) ->
 transactional_command({Owner, Pool, Key, Token}, Command) when Owner =:= self() ->
     StateKey = {?MODULE, transaction, Token},
     case {lists:keyfind(Key, 1, held_sessions(Pool)), Command, get(StateKey)} of
+        {{Key, Token, Ref, Connection}, check, undefined} ->
+            check_transactional_lock(Pool, Key, Ref, Connection);
         {{Key, Token, Ref, Connection}, 'begin', undefined} ->
             run_transaction_command(Pool, Key, Ref, Connection, StateKey, 'begin', "BEGIN");
         {{Key, Token, Ref, Connection}, commit, Scope} when is_reference(Scope) ->
@@ -188,6 +190,18 @@ transactional_command({Owner, Pool, Key, Token}, Command) when Owner =:= self() 
     end;
 transactional_command(_, _) ->
     {error, session_failed}.
+
+check_transactional_lock(Pool, Key, Ref, Connection) ->
+    Sql = "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' "
+          "AND pid = pg_backend_pid() AND granted AND mode = 'ExclusiveLock' "
+          "AND objsubid = 1 AND classid::bigint = ($1::bigint >> 32 & 4294967295) "
+          "AND objid::bigint = ($1::bigint & 4294967295))",
+    case advisory_query(Connection, Sql, Key) of
+        #{rows := [{true}]} -> {ok, {single_connection, Connection}};
+        _ ->
+            discard_session(Pool, Key, Ref, Connection),
+            {error, session_failed}
+    end.
 
 transactional_scope({Owner, _, _, Token} = Leader) when Owner =:= self() ->
     {Leader, get({?MODULE, transaction, Token})}.
@@ -212,11 +226,29 @@ run_transaction_command(Pool, Key, Ref, Connection, StateKey, Command, Sql) ->
         #{command := rollback} when Command =:= commit ->
             erase(StateKey),
             {error, rolled_back};
+        {error, {pgsql_error, #{code := Code}}} when Command =:= commit ->
+            case commit_rejected(Code) of
+                true ->
+                    erase(StateKey),
+                    {error, rolled_back};
+                false ->
+                    failed_transaction_command(Pool, Key, Ref, Connection, StateKey)
+            end;
         _ ->
-            erase(StateKey),
-            discard_session(Pool, Key, Ref, Connection),
-            {error, session_failed}
+            failed_transaction_command(Pool, Key, Ref, Connection, StateKey)
     end.
+
+%% Integrity violations and transaction rollback SQLSTATEs prove that
+%% PostgreSQL rejected COMMIT. 40003 explicitly leaves completion unknown.
+commit_rejected(<<"23", _/binary>>) -> true;
+commit_rejected(<<"40003">>) -> false;
+commit_rejected(<<"40", _/binary>>) -> true;
+commit_rejected(_) -> false.
+
+failed_transaction_command(Pool, Key, Ref, Connection, StateKey) ->
+    erase(StateKey),
+    discard_session(Pool, Key, Ref, Connection),
+    {error, session_failed}.
 
 advisory_query_no_parameter(Connection, Sql) ->
     try pgo_handler:extended_query(Connection, Sql, [], #{queue_time => undefined})

@@ -203,8 +203,137 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   assert count(second) == 4
   assert progress.load(second, failure_name) == Ok(None)
 
+  check_idle_fencing(destination, source, config, second)
+  check_error_policy_after_rollback(destination, source, config, second)
   check_leadership_loss(destination, source, config, second)
+  check_commit_rejection(destination, source, config, second, position1)
   check_commit_disconnect(destination, source, config, second, position1)
+}
+
+fn check_idle_fencing(
+  destination,
+  source: delivery.Source(error),
+  config,
+  observer,
+) {
+  let assert Ok(name) = delivery.projector_name("transactional-idle")
+  let pages = process.new_subject()
+  let empty =
+    delivery.Source(
+      id: source.id,
+      high_watermark: source.high_watermark,
+      read: fn(_, page, _) {
+        assert projection.page_after(page) == None
+        process.send(pages, Nil)
+        Ok([])
+      },
+    )
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { panic as "empty source decoded an envelope" },
+      fn(_, _, _) { panic as "empty source applied an envelope" },
+      fn(_) { transactional.Fatal },
+    )
+  let polls = process.new_subject()
+  process.send(polls, Nil)
+  let continuous =
+    transactional.Config(
+      ..config,
+      mode: transactional.Continuous(
+        projection_runner.Control(fn(_) {
+          case process.receive(polls, 0) {
+            Ok(Nil) -> {
+              assert process.receive(pages, 0) == Ok(Nil)
+              True
+            }
+            Error(Nil) -> {
+              assert process.receive(pages, 0) == Error(Nil)
+              let assert Ok(pog.Returned(rows: [True], ..)) =
+                pog.query(
+                  "SELECT pg_terminate_backend(pid, 1000) FROM pg_locks
+              WHERE locktype = 'advisory' AND granted AND mode = 'ExclusiveLock'
+                AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                AND objsubid = 1",
+                )
+                |> pog.returning(decode.at([0], decode.bool))
+                |> pog.execute(observer)
+              True
+            }
+          }
+        }),
+      ),
+    )
+  assert transactional.run(destination, projector, empty, continuous)
+    == Error(transactional.LeadershipLost)
+  assert progress.load(observer, name) == Ok(None)
+}
+
+fn check_error_policy_after_rollback(destination, source, config, observer) {
+  let assert Ok(name) = delivery.projector_name("transactional-policy")
+  let txs = process.new_subject()
+  let lock =
+    pog.query(
+      "SELECT amount FROM projection_effects
+    WHERE amount = 1 FOR UPDATE NOWAIT",
+    )
+    |> pog.returning(decode.at([0], decode.int))
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, _, tx) {
+        let assert Ok(pog.Returned(rows: [1], ..)) =
+          transactional.execute(tx, lock)
+        process.send(txs, tx)
+        Error("policy")
+      },
+      fn(_) {
+        let assert Ok(tx) = process.receive(txs, 0)
+        assert transactional.execute(tx, lock)
+          == Error(transactional.TransactionClosed)
+        let assert Ok(pog.Returned(rows: [1], ..)) = pog.execute(lock, observer)
+        transactional.Stop
+      },
+    )
+  let assert Ok(position) = projection.position(1)
+  assert transactional.run(destination, projector, source, config)
+    == Ok(transactional.Stopped(position, 0, 0))
+}
+
+fn check_commit_rejection(destination, source, config, observer, position) {
+  let assert Ok(_) =
+    pog.query(
+      "ALTER TABLE projection_effects ADD CONSTRAINT projection_amount_unique
+      UNIQUE (amount) DEFERRABLE INITIALLY DEFERRED",
+    )
+    |> pog.execute(observer)
+  let assert Ok(name) = delivery.projector_name("transactional-rejected")
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, _, tx) {
+        let assert Ok(_) = insert(tx, 1)
+        Ok(fn() { panic as "rejected commit ran the after-commit hook" })
+      },
+      fn(_) { transactional.Fatal },
+    )
+  assert transactional.run(destination, projector, source, config)
+    == Error(transactional.CommitRolledBack(position))
+  assert transactional.reset(
+      destination,
+      name,
+      source.id,
+      delivery.selection_identity(config.selection),
+      fn(tx) {
+        let assert Ok(_) = insert(tx, 1)
+        Ok(Nil)
+      },
+    )
+    == Error(transactional.ResetCommitRolledBack)
+  assert count(observer) == 4
+  assert progress.load(observer, name) == Ok(None)
 }
 
 fn check_leadership_loss(destination, source, config, observer) {

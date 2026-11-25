@@ -14,6 +14,7 @@ type Command {
   Begin
   Commit
   Rollback
+  Check
 }
 
 pub type CommandError {
@@ -27,6 +28,10 @@ pub fn with_leader(
   work: fn(Leader) -> Result(value, error),
 ) -> Result(Result(value, error), LeaderError) {
   with_transactional_leader(pool, delivery.projector_name_value(name), work)
+}
+
+pub fn check(leader: Leader) -> Result(Nil, CommandError) {
+  transactional_command(leader, Check) |> result.map(fn(_) { Nil })
 }
 
 pub fn begin(leader: Leader) -> Result(pog.Connection, CommandError) {
