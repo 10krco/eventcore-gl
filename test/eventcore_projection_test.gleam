@@ -1,7 +1,9 @@
+import eventcore/internal/projection_scan
 import eventcore/memory
 import eventcore/projection
 import eventcore/store
 import eventcore/stream
+import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 
@@ -119,4 +121,47 @@ fn emit_unrelated(writes: store.Writes(Int), id: stream.Id, remaining: Int) {
       store.append(writes, store.Event(id, "unrelated", remaining))
       |> result.try(fn(writes) { emit_unrelated(writes, id, remaining - 1) })
   }
+}
+
+pub fn release_page_limits_candidates_before_decode_test() {
+  let assert Ok(id) = stream.id("ledger")
+  let accepted = store.Event(id, "selected", 1)
+  let invalid = store.Event(id, "selected", 2)
+  let other = store.Event(id, "other", 3)
+  let later = store.Event(id, "selected", 4)
+  let candidates = [#(1, accepted), #(2, other), #(3, invalid), #(4, later)]
+  let fetch = fn(first, last) {
+    Ok(list.filter(candidates, fn(row) { row.0 >= first && row.0 <= last }))
+  }
+  let decode = fn(event: store.Event(Int)) {
+    case event.payload {
+      2 -> Error(store.DeserializationFailed(id, "wrong event type"))
+      _ -> Ok(event)
+    }
+  }
+  let assert Ok(first) = projection.position(1)
+  let assert Ok(last) = projection.position(4)
+  let assert Ok(page) = projection.page(None, 2)
+  let filter = projection.rust_release_pagination(projection.all(), "selected")
+  assert projection_scan.read(filter, page, 4, fetch, decode)
+    == Ok(projection.PageResult(
+      [projection.Delivery(accepted, first)],
+      Some(first),
+    ))
+
+  let assert Ok(resume) = projection.page(Some(first), 2)
+  assert projection_scan.read(filter, resume, 4, fetch, decode)
+    == Ok(projection.PageResult([projection.Delivery(later, last)], Some(last)))
+
+  let assert Ok(one) = projection.page(Some(first), 1)
+  assert projection_scan.read(filter, one, 4, fetch, decode)
+    == Ok(projection.PageResult([], Some(first)))
+
+  let native = projection.with_event_type(projection.all(), "selected")
+  assert projection_scan.read(native, page, 4, fetch, decode)
+    == Error(store.DeserializationFailed(id, "wrong event type"))
+  let explicit = projection.with_event_type(projection.all(), "other")
+  let release = projection.rust_release_pagination(explicit, "selected")
+  assert projection.matches(release, id, "other")
+  assert !projection.matches(release, id, "selected")
 }

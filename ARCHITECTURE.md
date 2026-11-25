@@ -143,6 +143,11 @@ local journal. See
 [ADR 0011](docs/decisions/0011-filesystem-projection-ingestion.md) and
 [ADR 0022](docs/decisions/0022-filesystem-projection-coordination.md).
 
+Legacy projection filters can opt into EventCore 2.1.0 pagination. The
+shared scan defaults to the supplied consumer kind, limits matching rows
+before decoding, and advances only through the last delivered event.
+See [ADR 0026](docs/decisions/0026-legacy-projection-release-pagination.md).
+
 SQLite projection reads scan committed insertion positions in bounded ranges.
 Each page captures an upper position before scanning. A projector can use
 the event database for its progress or a separate checkpoint database.

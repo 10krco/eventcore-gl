@@ -85,7 +85,7 @@ pub type Checkpoints {
 }
 
 pub opaque type Filter {
-  Filter(stream: StreamFilter, kind: Option(String))
+  Filter(stream: StreamFilter, kind: Option(String), release: Bool)
 }
 
 type StreamFilter {
@@ -97,12 +97,12 @@ type StreamFilter {
 type Glob
 
 pub fn all() -> Filter {
-  Filter(All, None)
+  Filter(All, None, False)
 }
 
 pub fn prefix(value: String) -> Result(Filter, stream.IdError) {
   stream.id(value)
-  |> result.map(fn(id) { Filter(Prefix(stream.name(id)), None) })
+  |> result.map(fn(id) { Filter(Prefix(stream.name(id)), None, False) })
 }
 
 pub fn pattern(value: String) -> Result(Filter, Nil) {
@@ -111,13 +111,31 @@ pub fn pattern(value: String) -> Result(Filter, Nil) {
   case length > 0 && length <= 255 {
     True ->
       compile_glob(trimmed)
-      |> result.map(fn(glob) { Filter(Pattern(glob), None) })
+      |> result.map(fn(glob) { Filter(Pattern(glob), None, False) })
     False -> Error(Nil)
   }
 }
 
 pub fn with_event_type(filter: Filter, kind: String) -> Filter {
   Filter(..filter, kind: Some(kind))
+}
+
+/// Select EventCore 2.1.0 legacy pagination. Use the consumer's event kind
+/// when the filter does not already name one.
+pub fn rust_release_pagination(
+  filter: Filter,
+  consumer_kind: String,
+) -> Filter {
+  let kind = case filter.kind {
+    None -> Some(consumer_kind)
+    Some(_) -> filter.kind
+  }
+  Filter(..filter, kind: kind, release: True)
+}
+
+@internal
+pub fn uses_release_pagination(filter: Filter) -> Bool {
+  filter.release
 }
 
 pub fn matches(filter: Filter, stream: Id, kind: String) -> Bool {
