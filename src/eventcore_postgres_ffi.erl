@@ -1,6 +1,6 @@
 -module(eventcore_postgres_ffi).
 -include_lib("kernel/include/logger.hrl").
--export([trace_read/2, trace_append/2, stop_pool/1, acquire_projection/2, projection_connection/1]).
+-export([trace_read/2, trace_append/2, stop_pool/1, acquire_projection/2, projection_connection/1, checkpoint_connection/2]).
 
 trace_read(Stream, 0) ->
     ?LOG_INFO(#{operation => <<"postgres.read_stream">>, stream => Stream}),
@@ -94,6 +94,14 @@ projection_connection({pool, Pool} = Original) ->
         [] -> Original
     end;
 projection_connection(Original) ->
+    Original.
+
+checkpoint_connection({pool, Pool} = Original, Name) ->
+    case lists:keyfind(lock_key(Name), 1, held_sessions(Pool)) of
+        {_, _, _, Connection} -> {single_connection, Connection};
+        false -> Original
+    end;
+checkpoint_connection(Original, _) ->
     Original.
 
 advisory_query(Connection, Sql, Key) ->

@@ -499,7 +499,7 @@ pub fn projection_checkpoints(
   projection.Checkpoints(
     fn(name) {
       use cursor <- result.try(
-        load_checkpoint(projection_checkpoint_session(checkpoints), name)
+        load_checkpoint(projection_checkpoint_session(checkpoints, name), name)
         |> result.replace_error(store.StoreFailure(store.LoadCheckpoint)),
       )
       case cursor {
@@ -512,7 +512,7 @@ pub fn projection_checkpoints(
     },
     fn(name, position) {
       save_checkpoint(
-        projection_checkpoint_session(checkpoints),
+        projection_checkpoint_session(checkpoints, name),
         name,
         projection.sequence(position),
       )
@@ -552,9 +552,13 @@ fn acquire_projection(
 
 fn projection_checkpoint_session(
   checkpoints: CheckpointStore,
+  name: String,
 ) -> CheckpointStore {
-  CheckpointStore(projection_connection(checkpoints.pool))
+  CheckpointStore(checkpoint_connection(checkpoints.pool, name))
 }
+
+@external(erlang, "eventcore_postgres_ffi", "checkpoint_connection")
+fn checkpoint_connection(pool: pog.Connection, name: String) -> pog.Connection
 
 @external(erlang, "eventcore_postgres_ffi", "projection_connection")
 fn projection_connection(pool: pog.Connection) -> pog.Connection

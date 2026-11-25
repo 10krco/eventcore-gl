@@ -15,8 +15,8 @@ the advisory key. The BEAM holder owns the checkout and releases it with an
 idempotent guard. Return only successfully unlocked sessions to the pool.
 Pog disconnects the session when the holder dies.
 
-Use the held session for reads and checkpoint writes that would otherwise
-check out from the same pool. This supports a projector using a pool with
+Use the session holding the subscription lock for its checkpoint operations.
+Read-only pages reuse a held session when they use the same pool. This supports a projector using a pool with
 one connection. Replay scans bounded position ranges through the committed
 frontier using the legacy event codec.
 

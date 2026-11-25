@@ -124,7 +124,7 @@ original payload bytes and JSON metadata for application decoding.
 See [ADR 0013](docs/decisions/0013-postgres-projection-delivery.md).
 
 Legacy PostgreSQL projectors hold a session advisory lock in the checkpoint
-database. Reads and checkpoint operations reuse that session when they use
-the same pool. The projection reader scans committed positions in bounded
+database. Named checkpoint operations use the lock-owning session. Reads can
+reuse a held session from the same pool. The projection reader scans committed positions in bounded
 ranges and returns decoded events through the legacy event codec.
 See [ADR 0014](docs/decisions/0014-postgres-legacy-projections.md).

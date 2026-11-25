@@ -332,11 +332,30 @@ pub fn check_distinct_names(first: pog.Connection, second: pog.Connection) {
   let primary = postgres.projection_backend(postgres.from_pool(first, codec))
   let secondary = postgres.projection_backend(postgres.from_pool(second, codec))
   let assert Ok(one) = primary.acquire("independent-one")
+  let assert Ok(owned) =
+    pog.query(
+      "SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted",
+    )
+    |> pog.returning(decode.at([0], decode.int))
+    |> pog.execute(second)
+  let assert [owner_pid] = owned.rows
   let assert Ok(two) = primary.acquire("independent-two")
   assert secondary.acquire("independent-one") == Error(runner.AlreadyLeading)
   assert secondary.acquire("independent-two") == Error(runner.AlreadyLeading)
-  one.release()
+  let assert Ok(terminated) =
+    pog.query("SELECT pg_terminate_backend($1, 1000)")
+    |> pog.parameter(pog.int(owner_pid))
+    |> pog.returning(decode.at([0], decode.bool))
+    |> pog.execute(second)
+  assert terminated.rows == [True]
   let assert Ok(after_release) = secondary.acquire("independent-one")
+  let assert Ok(position) = projection.position(1)
+  assert primary.checkpoints.save("independent-one", position)
+    == Error(store.StoreFailure(store.SaveCheckpoint))
+  assert secondary.checkpoints.load("independent-one") == Ok(None)
+  assert primary.checkpoints.save("independent-two", position) == Ok(Nil)
+  one.release()
+  assert primary.checkpoints.load("independent-two") == Ok(Some(position))
   after_release.release()
   assert secondary.acquire("independent-two") == Error(runner.AlreadyLeading)
   two.release()
