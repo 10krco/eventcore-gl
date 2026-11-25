@@ -91,7 +91,7 @@ pub opaque type Filter {
 type StreamFilter {
   All
   Prefix(String)
-  Pattern(Glob)
+  Pattern(source: String, compiled: Glob)
 }
 
 type Glob
@@ -111,7 +111,7 @@ pub fn pattern(value: String) -> Result(Filter, Nil) {
   case length > 0 && length <= 255 {
     True ->
       compile_glob(trimmed)
-      |> result.map(fn(glob) { Filter(Pattern(glob), None, False) })
+      |> result.map(fn(glob) { Filter(Pattern(trimmed, glob), None, False) })
     False -> Error(Nil)
   }
 }
@@ -138,6 +138,27 @@ pub fn uses_release_pagination(filter: Filter) -> Bool {
   filter.release
 }
 
+@internal
+pub fn stream_prefix(filter: Filter) -> Option(String) {
+  case filter.stream {
+    Prefix(prefix) -> Some(prefix)
+    _ -> None
+  }
+}
+
+@internal
+pub fn stream_pattern(filter: Filter) -> Option(String) {
+  case filter.stream {
+    Pattern(source, _) -> Some(source)
+    _ -> None
+  }
+}
+
+@internal
+pub fn event_kind(filter: Filter) -> Option(String) {
+  filter.kind
+}
+
 pub fn matches(filter: Filter, stream: Id, kind: String) -> Bool {
   case filter.kind {
     Some(expected) if expected != kind -> False
@@ -145,7 +166,7 @@ pub fn matches(filter: Filter, stream: Id, kind: String) -> Bool {
       case filter.stream {
         All -> True
         Prefix(prefix) -> string.starts_with(stream.name(stream), prefix)
-        Pattern(pattern) -> matches_glob(pattern, stream.name(stream))
+        Pattern(_, pattern) -> matches_glob(pattern, stream.name(stream))
       }
   }
 }

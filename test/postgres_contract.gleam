@@ -99,6 +99,7 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   assert postgres.load_checkpoint(checkpoints, "standalone") == Ok(Some(1))
   check_legacy_projection(events, reopened, second_checkpoints)
   check_committed_delivery(first, events, reopened)
+  check_release_projection(first, events, second_checkpoints)
 
   let assert Ok(key) = snapshot.key("ledger/v1")
   let assert Ok(two) = stream.version(2)
@@ -335,6 +336,55 @@ fn check_committed_delivery(
     <<300:64>>,
   )
 
+  Nil
+}
+
+fn check_release_projection(pool, events, checkpoints) {
+  assert postgres.migrate_release_checkpoints(checkpoints) == Ok(Nil)
+  let assert Ok(id) = stream.id("legacy-any-reader/created")
+  let assert Ok(writes) =
+    store.writes()
+    |> store.register(id, stream.initial_version)
+    |> result.try(store.append(_, store.Event(id, "created", 10)))
+    |> result.try(store.append(_, store.Event(id, "created", 20)))
+  assert postgres.as_store(events).append_events(writes) == Ok(Nil)
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE eventcore_events SET event_id = CASE version
+         WHEN 1 THEN 'ffffffff-ffff-7fff-bfff-ffffffffffff'::uuid
+         ELSE '00000000-0000-7000-8000-000000000001'::uuid END
+       WHERE stream = $1",
+    )
+    |> pog.parameter(pog.text(stream.name(id)))
+    |> pog.execute(pool)
+  let backend =
+    postgres.projection_release_backend(events, checkpoints, "created")
+  let read = backend.reader
+  let assert Ok(filter) = projection.prefix("legacy%reader/")
+  let assert Ok(page) = projection.page(None, 1)
+  let assert Ok(projection.PageResult([first], Some(cursor))) =
+    read(filter, page)
+  assert first.event.payload == 20
+  let native = postgres.projection_checkpoints(checkpoints)
+  let release = backend.checkpoints
+  let assert Ok(native_cursor) = projection.position(1)
+  assert native.save("legacy-uuid", native_cursor) == Ok(Nil)
+  assert release.load("legacy-uuid") == Ok(None)
+  assert release.save("legacy-uuid", cursor) == Ok(Nil)
+  assert release.load("legacy-uuid") == Ok(Some(cursor))
+  assert native.load("legacy-uuid") == Ok(Some(native_cursor))
+
+  let assert Ok(after) = projection.page(Some(cursor), 1)
+  let assert Ok(pattern) = projection.pattern("legacy-*/create[d]")
+  let assert Ok(projection.PageResult([last], Some(through))) =
+    read(pattern, after)
+  assert last.event.payload == 10
+  let assert Ok(end) = projection.page(Some(through), 1)
+  assert read(filter, end) == Ok(projection.PageResult([], Some(through)))
+  assert postgres.reset_release_checkpoint(checkpoints, "legacy-uuid")
+    == Ok(Nil)
+  assert release.load("legacy-uuid") == Ok(None)
+  assert native.load("legacy-uuid") == Ok(Some(native_cursor))
   Nil
 }
 

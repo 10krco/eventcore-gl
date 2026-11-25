@@ -1,5 +1,7 @@
 //// PostgreSQL event and checkpoint storage for an existing Pog pool.
 
+import eventcore/internal/uuid_position
+
 import eventcore/internal/projection_scan
 import eventcore/projection
 import eventcore/projection_delivery as delivery
@@ -484,6 +486,88 @@ pub fn projection_reader(
   }
 }
 
+/// Read legacy release pages in persisted UUID order. Run `migrate_delivery`
+/// on the event database and pair this reader with release checkpoints.
+pub fn projection_release_reader(
+  events: EventStore(payload),
+  consumer_kind: String,
+) -> projection.Reader(payload) {
+  fn(filter, page) {
+    let failure = store.StoreFailure(store.ReadProjection)
+    let after = projection.page_after(page)
+    use cursor <- result.try(case after {
+      None -> Ok(None)
+      Some(position) ->
+        uuid_position.to_uuid(position)
+        |> result.map(Some)
+        |> result.replace_error(failure)
+    })
+    let pattern =
+      projection.stream_pattern(filter) |> option.map(release_glob_regex)
+    let kind = projection.event_kind(filter) |> option.unwrap(consumer_kind)
+    let row = {
+      use uuid <- decode.field(0, decode.string)
+      use stream <- decode.field(1, decode.string)
+      use kind <- decode.field(2, decode.string)
+      use payload <- decode.field(3, decode.bit_array)
+      decode.success(#(uuid, stream, kind, payload))
+    }
+    use returned <- result.try(
+      pog.query(
+        "SELECT event_id::text, stream, kind, payload FROM eventcore_events
+         WHERE kind = $1
+           AND ($2::text IS NULL OR event_id > $2::text::uuid)
+           AND ($3::text IS NULL OR stream LIKE $3::text || '%')
+           AND ($4::text IS NULL OR stream ~ $4::text)
+         ORDER BY event_id LIMIT $5",
+      )
+      |> pog.parameter(pog.text(kind))
+      |> pog.parameter(pog.nullable(pog.text, cursor))
+      |> pog.parameter(pog.nullable(pog.text, projection.stream_prefix(filter)))
+      |> pog.parameter(pog.nullable(pog.text, pattern))
+      |> pog.parameter(
+        pog.int(int.min(projection.page_limit(page), max_bigint)),
+      )
+      |> pog.returning(row)
+      |> pog.execute(projection_connection(events.pool))
+      |> result.replace_error(failure),
+    )
+    release_page(events.codec, returned.rows, after, [])
+  }
+}
+
+fn release_page(
+  codec: Codec(payload),
+  rows: List(#(String, String, String, BitArray)),
+  after: Option(projection.Position),
+  reversed: List(projection.Delivery(payload)),
+) -> Result(projection.PageResult(payload), StoreError) {
+  case rows {
+    [] -> Ok(projection.PageResult(list.reverse(reversed), after))
+    [#(uuid, name, kind, packed), ..rest] -> {
+      let failure = store.StoreFailure(store.ReadProjection)
+      use id <- result.try(stream.id(name) |> result.replace_error(failure))
+      use position <- result.try(
+        uuid_position.from_uuid(uuid) |> result.replace_error(failure),
+      )
+      use data <- result.try(
+        unpack_payload(packed) |> result.replace_error(failure),
+      )
+      case codec.decode(kind, data) {
+        Error(_) -> release_page(codec, rest, after, reversed)
+        Ok(payload) ->
+          release_page(codec, rest, Some(position), [
+            projection.Delivery(store.Event(id, kind, payload), position),
+            ..reversed
+          ])
+      }
+    }
+  }
+}
+
+@external(erlang, "eventcore_postgres_ffi", "release_glob_regex")
+fn release_glob_regex(pattern: String) -> String
+
 fn projection_range(pool, first, last) {
   use returned <- result.try(
     pog.query(
@@ -510,6 +594,59 @@ fn projection_range(pool, first, last) {
     )
     #(position, store.Event(id, kind, payload))
   })
+}
+
+/// Set up the UUID cursor namespace for release-compatible legacy readers.
+pub fn migrate_release_checkpoints(
+  checkpoints: CheckpointStore,
+) -> Result(Nil, MigrationError) {
+  migrate_tables(checkpoints.pool, [
+    "CREATE TABLE IF NOT EXISTS eventcore_release_checkpoints (
+      name text PRIMARY KEY, position uuid NOT NULL)",
+  ])
+}
+
+pub fn projection_release_checkpoints(
+  checkpoints: CheckpointStore,
+) -> projection.Checkpoints {
+  projection.Checkpoints(
+    fn(name) {
+      let failure = store.StoreFailure(store.LoadCheckpoint)
+      let session = projection_checkpoint_session(checkpoints, name)
+      use returned <- result.try(
+        pog.query(
+          "SELECT position::text FROM eventcore_release_checkpoints WHERE name = $1",
+        )
+        |> pog.parameter(pog.text(name))
+        |> pog.returning(decode.at([0], decode.string))
+        |> pog.execute(session.pool)
+        |> result.replace_error(failure),
+      )
+      case returned.rows {
+        [] -> Ok(None)
+        [uuid] ->
+          uuid_position.from_uuid(uuid)
+          |> result.map(Some)
+          |> result.replace_error(failure)
+        _ -> Error(failure)
+      }
+    },
+    fn(name, position) {
+      let failure = store.StoreFailure(store.SaveCheckpoint)
+      let session = projection_checkpoint_session(checkpoints, name)
+      use uuid <- result.try(
+        uuid_position.to_uuid(position) |> result.replace_error(failure),
+      )
+      execute_one(
+        session.pool,
+        "INSERT INTO eventcore_release_checkpoints(name, position)
+         VALUES ($1, $2::text::uuid)
+         ON CONFLICT (name) DO UPDATE SET position = excluded.position",
+        [pog.text(name), pog.text(uuid)],
+      )
+      |> result.replace_error(failure)
+    },
+  )
 }
 
 pub fn projection_checkpoints(
@@ -560,6 +697,19 @@ pub fn projection_backend_with_checkpoints(
   )
 }
 
+/// Combine UUID-ordered replay, UUID checkpoints and session leadership.
+pub fn projection_release_backend(
+  events: EventStore(payload),
+  checkpoints: CheckpointStore,
+  consumer_kind: String,
+) -> projection_runner.Backend(payload) {
+  projection_runner.Backend(
+    projection_release_reader(events, consumer_kind),
+    projection_release_checkpoints(checkpoints),
+    projection_coordinator(checkpoints.pool),
+  )
+}
+
 /// Acquires a session advisory lock from an existing pool. Use the same pool
 /// as the checkpoint adapter to route its writes through the locked session.
 pub fn projection_coordinator(
@@ -594,13 +744,29 @@ pub fn reset_checkpoint(
   checkpoints: CheckpointStore,
   name: String,
 ) -> Result(Nil, CheckpointError) {
+  reset_checkpoint_in(checkpoints, name, "eventcore_checkpoints")
+}
+
+/// Remove progress only from the release-compatible UUID namespace.
+pub fn reset_release_checkpoint(
+  checkpoints: CheckpointStore,
+  name: String,
+) -> Result(Nil, CheckpointError) {
+  reset_checkpoint_in(checkpoints, name, "eventcore_release_checkpoints")
+}
+
+fn reset_checkpoint_in(
+  checkpoints: CheckpointStore,
+  name: String,
+  table: String,
+) -> Result(Nil, CheckpointError) {
   pog.transaction(checkpoints.pool, fn(tx) {
     use Nil <- result.try(read_committed(tx) |> result.replace_error(Nil))
     let parameters = [pog.text(name)]
     use existing <- result.try(
       query(
         tx,
-        "SELECT 1 FROM eventcore_checkpoints WHERE name = $1 FOR UPDATE",
+        "SELECT 1 FROM " <> table <> " WHERE name = $1 FOR UPDATE",
         parameters,
       )
       |> result.replace_error(Nil),
@@ -610,7 +776,7 @@ pub fn reset_checkpoint(
       1 ->
         execute_one(
           tx,
-          "DELETE FROM eventcore_checkpoints WHERE name = $1",
+          "DELETE FROM " <> table <> " WHERE name = $1",
           parameters,
         )
       _ -> Error(Nil)
