@@ -1,4 +1,7 @@
 //// Typed components and mappings for experimental domain modeling.
+////
+//// **Experimental.** This module is outside the EventCore 1.x compatibility
+//// guarantee. Its types and functions may change in a minor release.
 
 import eventcore/stream
 import gleam/list

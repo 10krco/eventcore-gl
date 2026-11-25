@@ -10,15 +10,20 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/set.{type Set}
 
+/// The statically known streams to read before deciding a command.
 pub opaque type Declarations {
   Declarations(List(Id))
 }
 
+/// Why a set of statically known streams could not be constructed.
 pub type DeclarationError {
+  /// At least one stream is required.
   EmptyDeclarations
+  /// The same identifier appeared more than once.
   DuplicateStream(Id)
 }
 
+/// Validate a nonempty list of distinct streams and retain its order.
 pub fn declare(streams: List(Id)) -> Result(Declarations, DeclarationError) {
   case streams {
     [] -> Error(EmptyDeclarations)
@@ -36,6 +41,7 @@ pub fn declare(streams: List(Id)) -> Result(Declarations, DeclarationError) {
   }
 }
 
+/// Declare one stream to read.
 pub fn single(id: Id) -> Declarations {
   Declarations([id])
 }
@@ -46,6 +52,7 @@ pub fn across(primary: Id, participants: List(Id)) -> Declarations {
   Declarations(list.unique([primary, ..participants]))
 }
 
+/// Append a stream to the declarations, rejecting an existing identifier.
 pub fn with_participant(
   declarations: Declarations,
   id: Id,
@@ -54,8 +61,11 @@ pub fn with_participant(
   declare(list.append(streams, [id]))
 }
 
+/// A decision to stop execution before proposing any writes.
 pub type Rejection(domain_error) {
+  /// The reconstructed state cannot support the command.
   InvalidState(String)
+  /// A domain rule rejected the command. The application defines the error value.
   BusinessRule(domain_error)
 }
 
@@ -71,13 +81,27 @@ pub fn require(
   }
 }
 
+/// Why the command could not return a successful execution.
 pub type CommandError(domain_error) {
+  /// The handler rejected the reconstructed state or command input.
   Rejected(Rejection(domain_error))
+  /// A store operation failed, or the handler proposed an event for an undeclared stream.
   StorageError(StoreError)
+  /// An optimistic append conflict exhausted the configured retry budget.
   ConcurrencyError(max_retries: Int)
+  /// The snapshot codec could not encode or decode the command state.
   InvalidSnapshot(detail: String)
 }
 
+/// A decision that reconstructs state and proposes a batch of events.
+///
+/// `initial_state` starts replay on each attempt. `apply` folds events in
+/// version order within each stream. After each stream, `discover` can add
+/// related streams. Each identifier is read once per attempt. `handle` decides
+/// after replay finishes, and may return events only for participating streams.
+///
+/// The callbacks may run again after an optimistic append conflict. Keep them
+/// deterministic and free of external effects.
 pub type Command(state, payload, domain_error) {
   Command(
     streams: Declarations,
@@ -88,27 +112,40 @@ pub type Command(state, payload, domain_error) {
   )
 }
 
+/// Successful completion. The attempt count includes the initial attempt.
 pub type Execution {
   Execution(attempts: Int)
 }
 
+/// Time to wait between optimistic append attempts.
 pub type Backoff {
+  /// Wait this many milliseconds on every retry.
   Fixed(delay_ms: Int)
+  /// Double the base delay with each retry and apply jitter.
   Exponential(base_ms: Int)
 }
 
+/// The streams reconstructed, the one-based attempt that encountered a
+/// conflict, and the delay before the next attempt.
 pub type RetryContext {
   RetryContext(streams: List(Id), attempt: Int, delay_ms: Int)
 }
 
+/// Lifecycle events emitted synchronously during command execution.
 pub type Trace {
+  /// Execution is starting, before the first replay.
   ExecutionStarted
+  /// The append succeeded after the given number of attempts.
   CommandSucceeded(attempts: Int)
+  /// An append conflicted and another attempt is scheduled.
   Retrying(RetryContext)
+  /// An append conflicted after the entire retry budget was used.
   RetriesExhausted(streams: List(Id), max_retries: Int)
+  /// Execution ended with a rejection, storage error, or snapshot error.
   CommandFailed
 }
 
+/// The optimistic conflict retry budget, backoff, and observer callbacks.
 pub opaque type RetryPolicy {
   RetryPolicy(
     max_retries: Int,
@@ -118,10 +155,15 @@ pub opaque type RetryPolicy {
   )
 }
 
+/// Allow four retries after the initial attempt, with jittered exponential
+/// backoff from a base of 10 milliseconds. Trace to the Erlang logger.
 pub fn default_policy() -> RetryPolicy {
   RetryPolicy(4, Exponential(10), None, log_trace)
 }
 
+/// Configure the number of retries after the initial attempt and the delay.
+/// The count and base delay must fit in unsigned 32-bit and 64-bit integers,
+/// respectively. Zero retries gives a single attempt.
 pub fn retry_policy(
   max_retries: Int,
   backoff: Backoff,
@@ -140,6 +182,8 @@ pub fn retry_policy(
   }
 }
 
+/// Replace the callback invoked once for each scheduled retry, before waiting.
+/// The callback receives the failed attempt and its selected delay.
 pub fn with_metrics(
   policy: RetryPolicy,
   hook: fn(RetryContext) -> Nil,
@@ -147,6 +191,7 @@ pub fn with_metrics(
   RetryPolicy(..policy, metrics: Some(hook))
 }
 
+/// Replace the Erlang logger trace handler with a custom lifecycle observer.
 pub fn with_trace(policy: RetryPolicy, trace: fn(Trace) -> Nil) -> RetryPolicy {
   RetryPolicy(..policy, trace: trace)
 }
@@ -157,6 +202,9 @@ fn sleep(delay_ms: Int) -> Nil
 @external(erlang, "eventcore_command_ffi", "trace")
 fn log_trace(trace: Trace) -> Nil
 
+/// Replay all participating streams, decide, and atomically append the batch.
+/// Only an optimistic version conflict returned by the append triggers a
+/// retry. Each retry rebuilds state before making the decision again.
 pub fn execute(
   storage: Store(payload),
   command: Command(state, payload, domain_error),
@@ -176,8 +224,9 @@ pub fn execute(
   })
 }
 
-/// Reuse a durable projection of this command's replay state. Include every
-/// command and state-schema dimension that affects reconstruction in the key.
+/// Resume reconstruction using stored command state when available. Include
+/// every command and state-schema dimension that affects replay in the key.
+/// The repository can be refreshed during replay, before the handler runs.
 pub fn execute_with_snapshot(
   storage: Store(payload),
   command: Command(state, payload, domain_error),

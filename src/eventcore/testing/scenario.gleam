@@ -10,10 +10,14 @@ import eventcore/testing/event_collector
 import gleam/list
 import gleam/result
 
+/// An isolated test fixture backed by its own in-memory event store.
 pub opaque type Scenario(payload) {
   Scenario(memory.Memory(payload))
 }
 
+/// The command result and the event deliveries collected after execution.
+/// The deliveries include setup events and are available even if the command
+/// was rejected.
 pub type Observation(payload, error) {
   Observation(
     execution: Result(command.Execution, command.CommandError(error)),
@@ -21,16 +25,19 @@ pub type Observation(payload, error) {
   )
 }
 
+/// Start a scenario with an empty event history.
 pub fn start() -> Result(Scenario(payload), StoreError) {
   memory.start() |> result.map(Scenario)
 }
 
+/// Close the scenario's memory store and release its resources.
 pub fn close(scenario: Scenario(payload)) -> Result(Nil, StoreError) {
   let Scenario(memory) = scenario
   memory.close(memory)
 }
 
-/// Append setup events to the stream at its current version.
+/// Append setup events to the stream at its current version. Each event must
+/// belong to the supplied stream.
 pub fn given_events(
   scenario: Scenario(payload),
   id: Id,
@@ -55,10 +62,9 @@ pub fn given_events(
   }
 }
 
-/// Execute the command and collect one replay batch from a fresh checkpoint.
-/// EventCore 2.1.0 runs one legacy batch of up to 1,000 deliveries.
-/// Setup events count toward that limit. Close the scenario after collecting
-/// its single observation.
+/// Execute one command and collect a batch of up to 1,000 deliveries.
+/// Setup events count toward that limit. Start a fresh scenario for each
+/// observation, and close it after collecting its result.
 pub fn when(
   scenario: Scenario(payload),
   command: command.Command(state, payload, error),
@@ -75,6 +81,7 @@ pub fn when(
   Observation(execution, events)
 }
 
+/// Assert that the command succeeded and return the observation.
 pub fn succeeded(
   observation: Observation(payload, error),
 ) -> Observation(payload, error) {
@@ -82,6 +89,7 @@ pub fn succeeded(
   observation
 }
 
+/// Assert that the command returned exactly the expected error.
 pub fn failed_with(
   observation: Observation(payload, error),
   expected: command.CommandError(error),
@@ -90,6 +98,7 @@ pub fn failed_with(
   observation
 }
 
+/// Assert exact equality with the events collected in delivery order.
 pub fn then_events(
   observation: Observation(payload, error),
   expected: List(Event(payload)),
@@ -98,6 +107,7 @@ pub fn then_events(
   observation
 }
 
+/// Assert the number of collected events, including any setup events.
 pub fn then_event_count(
   observation: Observation(payload, error),
   expected: Int,

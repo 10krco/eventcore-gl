@@ -7,10 +7,13 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
+/// A cursor in one store's delivery sequence. Keep it with the reader that
+/// produced it.
 pub opaque type Position {
   Position(Int)
 }
 
+/// Constructs a cursor from a positive stored sequence number.
 pub fn position(sequence: Int) -> Result(Position, Nil) {
   case sequence > 0 {
     True -> Ok(Position(sequence))
@@ -25,6 +28,7 @@ pub fn sequence(position: Position) -> Int {
   value
 }
 
+/// A bounded read request starting strictly after an optional cursor.
 pub opaque type Page {
   Page(after: Option(Position), limit: Int)
 }
@@ -37,14 +41,17 @@ pub fn page(after: Option(Position), limit: Int) -> Result(Page, Nil) {
   }
 }
 
+/// Returns the exclusive starting cursor, if one was supplied.
 pub fn page_after(page: Page) -> Option(Position) {
   page.after
 }
 
+/// Returns the requested maximum number of deliveries.
 pub fn page_limit(page: Page) -> Int {
   page.limit
 }
 
+/// A stored event paired with its position in the reader's delivery order.
 pub type Delivery(payload) {
   Delivery(event: Event(payload), position: Position)
 }
@@ -67,11 +74,15 @@ pub type Reader(payload) =
 /// The filesystem adapter owns this capability and validates it at commit.
 pub type CheckpointFence
 
+/// A fenced checkpoint failed because leadership was lost or storage rejected
+/// the write.
 pub type CheckpointWriteError {
   LeaseLost
   WriteFailed(StoreError)
 }
 
+/// Loads and saves cursors by projector name. Fenced stores also validate
+/// leadership at write time.
 pub type Checkpoints {
   Checkpoints(
     load: fn(String) -> Result(Option(Position), StoreError),
@@ -85,6 +96,7 @@ pub type Checkpoints {
   )
 }
 
+/// Stream and event-kind criteria used to select projection deliveries.
 pub opaque type Filter {
   Filter(stream: StreamFilter, kind: Option(String), release: Bool)
 }
@@ -97,15 +109,19 @@ type StreamFilter {
 
 type Glob
 
+/// Matches every stream and event kind.
 pub fn all() -> Filter {
   Filter(All, None, False)
 }
 
+/// Matches stream names that start with a validated stream ID prefix.
 pub fn prefix(value: String) -> Result(Filter, stream.IdError) {
   stream.id(value)
   |> result.map(fn(id) { Filter(Prefix(stream.name(id)), None, False) })
 }
 
+/// Matches stream names against a compiled glob. Rejects empty, oversized, or
+/// invalid patterns.
 pub fn pattern(value: String) -> Result(Filter, Nil) {
   let trimmed = string.trim(value)
   let length = list.length(string.to_utf_codepoints(trimmed))
@@ -117,6 +133,7 @@ pub fn pattern(value: String) -> Result(Filter, Nil) {
   }
 }
 
+/// Adds or replaces the exact persisted event-kind constraint.
 pub fn with_event_type(filter: Filter, kind: String) -> Filter {
   Filter(..filter, kind: Some(kind))
 }
@@ -160,6 +177,7 @@ pub fn event_kind(filter: Filter) -> Option(String) {
   filter.kind
 }
 
+/// Reports whether a stream and persisted event kind satisfy the filter.
 pub fn matches(filter: Filter, stream: Id, kind: String) -> Bool {
   case filter.kind {
     Some(expected) if expected != kind -> False

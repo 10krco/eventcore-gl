@@ -1,4 +1,7 @@
 //// Run modeled commands, projections, and views using the standard runtime.
+////
+//// **Experimental.** This module is outside the EventCore 1.x compatibility
+//// guarantee. Its types and functions may change in a minor release.
 
 import eventcore/command
 import eventcore/model.{type Component, type Modeled}

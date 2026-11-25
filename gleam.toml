@@ -1,9 +1,17 @@
 name = "eventcore"
-version = "0.1.0"
+version = "1.0.0"
 target = "erlang"
-description = "Gleam port of the EventCore multi-stream event sourcing library"
+description = "Multi-stream event sourcing for Gleam on Erlang/OTP"
 licences = ["MIT"]
 repository = { type = "github", user = "10krco", repo = "eventcore-gl" }
+
+[documentation]
+pages = [
+  { title = "Commands and atomic transfers", path = "commands.html", source = "docs/commands.md" },
+  { title = "Projections and recovery", path = "projections.html", source = "docs/projections.md" },
+  { title = "Storage backends", path = "backends.html", source = "docs/backends.md" },
+  { title = "Testing", path = "testing.html", source = "docs/testing.md" },
+]
 
 [dev-dependencies]
 gleeunit = ">= 1.0.0 and < 2.0.0"

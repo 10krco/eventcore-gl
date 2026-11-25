@@ -1,5 +1,7 @@
 //// Filesystem store with immutable checksummed transactions.
 //// The host must provide the util-linux flock executable on PATH.
+////
+//// See the [backend guide](../backends.html) for durability and recovery.
 
 import eventcore/internal/projection_scan
 import eventcore/projection
@@ -15,17 +17,26 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
 
+/// Durability policy for writes to a journal or checkpoint directory.
 pub type Sync {
+  /// Flush journal writes and directory updates for crash durability.
   Full
+  /// Skip explicit filesystem sync. A crash can lose recent writes.
   Unsynced
 }
 
+/// Journal root and sync policy. Use the same root for standalone checkpoint
+/// and coordinator components that share a lease.
 pub type Config {
   Config(root: String, sync: Sync)
 }
 
+/// Policy for interpreting concurrent claims on a stream and recording
+/// resolutions. Choose it when opening a journal.
 pub type Reconciliation {
+  /// Use complete branch histories for explicit conflict resolution.
   FullBranches
+  /// Use the Rust 2.1.0 compatibility rules for fork detection and resolution.
   RustRelease
 }
 
@@ -37,13 +48,21 @@ pub type Codec(payload) {
   )
 }
 
+/// The journal or a standalone filesystem component could not be opened.
 pub type OpenError {
+  /// Another handle or process holds the journal writer lock.
   StoreLocked
+  /// The required flock executable was unavailable.
   LockExecutableMissing
+  /// The supplied replica identity was blank after trimming.
   InvalidReplicaId
+  /// The directory, lock, or journal could not be prepared.
   CannotOpen
 }
 
+/// The journal inspection results. Integrity failures identify damaged or
+/// unreadable transaction files. Dangling entries and forks describe the
+/// transaction graph recovered from the remaining files.
 pub type Status {
   Status(
     integrity_failures: List(String),
@@ -52,39 +71,60 @@ pub type Status {
   )
 }
 
+/// A transaction that refers to one or more unavailable parent transactions.
+/// Recover or import the missing parents to restore a complete history.
 pub type Dangling {
   Dangling(transaction: String, missing_parents: List(String))
 }
 
+/// Concurrent transaction claims on one stream from a shared base version.
+/// The transaction IDs identify the claims being considered for resolution.
 pub type Fork {
   Fork(stream: Id, base_version: Version, transactions: List(String))
 }
 
+/// Decoded event evidence for one transaction in a fork. The reconciliation
+/// policy determines the extent of its event history.
 pub type Branch(payload) {
   Branch(transaction: String, events: List(Event(payload)))
 }
 
+/// The fork and its decoded branches as seen by a reconciliation callback.
 pub type ForkContext(payload) {
   ForkContext(fork: Fork, branches: List(Branch(payload)))
 }
 
+/// The application decision returned for a fork. A resolution is recorded as
+/// a journal transaction, preserving the existing branch evidence.
 pub type Resolution(payload) {
+  /// Supply events to attach to the joined branch evidence.
   Resolve(events: List(Event(payload)))
+  /// Leave this fork open for later inspection or resolution.
   Unresolvable(reason: String)
 }
 
+/// The count of resolutions recorded by this call and streams for which the
+/// resolver declined a fork.
 pub type ReconcileReport {
   ReconcileReport(resolved_count: Int, unresolved_streams: List(Id))
 }
 
+/// A failure while inspecting or reconciling the journal.
 pub type JournalError {
+  /// The journal server is unavailable.
   JournalUnavailable
+  /// Two independent transaction histories claim the same replica ID.
   ReplicaIdentityConflict(replica: String, first: String, second: String)
+  /// The graph changed while a resolution was in progress. Inspect a fresh view.
   ReconciliationChanged
+  /// The prefix length is negative or exceeds the available canonical history.
   InvalidEventPrefix
+  /// Event encoding, decoding, or a store operation failed.
   JournalStoreError(StoreError)
 }
 
+/// An open journal and its event codec. Keep the opening process alive and
+/// close the handle when the application no longer needs the journal lock.
 pub opaque type Filesystem(payload) {
   Filesystem(
     server: Server,
@@ -95,6 +135,8 @@ pub opaque type Filesystem(payload) {
 
 type Server
 
+/// Open a journal with full sync and the full-branch reconciliation policy.
+/// The root is created if necessary and held under a writer lock.
 pub fn open(
   root: String,
   codec: Codec(payload),
@@ -102,6 +144,8 @@ pub fn open(
   open_with_config(Config(root, Full), codec)
 }
 
+/// Open a journal with the supplied root and sync policy, using the default
+/// replica identity and full-branch reconciliation.
 pub fn open_with_config(
   config: Config,
   codec: Codec(payload),
@@ -109,6 +153,9 @@ pub fn open_with_config(
   open_with_reconciliation(config, None, FullBranches, codec)
 }
 
+/// Open with a caller-provided replica identity and full-branch
+/// reconciliation. Supply an identity unique to this replica when exchanging
+/// transactions with other journals.
 pub fn open_with_replica(
   config: Config,
   replica: String,
@@ -135,27 +182,37 @@ pub fn open_with_reconciliation(
   }
 }
 
+/// Stop the journal server and release the writer lock. Stop dependent
+/// operations before closing their handle.
 pub fn close(filesystem: Filesystem(payload)) -> Result(Nil, StoreError) {
   stop(filesystem.server)
   |> result.replace_error(store.StoreFailure(store.CloseStore))
 }
 
+/// Inspect damaged transactions, missing parents, and detectable forks in
+/// the open journal. A replica identity conflict can prevent fork detection.
 pub fn status(filesystem: Filesystem(payload)) -> Result(Status, JournalError) {
   journal_status(filesystem.server)
 }
 
+/// Read the replica identity used for transactions written by this journal.
 pub fn replica_id(
   filesystem: Filesystem(payload),
 ) -> Result(String, JournalError) {
   journal_replica_id(filesystem.server)
 }
 
+/// Find the forks recognized by this journal’s reconciliation policy. An
+/// identity shared by independent histories can produce a replica conflict.
 pub fn detect_forks(
   filesystem: Filesystem(payload),
 ) -> Result(List(Fork), JournalError) {
   journal_forks(filesystem.server)
 }
 
+/// Count transactions with multiple parents in the current journal graph.
+/// Use an event prefix token to compare the canonical order of a consumed
+/// event prefix.
 pub fn topology_generation(
   filesystem: Filesystem(payload),
 ) -> Result(Int, JournalError) {
@@ -308,6 +365,8 @@ fn snapshot_repository(
   )
 }
 
+/// Expose the journal as an event store. For snapshot-backed commands that
+/// must keep replay and append on one reconciled view, use `command_view`.
 pub fn as_store(filesystem: Filesystem(payload)) -> Store(payload) {
   event_store(filesystem, None)
 }

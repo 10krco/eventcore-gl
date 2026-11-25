@@ -1,5 +1,7 @@
 //// In-memory event store backed by an OTP process. The store stops when its
 //// creating process exits. Call close to release it earlier.
+////
+//// See the [backend guide](../backends.html) for resource ownership.
 
 import eventcore/internal/projection_scan
 import eventcore/projection
@@ -14,10 +16,14 @@ import gleam/list
 import gleam/option.{None, Some}
 import gleam/result
 
+/// An in-process event store handle. Events, command snapshots, and projection
+/// checkpoints live until it closes or the process that opened it exits.
 pub opaque type Memory(payload) {
   Memory(Server(State(payload)))
 }
 
+/// An independent in-memory checkpoint handle. Its names and lifetime are
+/// separate from any event store.
 pub opaque type CheckpointStore {
   CheckpointStore(Server(Dict(String, projection.Position)))
 }
@@ -50,18 +56,22 @@ fn call(
 @external(erlang, "eventcore_memory_ffi", "stop")
 fn stop(server: Server(state)) -> Result(Nil, Nil)
 
+/// Start an empty event store owned by the calling BEAM process. Keep that
+/// process alive for the lifetime of the store.
 pub fn start() -> Result(Memory(payload), StoreError) {
   start_server(State(dict.new(), dict.new(), dict.new(), 0, dict.new()))
   |> result.map(Memory)
   |> result.replace_error(store.StoreFailure(store.StartStore))
 }
 
+/// Stop the event store and discard its events, snapshots, and progress.
 pub fn close(memory: Memory(payload)) -> Result(Nil, StoreError) {
   let Memory(server) = memory
   stop(server)
   |> result.replace_error(store.StoreFailure(store.CloseStore))
 }
 
+/// Expose stream reads and atomic optimistic appends on this handle.
 pub fn as_store(memory: Memory(payload)) -> Store(payload) {
   store.Store(
     fn(id, version) { read_after(memory, id, version) },
@@ -125,6 +135,8 @@ fn append_events(
   response
 }
 
+/// Store command snapshots on the same in-memory handle as the event log.
+/// The repository is useful for tests and disposable command runs.
 pub fn snapshots(memory: Memory(payload)) -> snapshot.Repository {
   let Memory(server) = memory
   snapshot.Repository(
@@ -234,6 +246,7 @@ pub fn start_checkpoints() -> Result(CheckpointStore, StoreError) {
   |> result.replace_error(store.StoreFailure(store.StartStore))
 }
 
+/// Stop the independently opened checkpoint store and discard its progress.
 pub fn close_checkpoints(
   checkpoints: CheckpointStore,
 ) -> Result(Nil, StoreError) {
@@ -242,6 +255,8 @@ pub fn close_checkpoints(
   |> result.replace_error(store.StoreFailure(store.CloseStore))
 }
 
+/// Adapt an independent store to the runner’s named checkpoint interface.
+/// Combine it with a reader and a coordinator when building a custom backend.
 pub fn standalone_projection_checkpoints(
   checkpoints: CheckpointStore,
 ) -> projection.Checkpoints {
@@ -249,6 +264,8 @@ pub fn standalone_projection_checkpoints(
   checkpoint_view(server, fn(saved) { saved }, fn(_, saved) { saved })
 }
 
+/// Use the checkpoints held inside the event store. All views of the same
+/// handle share the same checkpoint names.
 pub fn projection_checkpoints(
   memory: Memory(payload),
 ) -> projection.Checkpoints {

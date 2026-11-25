@@ -1,4 +1,6 @@
 //// PostgreSQL event and checkpoint storage for an existing Pog pool.
+////
+//// See the [backend guide](../backends.html) for setup and migrations.
 
 import eventcore/internal/uuid_position
 
@@ -21,6 +23,8 @@ import gleam/result
 import gleam/string
 import pog
 
+/// Encode event payloads into bytes and decode them using their stored kind.
+/// Keep decoders for historical events that the stream can still replay.
 pub type Codec(payload) {
   Codec(
     encode: fn(String, payload) -> Result(BitArray, String),
@@ -28,20 +32,28 @@ pub type Codec(payload) {
   )
 }
 
+/// A Pog connection pool paired with an event payload codec. The caller owns
+/// the pool lifecycle.
 pub opaque type EventStore(payload) {
   EventStore(pool: pog.Connection, codec: Codec(payload))
 }
 
+/// A view of a caller-owned Pog pool for named portable projection progress.
+/// The checkpoint database may be separate from the event database.
 pub opaque type CheckpointStore {
   CheckpointStore(pool: pog.Connection)
 }
 
+/// A PostgreSQL schema migration could not complete.
 pub type MigrationError {
   MigrationFailed
 }
 
+/// A direct checkpoint operation rejected a position or failed in PostgreSQL.
 pub type CheckpointError {
+  /// The numeric position is outside the nonnegative signed 64-bit range.
   InvalidPosition
+  /// The checkpoint query or transaction failed.
   CheckpointFailed
 }
 
@@ -95,11 +107,15 @@ pub fn from_pool(
   EventStore(pool, codec)
 }
 
+/// Check that the event store can execute a query through its pool.
 pub fn ping(events: EventStore(payload)) -> Result(Nil, StoreError) {
   execute(events.pool, "SELECT 1", [])
   |> result.replace_error(store.StoreFailure(store.StartStore))
 }
 
+/// Create the event log, global append position, numeric checkpoint, and
+/// command snapshot tables in one transaction. Run before first use. Use
+/// `migrate_delivery` afterward for strict or UUID-based delivery.
 pub fn migrate(events: EventStore(payload)) -> Result(Nil, MigrationError) {
   migrate_tables(events.pool, [
     "CREATE TABLE IF NOT EXISTS eventcore_positions (
@@ -117,10 +133,16 @@ pub fn migrate(events: EventStore(payload)) -> Result(Nil, MigrationError) {
   ])
 }
 
+/// A failure to read a strict-delivery frontier or construct a delivery
+/// envelope from a persisted row.
 pub type DeliveryError {
+  /// The frontier or event rows could not be read.
   DeliveryReadFailed
+  /// A stored stream name failed EventCore’s stream identifier validation.
   InvalidDeliveryStream(String)
+  /// A row had an invalid stream version.
   InvalidDeliveryVersion(Int)
+  /// The persisted payload could not be unpacked at the given position.
   InvalidDeliveryPayload(projection.Position, String)
 }
 
@@ -204,6 +226,9 @@ pub fn migrate_delivery(
   ])
 }
 
+/// Expose strict delivery in committed insertion order after `migrate_delivery`.
+/// The supplied identity should name the same physical event log on each run.
+/// Envelopes carry original encoded payloads for the projector to decode.
 pub fn projection_source(
   events: EventStore(payload),
   id: delivery.SourceId,
@@ -423,6 +448,9 @@ pub fn checkpoints_from_pool(pool: pog.Connection) -> CheckpointStore {
   CheckpointStore(pool)
 }
 
+/// Create the numeric checkpoint table in a separate checkpoint database.
+/// The ordinary event-store migration already creates it in the event
+/// database.
 pub fn migrate_checkpoints(
   checkpoints: CheckpointStore,
 ) -> Result(Nil, MigrationError) {
@@ -505,6 +533,8 @@ fn encode_snapshot(value: snapshot.Snapshot) -> BitArray
 @external(erlang, "eventcore_snapshot_wire", "decode")
 fn decode_snapshot(value: BitArray) -> Result(snapshot.Snapshot, Nil)
 
+/// Expose PostgreSQL stream reads and atomic optimistic appends after
+/// migrating the event database.
 pub fn as_store(events: EventStore(payload)) -> Store(payload) {
   store.Store(fn(id, version) { read(events, id, version) }, fn(writes) {
     append(events, writes)
@@ -665,6 +695,8 @@ pub fn migrate_release_checkpoints(
   ])
 }
 
+/// Adapt the migrated UUID checkpoint namespace to the portable runner.
+/// Pair it with `projection_release_reader`.
 pub fn projection_release_checkpoints(
   checkpoints: CheckpointStore,
 ) -> projection.Checkpoints {
@@ -708,6 +740,8 @@ pub fn projection_release_checkpoints(
   )
 }
 
+/// Adapt migrated numeric checkpoints to the portable runner. Pair this
+/// with the insertion-order projection reader.
 pub fn projection_checkpoints(
   checkpoints: CheckpointStore,
 ) -> projection.Checkpoints {
@@ -736,6 +770,8 @@ pub fn projection_checkpoints(
   )
 }
 
+/// Combine insertion-order reads, numeric checkpoints, and session
+/// leadership using the event store’s pool.
 pub fn projection_backend(
   events: EventStore(payload),
 ) -> projection_runner.Backend(payload) {
@@ -745,6 +781,8 @@ pub fn projection_backend(
   )
 }
 
+/// Use a supplied checkpoint pool for numeric progress and session
+/// leadership while reading the original event store.
 pub fn projection_backend_with_checkpoints(
   events: EventStore(payload),
   checkpoints: CheckpointStore,
@@ -799,6 +837,8 @@ fn checkpoint_connection(pool: pog.Connection, name: String) -> pog.Connection
 @external(erlang, "eventcore_postgres_ffi", "projection_connection")
 fn projection_connection(pool: pog.Connection) -> pog.Connection
 
+/// Delete the named numeric checkpoint. Coordinate with the portable
+/// projector and its derived data before restarting from the beginning.
 pub fn reset_checkpoint(
   checkpoints: CheckpointStore,
   name: String,
@@ -844,6 +884,8 @@ fn reset_checkpoint_in(
   |> result.replace_error(CheckpointFailed)
 }
 
+/// Read the named numeric checkpoint. An unused or reset name returns
+/// `Ok(None)`.
 pub fn load_checkpoint(
   checkpoints: CheckpointStore,
   name: String,
@@ -862,6 +904,9 @@ pub fn load_checkpoint(
   }
 }
 
+/// Set the named numeric checkpoint, replacing any earlier value. Position
+/// must be a nonnegative signed 64-bit integer. Coordinate with the projector
+/// if you write progress outside the runner.
 pub fn save_checkpoint(
   checkpoints: CheckpointStore,
   name: String,

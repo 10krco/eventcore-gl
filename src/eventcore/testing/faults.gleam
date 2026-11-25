@@ -5,26 +5,34 @@ import eventcore/stream
 import gleam/float
 import gleam/option.{type Option, None, Some}
 
+/// Probabilities for injected faults and an optional reproducible seed.
 pub opaque type Chaos {
   Chaos(seed: Option(Int), failure: Float, conflict: Float)
 }
 
+/// Start with a random seed and zero probability of injected faults.
 pub fn chaos() -> Chaos {
   Chaos(None, 0.0, 0.0)
 }
 
+/// Start with seed zero and zero probability of injected faults.
 pub fn deterministic() -> Chaos {
   Chaos(Some(0), 0.0, 0.0)
 }
 
+/// Use the given seed to reproduce outcomes for the same sequence of calls.
 pub fn with_seed(config: Chaos, seed: Int) -> Chaos {
   Chaos(..config, seed: Some(seed))
 }
 
+/// Set the probability that a read or append fails with `StoreFailure`.
+/// The probability is clamped to the range from zero to one.
 pub fn with_failure_probability(config: Chaos, probability: Float) -> Chaos {
   Chaos(..config, failure: float.clamp(probability, 0.0, 1.0))
 }
 
+/// Set the probability that an append fails with `VersionConflict`.
+/// The probability is clamped to the range from zero to one.
 pub fn with_version_conflict_probability(
   config: Chaos,
   probability: Float,
