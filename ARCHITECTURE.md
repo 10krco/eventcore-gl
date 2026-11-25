@@ -153,3 +153,11 @@ Domain modules combine required field values in private constructors. Input
 origins and state recipes provide roots. Mappings read one or more typed fields
 and produce the exact target field value, with fallible transformations
 preserving their domain errors. See [ADR 0017](docs/decisions/0017-typed-model-components.md).
+
+Modeled commands adapt their typed declarations, replay logic, and emitted
+events to the ordinary command runtime. Modeled projections use the ordinary
+projection runner with a checked effect sink. The adapter reports projection
+errors separately from sink errors and passes the delivery position to the
+sink. Tests and examples can use the serialized in-memory sink and render its
+read model through a typed view. See
+[ADR 0018](docs/decisions/0018-modeled-runtime.md).
