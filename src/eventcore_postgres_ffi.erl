@@ -226,10 +226,14 @@ run_transaction_command(Pool, Key, Ref, Connection, StateKey, Command, Sql) ->
         #{command := rollback} when Command =:= commit ->
             erase(StateKey),
             {error, rolled_back};
-        {error, {pgsql_error, #{code := Code}}} when Command =:= commit ->
-            case commit_rejected(Code) of
+        {error, {pgsql_error, Fields}} when Command =:= commit ->
+            case commit_rejected(Fields) of
                 true ->
                     erase(StateKey),
+                    case advisory_query_no_parameter(Connection, "ROLLBACK") of
+                        #{command := rollback} -> ok;
+                        _ -> discard_session(Pool, Key, Ref, Connection)
+                    end,
                     {error, rolled_back};
                 false ->
                     failed_transaction_command(Pool, Key, Ref, Connection, StateKey)
@@ -238,13 +242,13 @@ run_transaction_command(Pool, Key, Ref, Connection, StateKey, Command, Sql) ->
             failed_transaction_command(Pool, Key, Ref, Connection, StateKey)
     end.
 
-%% Integrity violations, the default RAISE EXCEPTION from a deferred trigger,
-%% and transaction rollback SQLSTATEs prove that PostgreSQL rejected COMMIT.
-%% 40003 explicitly leaves completion unknown.
-commit_rejected(<<"23", _/binary>>) -> true;
-commit_rejected(<<"P0001">>) -> true;
-commit_rejected(<<"40003">>) -> false;
-commit_rejected(<<"40", _/binary>>) -> true;
+%% Pgo returns pgsql_error from an extended query only after ReadyForQuery.
+%% A nonfatal ERROR is an explicit rejection unless the server reports
+%% an unknown outcome or a connection exception. V is unlocalized severity.
+commit_rejected(#{code := <<"40003">>}) -> false;
+commit_rejected(#{code := <<"08", _/binary>>}) -> false;
+commit_rejected(#{code := <<_:40>>} = Fields) ->
+    maps:get({unknown, $V}, Fields, maps:get(severity, Fields, undefined)) =:= <<"ERROR">>;
 commit_rejected(_) -> false.
 
 failed_transaction_command(Pool, Key, Ref, Connection, StateKey) ->

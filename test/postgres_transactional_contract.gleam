@@ -229,6 +229,16 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     )
     |> pog.execute(second)
   check_commit_rejection(destination, source, config, second, position1, 600)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE OR REPLACE FUNCTION reject_projection() RETURNS trigger
+      LANGUAGE plpgsql AS $$ BEGIN
+        RAISE EXCEPTION 'projection commit rejected with a custom SQLSTATE'
+          USING ERRCODE = '22000';
+      END $$",
+    )
+    |> pog.execute(second)
+  check_commit_rejection(destination, source, config, second, position1, 600)
   check_commit_disconnect(destination, source, config, second, position1)
 }
 
