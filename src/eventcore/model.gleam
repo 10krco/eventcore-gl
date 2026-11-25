@@ -178,14 +178,32 @@ pub fn absence(
   constant(field, None)
 }
 
+pub type Dependency {
+  Current(FieldId)
+  Previous(FieldId)
+}
+
+pub fn dependency_field(dependency: Dependency) -> FieldId {
+  case dependency {
+    Current(field) | Previous(field) -> field
+  }
+}
+
 pub opaque type Source(input, value) {
-  Source(read: fn(input) -> value, fields: List(FieldId))
+  Source(read: fn(input) -> value, fields: List(Dependency))
 }
 
 pub fn source(
   field: Field(role, owner, occurrence, value),
 ) -> Source(Modeled(role, owner), value) {
-  Source(fn(input) { field.get(value(input)) }, [field.id])
+  Source(fn(input) { field.get(value(input)) }, [Current(field.id)])
+}
+
+/// Read a field from the prior modeled value in a state transition.
+pub fn previous(
+  field: Field(role, owner, occurrence, value),
+) -> Source(Modeled(role, owner), value) {
+  Source(fn(input) { field.get(value(input)) }, [Previous(field.id)])
 }
 
 pub fn sources(
@@ -214,7 +232,7 @@ pub fn paired_sources(
 pub opaque type Mapping(input, output) {
   Mapping(
     name: String,
-    source_fields: List(FieldId),
+    source_fields: List(Dependency),
     target_field: FieldId,
     apply: fn(input) -> output,
   )
@@ -249,6 +267,16 @@ pub fn apply(mapping: Mapping(input, output), input: input) -> output {
 pub fn mapping_fields(
   mapping: Mapping(input, output),
 ) -> #(String, List(FieldId), FieldId) {
+  #(
+    mapping.name,
+    list.map(mapping.source_fields, dependency_field),
+    mapping.target_field,
+  )
+}
+
+pub fn mapping_dependencies(
+  mapping: Mapping(input, output),
+) -> #(String, List(Dependency), FieldId) {
   #(mapping.name, mapping.source_fields, mapping.target_field)
 }
 

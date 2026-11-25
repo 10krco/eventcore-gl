@@ -162,3 +162,9 @@ sink. Tests and examples can use delivery positions to handle redelivery in
 the serialized in-memory sink, then render its read model through a typed
 view. See
 [ADR 0018](docs/decisions/0018-modeled-runtime.md).
+
+The model checker consumes a registry built from typed declarations. Mappings
+record current and previous value dependencies alongside their executable
+transformations. The checker walks each required field in stable order,
+checks producers and temporal seeds, and reports accepted assumptions
+explicitly. See [ADR 0019](docs/decisions/0019-model-provenance-checker.md).
