@@ -1,6 +1,8 @@
 //// Run against two independently opened pools on the same fresh database.
 
 import eventcore/postgres
+import eventcore/projection
+import eventcore/projection_delivery as delivery
 import eventcore/snapshot
 import eventcore/store
 import eventcore/stream
@@ -52,6 +54,7 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     postgres.as_store(reopened),
   )
   check_trigger_rollback(first, postgres.as_store(reopened))
+  check_committed_delivery(first, events, reopened)
 
   let assert Ok(key) = snapshot.key("ledger/v1")
   let assert Ok(two) = stream.version(2)
@@ -178,4 +181,75 @@ fn check_trigger_rollback(pool: pog.Connection, events: store.Store(Int)) {
     |> pog.execute(pool)
   assert positions
     == [#(last_position + 1, "created"), #(last_position + 2, "second")]
+}
+
+fn check_committed_delivery(
+  pool: pog.Connection,
+  events: postgres.EventStore(Int),
+  reopened: postgres.EventStore(Int),
+) -> Nil {
+  assert postgres.migrate_delivery(events) == Ok(Nil)
+  let assert Ok(id) = delivery.source_id("orders-database")
+  let source = postgres.projection_source(reopened, id)
+  let assert Ok(selection_id) = delivery.selection_id("debit-v1")
+  let assert Ok(prefix) = projection.prefix("contract/debit")
+  let assert Ok(opened) = delivery.event_type("opened")
+  let assert Ok(withdrawn) = delivery.event_type("withdrawn")
+  let assert Ok(selection) =
+    delivery.selection(selection_id, prefix, [opened, withdrawn])
+  let assert Ok(page) = projection.page(None, 1)
+  let assert Ok([first]) = source.read(selection, page, delivery.Unbounded)
+  assert first.source == id
+  assert first.event_type == opened
+  assert first.payload == <<100:64>>
+  assert first.metadata == "{}"
+  assert first.version == stream.next_version(stream.initial_version)
+  assert postgres.migrate_delivery(reopened) == Ok(Nil)
+  assert source.read(selection, page, delivery.Unbounded) == Ok([first])
+
+  let assert Ok(_) =
+    pog.query(
+      "UPDATE eventcore_events SET metadata = $1::text::json
+      WHERE event_id = $2::text::uuid",
+    )
+    |> pog.parameter(pog.text("{\"precision\":0.12345678901234567890123456789}"))
+    |> pog.parameter(pog.text(first.event_id))
+    |> pog.execute(pool)
+  let assert Ok([raw]) = source.read(selection, page, delivery.Unbounded)
+  assert raw.metadata == "{\"precision\":0.12345678901234567890123456789}"
+
+  let assert Ok(Some(before)) = source.high_watermark()
+  let assert Ok(new_stream) = stream.id("contract/debit/after")
+  let assert Ok(batch) =
+    store.register(store.writes(), new_stream, stream.initial_version)
+  let assert Ok(batch) =
+    store.append(batch, store.Event(new_stream, " opened ", 200))
+  assert postgres.as_store(events).append_events(batch) == Ok(Nil)
+  let assert Ok(Some(boundary)) = source.high_watermark()
+
+  let next_batch =
+    single_event(new_stream, stream.next_version(stream.initial_version), 300)
+  assert postgres.as_store(reopened).append_events(next_batch) == Ok(Nil)
+  let assert Ok(persisted) = delivery.persisted_event_type(" opened ")
+  let assert Ok(later) = delivery.event_type("created")
+  let assert Ok(exact_selection) =
+    delivery.selection(selection_id, prefix, [persisted, later])
+  let assert Ok(page) = projection.page(Some(before), 1)
+  let assert Ok([at_boundary]) =
+    source.read(exact_selection, page, delivery.Inclusive(boundary))
+  assert at_boundary.position == boundary
+  assert at_boundary.event_type == persisted
+  assert at_boundary.event_id != first.event_id
+  assert at_boundary.payload == <<200:64>>
+
+  let assert Ok(page) = projection.page(Some(boundary), 1)
+  assert source.read(exact_selection, page, delivery.Inclusive(boundary))
+    == Ok([])
+  let assert Ok([after]) =
+    source.read(exact_selection, page, delivery.Unbounded)
+  assert after.event_id != at_boundary.event_id
+  assert after.payload == <<300:64>>
+  assert projection.sequence(after.position)
+    == projection.sequence(boundary) + 1
+  Nil
 }
