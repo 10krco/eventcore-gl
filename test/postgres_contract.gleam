@@ -55,6 +55,18 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
     postgres.as_store(reopened),
   )
   check_trigger_rollback(first, postgres.as_store(reopened))
+  let acquire = postgres.projection_coordinator(first)
+  let competing_acquire = postgres.projection_coordinator(second)
+  let assert Ok(leader) = acquire("standalone")
+  assert competing_acquire("standalone") == Error(runner.AlreadyLeading)
+  leader.release()
+  let assert Ok(leader) = competing_acquire("standalone")
+  let assert Ok(one) = projection.position(1)
+  let projection_checkpoints =
+    postgres.projection_checkpoints(second_checkpoints)
+  assert projection_checkpoints.save("standalone", one) == Ok(Nil)
+  leader.release()
+  assert postgres.load_checkpoint(checkpoints, "standalone") == Ok(Some(1))
   check_legacy_projection(events, reopened, second_checkpoints)
   check_committed_delivery(first, events, reopened)
 

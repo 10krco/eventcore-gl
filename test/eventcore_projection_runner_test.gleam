@@ -7,6 +7,74 @@ import gleam/erlang/process
 import gleam/option.{None, Some}
 import gleam/result
 
+pub fn standalone_checkpoints_and_local_leases_compose_with_an_event_store_test() {
+  let assert Ok(events) = memory.start()
+  let assert Ok(saved) = memory.start_checkpoints()
+  let assert Ok(isolated) = memory.start_checkpoints()
+  let assert Ok(leader) = runner.start_local_coordinator()
+  let assert Ok(other_leader) = runner.start_local_coordinator()
+  let checkpoints = memory.standalone_projection_checkpoints(saved)
+  let acquire = runner.local_coordinator(leader)
+  let independently_acquire = runner.local_coordinator(other_leader)
+  let backend =
+    runner.Backend(memory.projection_reader(events), checkpoints, acquire)
+
+  let assert Ok(id) = stream.id("standalone")
+  let assert Ok(writes) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(writes) = store.append(writes, store.Event(id, "added", 42))
+  assert memory.as_store(events).append_events(writes) == Ok(Nil)
+  let projector =
+    runner.Projector(
+      name: "standalone",
+      filter: projection.all(),
+      initial: 0,
+      apply: fn(total, delivery) { #(total + delivery.event.payload, Ok(Nil)) },
+      on_error: fn(_) { runner.Fatal },
+    )
+
+  let assert Ok(held) = acquire("standalone")
+  assert acquire("standalone") == Error(runner.AlreadyLeading)
+  let assert Ok(distinct) = independently_acquire("standalone")
+  distinct.release()
+  assert runner.run(
+      backend,
+      projector,
+      runner.default_config,
+      runner.uninterrupted(),
+    )
+    == Error(runner.Leadership(runner.AlreadyLeading))
+  held.release()
+  assert runner.run(
+      backend,
+      projector,
+      runner.default_config,
+      runner.uninterrupted(),
+    )
+    == Ok(42)
+  let assert Ok(one) = projection.position(1)
+  assert checkpoints.load("standalone") == Ok(Some(one))
+  assert memory.projection_checkpoints(events).load("standalone") == Ok(None)
+  assert memory.standalone_projection_checkpoints(isolated).load("standalone")
+    == Ok(None)
+  assert runner.run(
+      backend,
+      projector,
+      runner.default_config,
+      runner.uninterrupted(),
+    )
+    == Ok(0)
+
+  assert runner.close_local_coordinator(leader) == Ok(Nil)
+  assert acquire("standalone") == Error(runner.CoordinatorUnavailable)
+  assert runner.close_local_coordinator(other_leader) == Ok(Nil)
+  assert memory.close_checkpoints(saved) == Ok(Nil)
+  assert checkpoints.load("standalone")
+    == Error(store.StoreFailure(store.LoadCheckpoint))
+  assert memory.close_checkpoints(isolated) == Ok(Nil)
+  assert memory.close(events) == Ok(Nil)
+}
+
 pub fn batch_retries_skips_and_saves_filtered_frontier_test() {
   let assert Ok(memory) = memory.start()
   let backend = memory.projection_backend(memory)

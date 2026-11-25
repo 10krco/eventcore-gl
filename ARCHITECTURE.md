@@ -116,6 +116,13 @@ waits. Memory leases live in the store process, require a holder on its BEAM nod
 holder exits. [ADR 0010](docs/decisions/0010-legacy-projection-runner.md)
 records the failure and checkpoint policies.
 
+Projection readers, checkpoints and coordinators can also be composed
+independently. Memory provides an isolated checkpoint store. Memory and
+SQLite can use a shared BEAM-local coordinator with monitored holders.
+PostgreSQL provides an independent coordinator from an existing pool and
+routes checkpoint writes through the held session when both components
+use that pool. See [ADR 0024](docs/decisions/0024-standalone-projection-components.md).
+
 Filesystem projections use a replica-local ingestion sequence. The server
 recovers persisted assignments before assigning positions to imported
 transactions. It syncs the journal directory before publishing newly recovered

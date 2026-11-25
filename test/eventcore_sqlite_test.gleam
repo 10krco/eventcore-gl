@@ -274,6 +274,45 @@ pub fn command_snapshot_reopens_and_prevents_regression_test() {
   assert delete_database(path) == Nil
 }
 
+pub fn sqlite_projection_uses_an_independently_owned_local_coordinator_test() {
+  let assert Ok(events) = sqlite.open_memory(integer_codec())
+  let assert Ok(checkpoints) = sqlite.open_memory_checkpoints()
+  let assert Ok(coordinator) = projection_runner.start_local_coordinator()
+  let assert Ok(Nil) = sqlite.migrate(events)
+  let assert Ok(Nil) = sqlite.migrate_checkpoints(checkpoints)
+  let assert Ok(id) = stream.id("independent")
+  let assert Ok(writes) =
+    store.register(store.writes(), id, stream.initial_version)
+  let assert Ok(writes) = store.append(writes, store.Event(id, "added", 7))
+  assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
+
+  let acquire = projection_runner.local_coordinator(coordinator)
+  let coupled = sqlite.projection_backend_with_checkpoints(events, checkpoints)
+  let assert Ok(coupled_lease) = coupled.acquire("local")
+  let backend =
+    projection_runner.Backend(coupled.reader, coupled.checkpoints, acquire)
+  let projector =
+    projection_runner.Projector(
+      name: "local",
+      filter: projection.all(),
+      initial: 0,
+      apply: fn(total, delivery) { #(total + delivery.event.payload, Ok(Nil)) },
+      on_error: fn(_) { projection_runner.Fatal },
+    )
+  assert projection_runner.run(
+      backend,
+      projector,
+      projection_runner.default_config,
+      projection_runner.uninterrupted(),
+    )
+    == Ok(7)
+  assert sqlite.load_checkpoint(checkpoints, "local") == Ok(Some(1))
+  coupled_lease.release()
+  assert projection_runner.close_local_coordinator(coordinator) == Ok(Nil)
+  assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
+  assert sqlite.close(events) == Ok(Nil)
+}
+
 pub fn projection_pages_resume_from_a_separate_sqlite_checkpoint_test() {
   let path = temp_database()
   let checkpoint_path = temp_database()

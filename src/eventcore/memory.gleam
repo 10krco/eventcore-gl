@@ -18,6 +18,10 @@ pub opaque type Memory(payload) {
   Memory(Server(State(payload)))
 }
 
+pub opaque type CheckpointStore {
+  CheckpointStore(Server(Dict(String, projection.Position)))
+}
+
 type State(payload) {
   State(
     streams: Dict(Id, History(payload)),
@@ -223,26 +227,54 @@ fn fetch_chunk(
   }
 }
 
+/// Starts an independent checkpoint store owned by the calling process.
+pub fn start_checkpoints() -> Result(CheckpointStore, StoreError) {
+  start_server(dict.new())
+  |> result.map(CheckpointStore)
+  |> result.replace_error(store.StoreFailure(store.StartStore))
+}
+
+pub fn close_checkpoints(
+  checkpoints: CheckpointStore,
+) -> Result(Nil, StoreError) {
+  let CheckpointStore(server) = checkpoints
+  stop(server)
+  |> result.replace_error(store.StoreFailure(store.CloseStore))
+}
+
+pub fn standalone_projection_checkpoints(
+  checkpoints: CheckpointStore,
+) -> projection.Checkpoints {
+  let CheckpointStore(server) = checkpoints
+  checkpoint_view(server, fn(saved) { saved }, fn(_, saved) { saved })
+}
+
 pub fn projection_checkpoints(
   memory: Memory(payload),
 ) -> projection.Checkpoints {
   let Memory(server) = memory
+  checkpoint_view(
+    server,
+    fn(state: State(payload)) { state.checkpoints },
+    fn(state, saved) { State(..state, checkpoints: saved) },
+  )
+}
+
+fn checkpoint_view(
+  server: Server(state),
+  get: fn(state) -> Dict(String, projection.Position),
+  replace: fn(state, Dict(String, projection.Position)) -> state,
+) -> projection.Checkpoints {
   projection.Checkpoints(
     load: fn(name) {
       call(server, fn(state) {
-        #(state, option.from_result(dict.get(state.checkpoints, name)))
+        #(state, option.from_result(dict.get(get(state), name)))
       })
       |> result.replace_error(store.StoreFailure(store.LoadCheckpoint))
     },
     save: fn(name, position) {
       call(server, fn(state) {
-        #(
-          State(
-            ..state,
-            checkpoints: dict.insert(state.checkpoints, name, position),
-          ),
-          Nil,
-        )
+        #(replace(state, dict.insert(get(state), name, position)), Nil)
       })
       |> result.replace_error(store.StoreFailure(store.SaveCheckpoint))
     },

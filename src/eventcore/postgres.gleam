@@ -546,11 +546,19 @@ pub fn projection_backend_with_checkpoints(
   projection_runner.Backend(
     projection_reader(events),
     projection_checkpoints(checkpoints),
-    fn(name) {
-      use release <- result.map(acquire_projection(checkpoints.pool, name))
-      projection_runner.Lease(release)
-    },
+    projection_coordinator(checkpoints.pool),
   )
+}
+
+/// Acquires a session advisory lock from an existing pool. Use the same pool
+/// as the checkpoint adapter to route its writes through the locked session.
+pub fn projection_coordinator(
+  pool: pog.Connection,
+) -> projection_runner.Coordinator {
+  fn(name) {
+    use release <- result.map(acquire_projection(pool, name))
+    projection_runner.Lease(release)
+  }
 }
 
 @external(erlang, "eventcore_postgres_ffi", "acquire_projection")
