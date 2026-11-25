@@ -29,8 +29,9 @@ pub opaque type Page {
   Page(after: Option(Position), limit: Int)
 }
 
+/// A zero limit reads no events and preserves the input cursor.
 pub fn page(after: Option(Position), limit: Int) -> Result(Page, Nil) {
-  case limit > 0 {
+  case limit >= 0 {
     True -> Ok(Page(after, limit))
     False -> Error(Nil)
   }

@@ -513,6 +513,9 @@ pub fn release_sqlite_uses_native_selection_and_resumes_uuid_after_reopen_test()
   let assert Ok(projection.PageResult([delivery], Some(cursor))) =
     backend.reader(prefix, first_page)
   assert delivery.event == first
+  let assert Ok(empty) = projection.page(Some(cursor), 0)
+  assert backend.reader(prefix, empty)
+    == Ok(projection.PageResult([], Some(cursor)))
   let assert Ok(native) = projection.position(1)
   assert cursor != native
   assert sqlite.save_checkpoint(checkpoints, "notes", 1) == Ok(Nil)
