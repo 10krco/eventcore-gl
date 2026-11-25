@@ -40,6 +40,12 @@ pub fn single(id: Id) -> Declarations {
   Declarations([id])
 }
 
+/// Declares a primary stream and additional participants in first-seen order.
+/// Repeated stream identifiers refer to the same participant.
+pub fn across(primary: Id, participants: List(Id)) -> Declarations {
+  Declarations(list.unique([primary, ..participants]))
+}
+
 pub fn with_participant(
   declarations: Declarations,
   id: Id,
@@ -51,6 +57,18 @@ pub fn with_participant(
 pub type Rejection(domain_error) {
   InvalidState(String)
   BusinessRule(domain_error)
+}
+
+/// Use with `result.try` to stop a handler when a business rule fails.
+/// The error is evaluated only when the condition is false.
+pub fn require(
+  condition: Bool,
+  error: fn() -> domain_error,
+) -> Result(Nil, Rejection(domain_error)) {
+  case condition {
+    True -> Ok(Nil)
+    False -> Error(BusinessRule(error()))
+  }
 }
 
 pub type CommandError(domain_error) {

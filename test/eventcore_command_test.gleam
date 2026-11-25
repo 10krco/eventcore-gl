@@ -6,6 +6,7 @@ import eventcore/stream
 import gleam/dict
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 
 type Notifications(value)
 
@@ -24,6 +25,58 @@ pub fn declarations_validate_and_preserve_uniqueness_test() {
   let assert Error(command.DuplicateStream(duplicate)) =
     command.with_participant(command.single(id), id)
   assert duplicate == id
+}
+
+pub fn typed_participants_replay_once_in_first_seen_order_test() {
+  let assert Ok(source) = stream.id("source")
+  let assert Ok(target) = stream.id("target")
+  let storage =
+    store.Store(
+      fn(id, _) { Ok(store.from_items([Ok(store.Event(id, "opened", Nil))])) },
+      fn(writes) {
+        assert dict.size(store.expected_versions(writes)) == 2
+        Ok(Nil)
+      },
+    )
+  let operation =
+    command.Command(
+      command.across(source, [source, target, target]),
+      fn() { [] },
+      fn(state, event) { [event.stream, ..state] },
+      fn(_) { [] },
+      fn(state) {
+        assert list.reverse(state) == [source, target]
+        Ok([])
+      },
+    )
+  assert command.execute(storage, operation, command.default_policy())
+    == Ok(command.Execution(1))
+}
+
+pub fn requirement_is_lazy_and_short_circuits_a_command_handler_test() {
+  let assert Ok(id) = stream.id("account")
+  let storage =
+    store.Store(fn(_, _) { Ok(store.from_items([])) }, fn(_) {
+      panic as "a rejected command must not append"
+    })
+  let operation =
+    command.Command(
+      command.single(id),
+      fn() { 20 },
+      fn(state, _) { state },
+      fn(_) { [] },
+      fn(balance) {
+        use _ <- result.try(
+          command.require(balance > 0, fn() {
+            panic as "a satisfied requirement must not evaluate its error"
+          }),
+        )
+        use _ <- result.try(command.require(balance >= 30, fn() { balance }))
+        panic as "a failed requirement must stop the handler"
+      },
+    )
+  assert command.execute(storage, operation, command.default_policy())
+    == Error(command.Rejected(command.BusinessRule(20)))
 }
 
 pub fn discovers_participants_and_replays_after_conflicts_test() {
