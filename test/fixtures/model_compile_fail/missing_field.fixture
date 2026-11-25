@@ -1,6 +1,6 @@
 import eventcore/model
 import eventcore/stream
-import model_transfer_example.{type Transfer, AmountField, SourceField, TransferComponent, build_transfer, debit}
+import model_transfer_example.{type Transfer, AmountField, SourceField, Transfer, TransferComponent, build_transfer, debit}
 
 type ExampleInput { ExampleInput }
 

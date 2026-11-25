@@ -197,7 +197,7 @@ fn compile_failure(fixture: String) -> #(Int, String)
 pub fn model_constraints_fail_at_compilation_test() {
   expect_rejected("wrong_target", "Type mismatch", "Int, Credit, Int")
   expect_rejected("wrong_component", "Type mismatch", "Command(Withdrawal)")
-  expect_rejected("missing_field", "Incorrect arity", "target")
+  expect_rejected("missing_field", "Incorrect arity", "  - target")
   expect_rejected("swapped_stream", "Type mismatch", "StreamIdentity(Credit)")
   expect_rejected("wrong_transform", "Type mismatch", "String")
   expect_rejected("invalid_origin", "Type mismatch", "model.Origin")
