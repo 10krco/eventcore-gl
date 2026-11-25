@@ -225,81 +225,116 @@ fn scan_delivery(pool, id, selection, after, high, remaining, reversed) {
     True -> Ok(list.reverse(reversed))
     False -> {
       let through = int.min(after + 128, high)
-      use returned <- result.try(
+      use candidates <- result.try(
         pog.query(
-          "SELECT position, event_id::text, stream, version, kind, payload, metadata::text
-          FROM eventcore_events WHERE position BETWEEN $1 AND $2 ORDER BY position",
+          "SELECT position, stream, kind FROM eventcore_events
+          WHERE position BETWEEN $1 AND $2 AND kind = ANY($3::text[])
+          ORDER BY position",
         )
         |> pog.parameter(pog.int(after + 1))
         |> pog.parameter(pog.int(through))
-        |> pog.returning(delivery_row())
+        |> pog.parameter(pog.array(
+          pog.text,
+          delivery.selection_event_types(selection),
+        ))
+        |> pog.returning({
+          use position <- decode.field(0, decode.int)
+          use stream <- decode.field(1, decode.string)
+          use kind <- decode.field(2, decode.string)
+          decode.success(#(position, stream, kind))
+        })
         |> pog.execute(pool)
         |> result.replace_error(DeliveryReadFailed),
       )
-      use #(remaining, reversed) <- result.try(select_delivery(
-        returned.rows,
+      use positions <- result.try(
+        selected_delivery_positions(candidates.rows, selection, remaining, []),
+      )
+      use rows <- result.try(fetch_delivery_rows(pool, positions))
+      use Nil <- result.try(case list.length(positions) == list.length(rows) {
+        True -> Ok(Nil)
+        False -> Error(DeliveryReadFailed)
+      })
+      use envelopes <- result.try(list.try_map(rows, decode_delivery(_, id)))
+      scan_delivery(
+        pool,
         id,
         selection,
-        remaining,
-        reversed,
-      ))
-      scan_delivery(pool, id, selection, through, high, remaining, reversed)
+        through,
+        high,
+        remaining - list.length(envelopes),
+        list.fold(envelopes, reversed, fn(acc, envelope) { [envelope, ..acc] }),
+      )
     }
   }
 }
 
-fn select_delivery(
-  rows: List(DeliveryRow),
-  id,
-  selection,
-  remaining,
-  reversed,
-) {
+fn selected_delivery_positions(rows, selection, remaining, reversed) {
   case rows, remaining {
-    [], _ | _, 0 -> Ok(#(remaining, reversed))
-    [row, ..rest], _ -> {
-      use stream <- result.try(
-        stream.id(row.stream)
-        |> result.replace_error(InvalidDeliveryStream(row.stream)),
+    [], _ | _, 0 -> Ok(reversed)
+    [#(position, name, kind), ..rest], _ -> {
+      use id <- result.try(
+        stream.id(name) |> result.replace_error(InvalidDeliveryStream(name)),
       )
-      case delivery.selects(selection, stream, row.kind) {
-        False -> select_delivery(rest, id, selection, remaining, reversed)
-        True -> {
-          use position <- result.try(
-            projection.position(row.position)
-            |> result.replace_error(DeliveryReadFailed),
-          )
-          use version <- result.try(
-            stream.version(row.version)
-            |> result.replace_error(InvalidDeliveryVersion(row.version)),
-          )
-          use kind <- result.try(
-            delivery.event_type(row.kind)
-            |> result.replace_error(DeliveryReadFailed),
-          )
-          use payload <- result.try(
-            unpack_payload(row.payload)
-            |> result.map_error(InvalidDeliveryPayload(position, _)),
-          )
-          let envelope =
-            delivery.Envelope(
-              id,
-              position,
-              row.id,
-              stream,
-              version,
-              kind,
-              payload,
-              row.metadata,
-            )
-          select_delivery(rest, id, selection, remaining - 1, [
-            envelope,
+      case delivery.selects(selection, id, kind) {
+        True ->
+          selected_delivery_positions(rest, selection, remaining - 1, [
+            position,
             ..reversed
           ])
-        }
+        False ->
+          selected_delivery_positions(rest, selection, remaining, reversed)
       }
     }
   }
+}
+
+fn fetch_delivery_rows(pool, positions) {
+  case positions {
+    [] -> Ok([])
+    [_, ..] ->
+      pog.query(
+        "SELECT position, event_id::text, stream, version, kind, payload, metadata::text
+        FROM eventcore_events WHERE position = ANY($1::bigint[]) ORDER BY position",
+      )
+      |> pog.parameter(pog.array(pog.int, positions))
+      |> pog.returning(delivery_row())
+      |> pog.execute(pool)
+      |> result.map(fn(result) { result.rows })
+      |> result.replace_error(DeliveryReadFailed)
+  }
+}
+
+fn decode_delivery(row: DeliveryRow, id: delivery.SourceId) {
+  use stream <- result.try(
+    stream.id(row.stream)
+    |> result.replace_error(InvalidDeliveryStream(row.stream)),
+  )
+  use position <- result.try(
+    projection.position(row.position)
+    |> result.replace_error(DeliveryReadFailed),
+  )
+  use version <- result.try(
+    stream.version(row.version)
+    |> result.replace_error(InvalidDeliveryVersion(row.version)),
+  )
+  use kind <- result.try(
+    delivery.persisted_event_type(row.kind)
+    |> result.replace_error(DeliveryReadFailed),
+  )
+  use payload <- result.try(
+    unpack_payload(row.payload)
+    |> result.map_error(InvalidDeliveryPayload(position, _)),
+  )
+  Ok(delivery.Envelope(
+    id,
+    position,
+    row.id,
+    stream,
+    version,
+    kind,
+    payload,
+    row.metadata,
+  ))
 }
 
 /// Use the supplied pool for checkpoint-only operations.

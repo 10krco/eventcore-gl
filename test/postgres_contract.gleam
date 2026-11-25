@@ -223,13 +223,33 @@ fn check_committed_delivery(
   let assert Ok(batch) =
     store.register(store.writes(), new_stream, stream.initial_version)
   let assert Ok(batch) =
-    store.append(batch, store.Event(new_stream, "opened", 200))
+    store.append(batch, store.Event(new_stream, " opened ", 200))
   assert postgres.as_store(events).append_events(batch) == Ok(Nil)
-  let assert Ok(page) = projection.page(Some(before), 10)
-  assert source.read(selection, page, delivery.Inclusive(before)) == Ok([])
-  let assert Ok([after]) = source.read(selection, page, delivery.Unbounded)
-  assert after.event_id != first.event_id
-  assert after.payload == <<200:64>>
-  assert projection.sequence(after.position) == projection.sequence(before) + 1
+  let assert Ok(Some(boundary)) = source.high_watermark()
+
+  let next_batch =
+    single_event(new_stream, stream.next_version(stream.initial_version), 300)
+  assert postgres.as_store(reopened).append_events(next_batch) == Ok(Nil)
+  let assert Ok(persisted) = delivery.persisted_event_type(" opened ")
+  let assert Ok(later) = delivery.event_type("created")
+  let assert Ok(exact_selection) =
+    delivery.selection(selection_id, prefix, [persisted, later])
+  let assert Ok(page) = projection.page(Some(before), 1)
+  let assert Ok([at_boundary]) =
+    source.read(exact_selection, page, delivery.Inclusive(boundary))
+  assert at_boundary.position == boundary
+  assert at_boundary.event_type == persisted
+  assert at_boundary.event_id != first.event_id
+  assert at_boundary.payload == <<200:64>>
+
+  let assert Ok(page) = projection.page(Some(boundary), 1)
+  assert source.read(exact_selection, page, delivery.Inclusive(boundary))
+    == Ok([])
+  let assert Ok([after]) =
+    source.read(exact_selection, page, delivery.Unbounded)
+  assert after.event_id != at_boundary.event_id
+  assert after.payload == <<300:64>>
+  assert projection.sequence(after.position)
+    == projection.sequence(boundary) + 1
   Nil
 }

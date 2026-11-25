@@ -46,6 +46,15 @@ pub fn event_type(value: String) -> Result(EventType, Nil) {
   nonblank(value) |> result.map(EventType)
 }
 
+/// Select an event kind exactly as it was persisted, including whitespace.
+pub fn persisted_event_type(value: String) -> Result(EventType, Nil) {
+  nonblank(value) |> result.map(fn(_) { EventType(value) })
+}
+
+pub fn selection_event_types(selection: Selection) -> List(String) {
+  list.map(selection.event_types, event_type_name)
+}
+
 pub fn event_type_name(kind: EventType) -> String {
   let EventType(value) = kind
   value

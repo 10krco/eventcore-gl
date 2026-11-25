@@ -26,3 +26,13 @@ pub fn identities_and_selection_are_validated_test() {
   assert !delivery.selects(selection, order, "deleted")
   assert !delivery.selects(selection, invoice, "created")
 }
+
+pub fn exact_event_types_preserve_persisted_whitespace_test() {
+  assert delivery.persisted_event_type("  ") == Error(Nil)
+  let assert Ok(exact) = delivery.persisted_event_type(" created ")
+  let assert Ok(id) = delivery.selection_id("exact-created")
+  let assert Ok(stream) = stream.id("order/1")
+  let assert Ok(selection) = delivery.selection(id, projection.all(), [exact])
+  assert delivery.selects(selection, stream, " created ")
+  assert !delivery.selects(selection, stream, "created")
+}
