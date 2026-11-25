@@ -703,8 +703,18 @@ fn append(
   events: EventStore(payload),
   writes: store.Writes(payload),
 ) -> Result(Nil, StoreError) {
-  let expected = store.expected_versions(writes)
-  let entries = store.entries(writes)
+  case store.entries(writes) {
+    [] -> Ok(Nil)
+    [_, ..] as entries ->
+      append_nonempty(events, store.expected_versions(writes), entries)
+  }
+}
+
+fn append_nonempty(
+  events: EventStore(payload),
+  expected: Dict(Id, Version),
+  entries: List(Event(payload)),
+) -> Result(Nil, StoreError) {
   trace_append(dict.size(expected), list.length(entries))
   let ordered =
     dict.to_list(expected)

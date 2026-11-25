@@ -24,7 +24,19 @@ fn integer_codec() -> sqlite.Codec(Int) {
 
 pub fn memory_contract_test() {
   let assert Ok(db) = sqlite.open_memory(integer_codec())
+  let storage = sqlite.as_store(db)
+  let assert Ok(id) = stream.id("contract/empty-append")
+  let assert Ok(stale) =
+    store.register(
+      store.writes(),
+      id,
+      stream.next_version(stream.initial_version),
+    )
+  assert storage.append_events(stale) == Ok(Nil)
   assert sqlite.migrate(db) == Ok(Nil)
+  assert storage.append_events(stale) == Ok(Nil)
+  let assert Ok(events) = store.read_stream(storage, id)
+  assert store.collect(events) == Ok([])
   assert sqlite.migrate(db) == Ok(Nil)
   store_contract.check_atomic_streams(sqlite.as_store(db))
   let assert Ok(checkpoints) = sqlite.open_memory_checkpoints()

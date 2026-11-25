@@ -25,7 +25,19 @@ pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
   let events = postgres.from_pool(first, codec)
   let reopened = postgres.from_pool(second, codec)
   assert postgres.ping(events) == Ok(Nil)
+  let storage = postgres.as_store(events)
+  let assert Ok(id) = stream.id("contract/empty-append")
+  let assert Ok(stale) =
+    store.register(
+      store.writes(),
+      id,
+      stream.next_version(stream.initial_version),
+    )
+  assert storage.append_events(stale) == Ok(Nil)
   assert postgres.migrate(events) == Ok(Nil)
+  assert storage.append_events(stale) == Ok(Nil)
+  let assert Ok(empty) = store.read_stream(storage, id)
+  assert store.collect(empty) == Ok([])
   assert postgres.migrate(reopened) == Ok(Nil)
   store_contract.check_atomic_streams(postgres.as_store(events))
 

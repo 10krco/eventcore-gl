@@ -30,6 +30,10 @@ Owning Tiber task `20261124-m7wf`.
 | [Run PostgreSQL storage contracts](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore-postgres/tests/contract_suite_test.rs) | Pass shared contracts against a real database, migrate and reconnect, commit batches atomically, retry competing writers, and assert the published observability behavior. | [Live PostgreSQL contract](../test/eventcore_postgres_integration_test.gleam) and [two-pool scenarios](../test/postgres_contract.gleam). | [PostgreSQL](https://github.com/10krco/eventcore-gl/actions/runs/45511038580) |
 | [Restore and catch up command state](https://github.com/jwilger/eventcore/tree/fea3e386cce904e9ef9b76cd303926870d04a692/eventcore/tests/command_state_snapshot_test.rs) | Handle a missing snapshot, persist monotonically advancing snapshots, exercise the default 100-event refresh threshold and replay only required events in stream order. Exercise restart on each supporting adapter. | [Replay and refresh tests](../test/eventcore_command_test.gleam), [journal restart and invalidation tests](../test/eventcore_filesystem_test.gleam), and [SQLite restart tests](../test/eventcore_sqlite_test.gleam). The [PostgreSQL contract](../test/postgres_contract.gleam) reopens the snapshot through a second pool and rejects a regressing version. | [Snapshots](https://github.com/10krco/eventcore-gl/actions/runs/45510129472), [PostgreSQL snapshots](https://github.com/10krco/eventcore-gl/actions/runs/45511038580) |
 
+With SQLite and PostgreSQL, an empty append succeeds without checking expected
+versions or opening a database transaction. A nonempty batch still checks every
+registered participant. SQLite and PostgreSQL tests exercise both paths.
+
 Open the journal with `RustRelease` to reproduce the published fork rules.
 The release tests exercise initial claim events, read-only stream claims,
 empty appends, and ordinary appends that close forks. The default
