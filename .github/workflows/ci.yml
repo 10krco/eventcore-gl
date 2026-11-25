@@ -23,5 +23,22 @@ jobs:
         run: |
           nix develop --no-update-lock-file -c gleam clean
           nix develop --no-update-lock-file -c env -u USE_SYSTEM_SQLITE -u CFLAGS -u LDFLAGS EVENTCORE_SQLITE_TEST_BACKEND=plain gleam test
+      - name: Verify the documentation build
+        run: nix develop --no-update-lock-file -c gleam docs build
+      - name: Run the README quickstart
+        run: |
+          example=$(mktemp -d)
+          module=test/readme_quickstart.gleam
+          trap 'rm -rf "$example"; rm -f "$module"' EXIT
+          awk '
+            /^```gleam$/ { copying = 1; next }
+            copying && /^```$/ { closed = 1; exit }
+            copying { print }
+            END { if (!closed) exit 1 }
+          ' README.md > "$example/readme_quickstart.gleam"
+          cp "$example/readme_quickstart.gleam" "$module"
+          nix develop --no-update-lock-file -c env -u USE_SYSTEM_SQLITE -u CFLAGS -u LDFLAGS gleam run -m readme_quickstart > "$example/output"
+          cat "$example/output"
+          test "$(cat "$example/output")" = 'Balance in cents: 1100'
       - name: Verify the committed Gleam manifest
         run: git diff --exit-code HEAD -- manifest.toml

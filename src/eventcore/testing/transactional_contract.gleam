@@ -8,6 +8,7 @@ import eventcore/store
 import gleam/erlang/process
 import gleam/option.{type Option, None, Some}
 
+/// The source, selection, and last position recorded for a projector.
 pub type Progress {
   Progress(
     source: delivery.SourceId,

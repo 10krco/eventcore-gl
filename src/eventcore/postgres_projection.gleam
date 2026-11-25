@@ -11,25 +11,35 @@ import gleam/option.{type Option, None, Some}
 import gleam/result
 import pog
 
+/// PostgreSQL database for projector writes, advisory leadership, and
+/// transactional progress.
 pub opaque type Destination {
   Destination(pool: pog.Connection)
 }
 
+/// Wraps an application-owned Pog pool. Keep it open while running, resetting,
+/// or migrating a projection.
 pub fn destination(pool: pog.Connection) -> Destination {
   Destination(pool)
 }
 
+/// Creates or upgrades the destination progress table. Run before starting
+/// projectors.
 pub fn migrate(
   destination: Destination,
 ) -> Result(Nil, pog.TransactionError(pog.QueryError)) {
   progress.migrate(destination.pool)
 }
 
+/// Batch captures the source high watermark and drains through it. Continuous
+/// polls until its control signals cancellation.
 pub type Mode {
   Batch
   Continuous(legacy.Control)
 }
 
+/// Selection, run mode, page size, polling interval in milliseconds, and
+/// application retry settings.
 pub type Config {
   Config(
     selection: delivery.Selection,
@@ -41,10 +51,13 @@ pub type Config {
   )
 }
 
+/// Bounded exponential backoff for retrying a rolled-back application attempt.
 pub opaque type RetryPolicy {
   RetryPolicy(retries: Int, initial: Int, multiplier: Float, maximum: Int)
 }
 
+/// Validates the number of retries, nonnegative delays in milliseconds, and a
+/// finite multiplier of at least one.
 pub fn retry_policy(
   retries: Int,
   initial_ms: Int,
@@ -64,6 +77,8 @@ pub fn retry_policy(
   }
 }
 
+/// Creates a batch configuration with 100 deliveries per read, a one-second
+/// poll interval, and no retries.
 pub fn config(selection: delivery.Selection) -> Config {
   let legacy.Control(wait) = legacy.uninterrupted()
   Config(selection, Batch, 100, 1000, RetryPolicy(0, 100, 2.0, 30_000), fn(ms) {
@@ -72,6 +87,9 @@ pub fn config(selection: delivery.Selection) -> Config {
   })
 }
 
+/// Policy after application rollback. Retry repeats the attempt, Skip commits
+/// progress alone, Stop leaves the position pending, and Fatal returns an
+/// error.
 pub type Decision {
   Retry
   Skip
@@ -79,6 +97,8 @@ pub type Decision {
   Fatal
 }
 
+/// Application error passed to the policy after rollback, with the position
+/// and one-based attempt number.
 pub type Failure(error) {
   Failure(position: Position, error: error, attempt: Int)
 }
@@ -89,6 +109,8 @@ pub opaque type Transaction {
   Transaction(session.Transaction)
 }
 
+/// A callback query failed because its scope ended or PostgreSQL returned a
+/// query error.
 pub type TransactionQueryError {
   TransactionClosed
   QueryFailed(pog.QueryError)
@@ -107,6 +129,9 @@ pub fn execute(
   pog.execute(query, connection) |> result.map_error(QueryFailed)
 }
 
+/// Decodes a delivery and applies destination changes in the supplied
+/// transaction. A successful apply returns a hook, run after commit
+/// acknowledgement.
 pub type Projector(event, error) {
   Projector(
     name: delivery.ProjectorName,
@@ -117,6 +142,7 @@ pub type Projector(event, error) {
   )
 }
 
+/// Successful no-op hook for a projector that has no work to do after commit.
 pub fn no_after_commit() -> Result(Nil, error) {
   Ok(Nil)
 }
@@ -139,6 +165,9 @@ fn public_progress_error(error: progress.Error) -> ProgressError {
   }
 }
 
+/// Failure while validating, leading, reading, applying, or committing a run.
+/// CommitIndeterminate requires reconciliation of durable progress.
+/// AfterCommitFailed leaves the database transaction committed.
 pub type RunError(source_error, error) {
   InvalidConfiguration
   Leadership(legacy.LeadershipError)
@@ -159,6 +188,10 @@ pub type RunError(source_error, error) {
   AfterCommitFailed(position: Position, error: error)
 }
 
+/// Completion by catching up, cancellation, or a policy stop. Processed counts
+/// applied deliveries and skipped counts intentionally bypassed deliveries.
+/// CaughtUp.through is the captured high watermark, which can be ahead of the
+/// last persisted selected event.
 pub type Outcome {
   CaughtUp(processed: Int, skipped: Int, through: Option(Position))
   Stopped(position: Position, processed: Int, skipped: Int)
@@ -220,6 +253,9 @@ fn valid_config(config: Config) -> Bool {
   && config.poll_interval > 0
 }
 
+/// Failure cleaning the destination and clearing progress.
+/// ResetCommitIndeterminate means the commit acknowledgement was lost and
+/// durable state needs reconciliation.
 pub type ResetError(error) {
   ResetLeadership(legacy.LeadershipError)
   ResetLeadershipLost
@@ -237,11 +273,15 @@ pub type ResetError(error) {
   ResetCommitIndeterminate
 }
 
+/// Identifies whether reset failed or replay failed after the reset phase.
 pub type ResetReplayError(source_error, error, reset_error) {
   ResetFailed(ResetError(reset_error))
   ReplayFailed(RunError(source_error, error))
 }
 
+/// Under the projector's leadership lock, validates stored identities and
+/// commits cleanup with cursor deletion in one transaction. Run destination
+/// cleanup using the supplied scope.
 pub fn reset(
   destination: Destination,
   name: delivery.ProjectorName,
@@ -256,6 +296,8 @@ pub fn reset(
   |> result.flatten
 }
 
+/// Commits cleanup and cursor removal, then replays under the same leadership
+/// lock. A replay failure can leave a partially rebuilt read model.
 pub fn reset_and_replay(
   destination: Destination,
   projector: Projector(event, error),

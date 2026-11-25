@@ -6,6 +6,8 @@ import eventcore/store.{type Event}
 import gleam/list
 import gleam/result
 
+/// Create a projector that prepends each selected event to its accumulator.
+/// Reverse the result to obtain delivery order, or use [collect](#collect).
 pub fn projector(
   name: String,
   filter: Filter,

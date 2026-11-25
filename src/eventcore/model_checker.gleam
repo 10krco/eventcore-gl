@@ -1,4 +1,7 @@
 //// Check information provenance across executable model declarations.
+////
+//// **Experimental.** This module is outside the EventCore 1.x compatibility
+//// guarantee. Its types and functions may change in a minor release.
 
 import eventcore/model.{type Dependency, type FieldId, Current, Previous}
 import gleam/bool

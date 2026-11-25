@@ -10,12 +10,15 @@ import gleam/int
 import gleam/option.{type Option, Some}
 import gleam/result
 
+/// A named projection lease could not be acquired or maintained.
 pub type LeadershipError {
   AlreadyLeading
   CoordinatorUnavailable
   RemoteHolder
 }
 
+/// A release callback and, when the backend supports fencing, a validity check
+/// and checkpoint write fence.
 pub type Lease {
   Lease(release: fn() -> Nil)
   CheckedLease(
@@ -33,6 +36,8 @@ pub fn check_lease(lease: Lease) -> Result(Nil, LeadershipError) {
   }
 }
 
+/// Acquires exclusive processing rights for a projector name within the
+/// backend's coordination scope.
 pub type Coordinator =
   fn(String) -> Result(Lease, LeadershipError)
 
@@ -52,6 +57,7 @@ pub fn start_local_coordinator() -> Result(LocalCoordinator, LeadershipError) {
 @external(erlang, "eventcore_memory_ffi", "stop")
 fn stop_coordinator_server(handle: LocalCoordinator) -> Result(Nil, Nil)
 
+/// Stops the local coordinator. Subsequent acquisitions on this handle fail.
 pub fn close_local_coordinator(
   handle: LocalCoordinator,
 ) -> Result(Nil, LeadershipError) {
@@ -59,6 +65,7 @@ pub fn close_local_coordinator(
   |> result.replace_error(CoordinatorUnavailable)
 }
 
+/// Adapts a shared local coordinator to the runner's named lease function.
 pub fn local_coordinator(handle: LocalCoordinator) -> Coordinator {
   fn(name) {
     use release <- result.map(acquire_local(handle, name))
@@ -72,6 +79,8 @@ fn acquire_local(
   name: String,
 ) -> Result(fn() -> Nil, LeadershipError)
 
+/// Supplies the reader, checkpoint store, and leadership acquisition used by
+/// the runner.
 pub type Backend(payload) {
   Backend(
     reader: Reader(payload),
@@ -80,16 +89,23 @@ pub type Backend(payload) {
   )
 }
 
+/// Policy after a failed delivery. Fatal ends the run, Skip advances past the
+/// delivery, and Retry uses the configured budget.
 pub type FailureStrategy {
   Fatal
   Skip
   Retry
 }
 
+/// Application failure and position. Retries counts the retries already
+/// performed for this delivery.
 pub type Failure(error) {
   Failure(error: error, position: Position, retries: Int)
 }
 
+/// Projection state and behavior. The runner starts with initial even when a
+/// checkpoint exists. Supply matching durable state when resuming, and return
+/// the unchanged state on an application error.
 pub type Projector(payload, state, error) {
   Projector(
     name: String,
@@ -100,11 +116,15 @@ pub type Projector(payload, state, error) {
   )
 }
 
+/// Batch processes one page of up to 1,000 deliveries. Continuous waits and
+/// polls for new events.
 pub type Mode {
   Batch
   Continuous
 }
 
+/// Polling and retry settings. Delays and intervals are milliseconds, and
+/// retry limits count retries after the initial attempt.
 pub type Config {
   Config(
     mode: Mode,
@@ -119,6 +139,7 @@ pub type Config {
   )
 }
 
+/// Default batch mode, polling settings, and bounded retry backoff.
 pub const default_config =
   Config(
     mode: Batch,
@@ -132,10 +153,12 @@ pub const default_config =
     event_retry_max_delay: 5000,
   )
 
+/// Wait callback receiving milliseconds. Return False to stop the runner.
 pub type Control {
   Control(wait: fn(Int) -> Bool)
 }
 
+/// Uses the runner's sleep function for waits without a cancellation signal.
 pub fn uninterrupted() -> Control {
   Control(wait: fn(delay) { sleep(delay) })
 }
@@ -158,6 +181,8 @@ fn wait_for_stop(stop: Subject(Nil), delay: Int) -> Bool {
   }
 }
 
+/// Failure acquiring leadership, loading progress, reading, or applying
+/// events. PollFailed means the reader exhausted its polling retry budget.
 pub type RunError(error) {
   InvalidConfiguration
   Leadership(LeadershipError)
@@ -177,6 +202,10 @@ type Run(payload, state, error) {
   )
 }
 
+/// Acquires leadership, loads the saved cursor, and applies matching events.
+/// Returns the final state and releases leadership. Cursor persistence and
+/// arbitrary callback effects are independent, so effects should tolerate
+/// redelivery.
 pub fn run(
   backend: Backend(payload),
   projector: Projector(payload, state, error),
