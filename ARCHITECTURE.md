@@ -193,6 +193,14 @@ Reset uses the same lock and commits destination cleanup with cursor deletion.
 Reset-and-replay holds leadership while it moves from cleanup to replay.
 See [ADR 0015](docs/decisions/0015-postgres-transactional-projections.md).
 
+The public transactional projection API exposes an opaque query scope.
+Callbacks execute queries through the runner while their scope is active.
+Session ownership and transaction control stay inside the runner. Cursor
+failures cross the public boundary as database query, invalid cursor value,
+or unexpected row count errors. Internal session and progress types can
+evolve independently of this contract.
+See [ADR 0030](docs/decisions/0030-postgres-projection-public-boundary.md).
+
 ## Typed model components
 
 The experimental model module wraps domain values in role-specific opaque types.

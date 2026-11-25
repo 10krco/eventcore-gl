@@ -83,8 +83,11 @@ pub type Failure(error) {
   Failure(position: Position, error: error, attempt: Int)
 }
 
-pub type Transaction =
-  session.Transaction
+/// Query scope for the current apply or reset callback.
+/// Use it with `execute` while the callback is active.
+pub opaque type Transaction {
+  Transaction(session.Transaction)
+}
 
 pub type TransactionQueryError {
   TransactionClosed
@@ -97,8 +100,9 @@ pub fn execute(
   transaction: Transaction,
   query: pog.Query(row),
 ) -> Result(pog.Returned(row), TransactionQueryError) {
+  let Transaction(scope) = transaction
   use connection <- result.try(
-    session.connection(transaction) |> result.replace_error(TransactionClosed),
+    session.connection(scope) |> result.replace_error(TransactionClosed),
   )
   pog.execute(query, connection) |> result.map_error(QueryFailed)
 }
@@ -117,6 +121,24 @@ pub fn no_after_commit() -> Result(Nil, error) {
   Ok(Nil)
 }
 
+/// Failure reading, advancing, or deleting a transactional projection cursor.
+pub type ProgressError {
+  /// Pog could not execute the query or decode its result.
+  ProgressDatabase(pog.QueryError)
+  /// A decoded row contains an invalid source ID, selection ID, or position.
+  ProgressInvalid
+  /// The query returned or affected a different number of rows than expected.
+  ProgressUnexpectedRows
+}
+
+fn public_progress_error(error: progress.Error) -> ProgressError {
+  case error {
+    progress.Database(error) -> ProgressDatabase(error)
+    progress.InvalidProgress -> ProgressInvalid
+    progress.UnexpectedRows -> ProgressUnexpectedRows
+  }
+}
+
 pub type RunError(source_error, error) {
   InvalidConfiguration
   Leadership(legacy.LeadershipError)
@@ -128,7 +150,7 @@ pub type RunError(source_error, error) {
     persisted: delivery.SelectionId,
     configured: delivery.SelectionId,
   )
-  ProgressFailed(position: Option(Position), error: progress.Error)
+  ProgressFailed(position: Option(Position), error: ProgressError)
   DecodeFailed(position: Position, error: error)
   ApplicationFailed(position: Position, error: error)
   RetryExhausted(position: Position, attempts: Int, error: error)
@@ -209,7 +231,7 @@ pub type ResetError(error) {
     persisted: delivery.SelectionId,
     configured: delivery.SelectionId,
   )
-  ResetProgressFailed(progress.Error)
+  ResetProgressFailed(ProgressError)
   ResetCallbackFailed(error)
   ResetCommitRolledBack
   ResetCommitIndeterminate
@@ -276,7 +298,10 @@ fn reset_with_leader(leader, name, source, selection, callback) {
   )
   let changes = {
     use observed <- result.try(
-      progress.lock(tx, name) |> result.map_error(ResetProgressFailed),
+      progress.lock(tx, name)
+      |> result.map_error(fn(error) {
+        ResetProgressFailed(public_progress_error(error))
+      }),
     )
     use _ <- result.try(validate_identity(
       observed,
@@ -286,9 +311,13 @@ fn reset_with_leader(leader, name, source, selection, callback) {
       ResetSelectionMismatch,
     ))
     use _ <- result.try(
-      callback(session.scope(leader)) |> result.map_error(ResetCallbackFailed),
+      callback(Transaction(session.scope(leader)))
+      |> result.map_error(ResetCallbackFailed),
     )
-    progress.delete(tx, name, observed) |> result.map_error(ResetProgressFailed)
+    progress.delete(tx, name, observed)
+    |> result.map_error(fn(error) {
+      ResetProgressFailed(public_progress_error(error))
+    })
   }
   case changes {
     Ok(Nil) ->
@@ -451,7 +480,11 @@ fn attempt(
       }
       use event <- result.try(rollback_on_error(runner.leader, event))
       case
-        runner.projector.apply(event, position, session.scope(runner.leader))
+        runner.projector.apply(
+          event,
+          position,
+          Transaction(session.scope(runner.leader)),
+        )
       {
         Ok(after_commit) -> {
           use _ <- result.try(advance(runner, transaction, position))
@@ -527,7 +560,9 @@ fn read_progress(
 ) {
   use row <- result.try(
     progress.lock(transaction, runner.projector.name)
-    |> result.map_error(fn(error) { ProgressFailed(position, error) }),
+    |> result.map_error(fn(error) {
+      ProgressFailed(position, public_progress_error(error))
+    }),
   )
   use _ <- result.try(validate_identity(
     row,
@@ -565,7 +600,9 @@ fn advance(runner: Runner(event, source_error, error), transaction, position) {
     )
   let saved =
     progress.advance(transaction, runner.projector.name, candidate)
-    |> result.map_error(fn(error) { ProgressFailed(Some(position), error) })
+    |> result.map_error(fn(error) {
+      ProgressFailed(Some(position), public_progress_error(error))
+    })
   use _ <- result.try(rollback_on_error(runner.leader, saved))
   session.commit(runner.leader)
   |> result.map_error(fn(error) {
