@@ -1,0 +1,298 @@
+import eventcore/internal/postgres_projection_progress as progress
+import eventcore/postgres
+import eventcore/postgres_projection as transactional
+import eventcore/projection
+import eventcore/projection_delivery as delivery
+import eventcore/projection_runner
+import eventcore/store
+import eventcore/stream
+import gleam/dynamic/decode
+import gleam/erlang/process
+import gleam/option.{None, Some}
+import gleam/result
+import pog
+
+pub fn check(first: pog.Connection, second: pog.Connection) -> Nil {
+  let codec =
+    postgres.Codec(fn(_, value) { Ok(value) }, fn(_, value) { Ok(value) })
+  let events = postgres.from_pool(first, codec)
+  assert postgres.migrate(events) == Ok(Nil)
+  assert postgres.migrate_delivery(events) == Ok(Nil)
+  let destination = transactional.destination(first)
+  let alternative = transactional.destination(second)
+  assert transactional.migrate(destination) == Ok(Nil)
+  assert transactional.migrate(alternative) == Ok(Nil)
+  let assert Ok(_) =
+    pog.query("CREATE TABLE projection_effects (amount bigint NOT NULL)")
+    |> pog.execute(first)
+  let assert Ok(id) = stream.id("transactional/amounts")
+  let assert Ok(batch) =
+    store.writes()
+    |> store.register(id, stream.initial_version)
+    |> result.try(store.append(_, store.Event(id, "amount", <<1>>)))
+    |> result.try(store.append(_, store.Event(id, "amount", <<2>>)))
+    |> result.try(store.append(_, store.Event(id, "amount", <<3>>)))
+  assert postgres.as_store(events).append_events(batch) == Ok(Nil)
+  let assert Ok(name) = delivery.projector_name("transactional-amounts")
+  let assert Ok(source_id) = delivery.source_id("transactional-store")
+  let assert Ok(selection_id) = delivery.selection_id("amount-v1")
+  let assert Ok(kind) = delivery.event_type("amount")
+  let assert Ok(selection) =
+    delivery.selection(selection_id, projection.all(), [kind])
+  let source = postgres.projection_source(events, source_id)
+  let assert Ok(position1) = projection.position(1)
+  let assert Ok(position2) = projection.position(2)
+  let assert Ok(position3) = projection.position(3)
+  let assert Ok(policy) = transactional.retry_policy(1, 100, 2.0, 5000)
+  let signal = process.new_subject()
+  let config =
+    transactional.Config(
+      ..transactional.config(selection),
+      batch_size: 1,
+      retry_policy: policy,
+      retry_wait: fn(delay) {
+        assert delay == 100
+        assert count(second) == 0
+        assert progress.load(second, name) == Ok(None)
+        process.send(signal, Nil)
+      },
+    )
+  let projector =
+    transactional.Projector(
+      name,
+      fn(event) { Ok(event.position) },
+      fn(position, _, tx) {
+        let assert Ok(_) = insert(tx, projection.sequence(position))
+        case position {
+          _ if position == position1 ->
+            case process.receive(signal, 0) {
+              Error(Nil) -> Error("retry")
+              Ok(Nil) ->
+                Ok(fn() {
+                  assert insert(tx, 999)
+                    == Error(transactional.TransactionClosed)
+                  assert count(second) == 1
+                  assert progress.load(second, name)
+                    == Ok(
+                      Some(progress.Progress(source_id, selection_id, position1)),
+                    )
+                  Ok(Nil)
+                })
+            }
+          _ if position == position2 -> Error("skip")
+          _ -> Ok(fn() { Error("hook") })
+        }
+      },
+      fn(failure) {
+        case failure.error {
+          "retry" -> transactional.Retry
+          _ -> transactional.Skip
+        }
+      },
+    )
+  assert transactional.run(destination, projector, source, config)
+    == Error(transactional.AfterCommitFailed(position3, "hook"))
+  assert count(second) == 2
+  assert progress.load(second, name)
+    == Ok(Some(progress.Progress(source_id, selection_id, position3)))
+  assert transactional.run(destination, projector, source, config)
+    == Ok(transactional.CaughtUp(0, 0, Some(position3)))
+
+  let assert Ok(alternate_id) = delivery.selection_id("amount-v2")
+  assert transactional.reset(destination, name, source_id, alternate_id, fn(_) {
+      panic as "mismatched reset callback"
+    })
+    == Error(transactional.ResetSelectionMismatch(selection_id, alternate_id))
+  assert transactional.reset(destination, name, source_id, selection_id, fn(tx) {
+      clear(tx)
+      Error("rollback")
+    })
+    == Error(transactional.ResetCallbackFailed("rollback"))
+  assert count(second) == 2
+
+  let replay =
+    transactional.Projector(
+      name,
+      fn(event) { Ok(event.position) },
+      fn(position, _, tx) {
+        let assert Ok(_) = insert(tx, projection.sequence(position))
+        Ok(transactional.no_after_commit)
+      },
+      fn(_) { transactional.Fatal },
+    )
+  assert transactional.reset_and_replay(
+      destination,
+      replay,
+      source,
+      config,
+      fn(tx) {
+        assert transactional.reset(
+            alternative,
+            name,
+            source_id,
+            selection_id,
+            fn(_) { panic as "concurrent reset callback" },
+          )
+          == Error(transactional.ResetLeadership(
+            projection_runner.AlreadyLeading,
+          ))
+        clear(tx)
+        Ok(Nil)
+      },
+    )
+    == Ok(transactional.CaughtUp(3, 0, Some(position3)))
+  assert count(second) == 3
+  let polls = process.new_subject()
+  process.send(polls, Nil)
+  let writer = postgres.from_pool(second, codec) |> postgres.as_store
+  let continuous =
+    transactional.Config(
+      ..config,
+      mode: transactional.Continuous(
+        projection_runner.Control(fn(interval) {
+          assert interval == 1000
+          case process.receive(polls, 0) {
+            Error(Nil) -> False
+            Ok(Nil) -> {
+              let assert Ok(new_stream) = stream.id("transactional/live")
+              let assert Ok(batch) =
+                store.writes()
+                |> store.register(new_stream, stream.initial_version)
+                |> result.try(store.append(
+                  _,
+                  store.Event(new_stream, "amount", <<4>>),
+                ))
+              assert writer.append_events(batch) == Ok(Nil)
+              True
+            }
+          }
+        }),
+      ),
+    )
+  assert transactional.run(destination, replay, source, continuous)
+    == Ok(transactional.Cancelled(1, 0))
+  assert count(second) == 4
+
+  let assert Ok(failure_name) = delivery.projector_name("transactional-failure")
+  let fails =
+    transactional.Projector(
+      failure_name,
+      fn(event) { Ok(event.position) },
+      fn(_, _, tx) {
+        let assert Ok(_) = insert(tx, 99)
+        Error("apply")
+      },
+      fn(_) { transactional.Stop },
+    )
+  assert transactional.run(destination, fails, source, config)
+    == Ok(transactional.Stopped(position1, 0, 0))
+  assert transactional.run(
+      destination,
+      transactional.Projector(..fails, on_error: fn(_) { transactional.Fatal }),
+      source,
+      config,
+    )
+    == Error(transactional.ApplicationFailed(position1, "apply"))
+  assert transactional.run(
+      destination,
+      transactional.Projector(..fails, on_error: fn(_) { transactional.Retry }),
+      source,
+      transactional.config(selection),
+    )
+    == Error(transactional.RetryExhausted(position1, 1, "apply"))
+  assert count(second) == 4
+  assert progress.load(second, failure_name) == Ok(None)
+
+  check_leadership_loss(destination, source, config, second)
+  check_commit_disconnect(destination, source, config, second, position1)
+}
+
+fn check_leadership_loss(destination, source, config, observer) {
+  let assert Ok(name) = delivery.projector_name("transactional-fenced-retry")
+  let sender = process.new_subject()
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, _, tx) {
+        let assert Ok(pog.Returned(rows: [pid], ..)) =
+          pog.query("SELECT pg_backend_pid()")
+          |> pog.returning(decode.at([0], decode.int))
+          |> transactional.execute(tx, _)
+        let assert Ok(_) = insert(tx, 99)
+        process.send(sender, pid)
+        Error("retry after losing the backend")
+      },
+      fn(_) { transactional.Retry },
+    )
+  let fenced =
+    transactional.Config(..config, retry_wait: fn(_) {
+      let assert Ok(pid) = process.receive(sender, 0)
+      let assert Ok(pog.Returned(rows: [True], ..)) =
+        pog.query("SELECT pg_terminate_backend($1, 1000)")
+        |> pog.parameter(pog.int(pid))
+        |> pog.returning(decode.at([0], decode.bool))
+        |> pog.execute(observer)
+      Nil
+    })
+  assert transactional.run(destination, projector, source, fenced)
+    == Error(transactional.LeadershipLost)
+  assert count(observer) == 4
+  assert progress.load(observer, name) == Ok(None)
+}
+
+fn check_commit_disconnect(destination, source, config, observer, position1) {
+  let assert Ok(_) =
+    pog.query(
+      "CREATE FUNCTION disconnect_projector() RETURNS trigger
+    LANGUAGE plpgsql AS $$ BEGIN
+      PERFORM pg_terminate_backend(pg_backend_pid());
+      RETURN NEW;
+    END $$",
+    )
+    |> pog.execute(observer)
+  let assert Ok(_) =
+    pog.query(
+      "CREATE CONSTRAINT TRIGGER disconnect_projector
+    AFTER INSERT ON projection_effects DEFERRABLE INITIALLY DEFERRED
+    FOR EACH ROW WHEN (NEW.amount = 500) EXECUTE FUNCTION disconnect_projector()",
+    )
+    |> pog.execute(observer)
+  let assert Ok(name) = delivery.projector_name("transactional-disconnect")
+  let projector =
+    transactional.Projector(
+      name,
+      fn(_) { Ok(Nil) },
+      fn(_, _, tx) {
+        let assert Ok(_) = insert(tx, 500)
+        Ok(fn() { panic as "commit was not acknowledged" })
+      },
+      fn(_) { transactional.Fatal },
+    )
+  assert transactional.run(destination, projector, source, config)
+    == Error(transactional.CommitIndeterminate(position1))
+  assert count(observer) == 4
+  assert progress.load(observer, name) == Ok(None)
+  Nil
+}
+
+fn insert(transaction: transactional.Transaction, amount: Int) {
+  pog.query("INSERT INTO projection_effects(amount) VALUES ($1)")
+  |> pog.parameter(pog.int(amount))
+  |> transactional.execute(transaction, _)
+}
+
+fn clear(transaction: transactional.Transaction) -> Nil {
+  let assert Ok(_) =
+    pog.query("DELETE FROM projection_effects")
+    |> transactional.execute(transaction, _)
+  Nil
+}
+
+fn count(connection: pog.Connection) -> Int {
+  let assert Ok(pog.Returned(rows: [count], ..)) =
+    pog.query("SELECT count(*) FROM projection_effects")
+    |> pog.returning(decode.at([0], decode.int))
+    |> pog.execute(connection)
+  count
+}

@@ -1,6 +1,8 @@
 -module(eventcore_postgres_ffi).
 -include_lib("kernel/include/logger.hrl").
--export([trace_read/2, trace_append/2, stop_pool/1, acquire_projection/2, projection_connection/1, checkpoint_connection/2]).
+-export([trace_read/2, trace_append/2, stop_pool/1, acquire_projection/2, projection_connection/1, checkpoint_connection/2,
+         with_transactional_leader/3, transactional_command/2,
+         transactional_scope/1, transactional_connection/1]).
 
 trace_read(Stream, 0) ->
     ?LOG_INFO(#{operation => <<"postgres.read_stream">>, stream => Stream}),
@@ -22,13 +24,15 @@ stop_pool(Pid) ->
     nil.
 
 
-acquire_projection({pool, Pool}, Name) ->
-    Key = lock_key(Name),
+acquire_projection(Connection, Name) ->
+    acquire_session(Connection, lock_key(Name)).
+
+acquire_session({pool, Pool}, Key) ->
     case lists:keymember(Key, 1, held_sessions(Pool)) of
         true -> {error, already_leading};
         false -> checkout_projection(Pool, Key, erlang:monotonic_time(millisecond) + 100)
     end;
-acquire_projection(_, _) ->
+acquire_session(_, _) ->
     {error, coordinator_unavailable}.
 
 checkout_projection(Pool, Key, Deadline) ->
@@ -66,21 +70,30 @@ lock_session(Pool, Ref, Connection, Key) ->
     end.
 
 release_session(Owner, Pool, Key, Token) when Owner =:= self() ->
-    case lists:keytake(Key, 1, held_sessions(Pool)) of
-        {value, {Key, Token, Ref, Connection}, Remaining} ->
-            case Remaining of
-                [] -> erase({?MODULE, Pool});
-                _ -> put({?MODULE, Pool}, Remaining)
-            end,
-            case advisory_query(Connection, "SELECT pg_advisory_unlock($1)", Key) of
-                #{rows := [{true}]} -> pgo:checkin(Ref, Connection);
-                _ -> disconnect_session(Ref, Connection)
-            end;
-        _ -> ok
-    end,
+    _ = unlock_session(Pool, Key, Token),
     nil;
 release_session(_, _, _, _) ->
     nil.
+
+unlock_session(Pool, Key, Token) ->
+    case lists:keytake(Key, 1, held_sessions(Pool)) of
+        {value, {Key, Token, Ref, Connection}, Remaining} ->
+            save_held_sessions(Pool, Remaining),
+            case advisory_query(Connection, "SELECT pg_advisory_unlock($1)", Key) of
+                #{rows := [{true}]} ->
+                    pgo:checkin(Ref, Connection),
+                    ok;
+                _ ->
+                    disconnect_session(Ref, Connection),
+                    error
+            end;
+        _ -> error
+    end.
+
+save_held_sessions(Pool, []) ->
+    erase({?MODULE, Pool});
+save_held_sessions(Pool, Remaining) ->
+    put({?MODULE, Pool}, Remaining).
 
 held_sessions(Pool) ->
     case get({?MODULE, Pool}) of
@@ -122,3 +135,95 @@ lock_hash(<<>>, Hash) ->
     Hash;
 lock_hash(<<Byte, Rest/binary>>, Hash) ->
     lock_hash(Rest, ((Hash bxor Byte) * 16#100000001b3) band 16#ffffffffffffffff).
+
+%% The leader's owning process holds the Pog checkout throughout the run.
+%% Run all writes on that exact session so pool reconnects cannot restore
+%% authority to a process that has lost its lock.
+with_transactional_leader({pool, Pool} = Database, Name, Work) ->
+    Key = lock_key(<<"eventcore:transactional-projection:", Name/binary>>),
+    case acquire_session(Database, Key) of
+        {ok, _} ->
+            {Key, Token, _, _} = lists:keyfind(Key, 1, held_sessions(Pool)),
+            try Work({self(), Pool, Key, Token}) of
+                {ok, _} = Outcome ->
+                    case finish_transactional_session(Pool, Key, Token) of
+                        ok -> {ok, Outcome};
+                        error -> {error, release_failed}
+                    end;
+                {error, _} = Outcome ->
+                    finish_transactional_session(Pool, Key, Token),
+                    {ok, Outcome}
+            catch
+                Class:Reason:Stack ->
+                    finish_transactional_session(Pool, Key, Token),
+                    erlang:raise(Class, Reason, Stack)
+            end;
+        {error, Error} -> {error, {acquisition_failed, Error}}
+    end;
+with_transactional_leader(_, _, _) ->
+    {error, {acquisition_failed, coordinator_unavailable}}.
+
+finish_transactional_session(Pool, Key, Token) ->
+    case erase({?MODULE, transaction, Token}) of
+        Scope when is_reference(Scope) ->
+            case lists:keyfind(Key, 1, held_sessions(Pool)) of
+                {Key, Token, Ref, Conn} -> discard_session(Pool, Key, Ref, Conn);
+                _ -> ok
+            end,
+            error;
+        _ ->
+            unlock_session(Pool, Key, Token)
+    end.
+
+transactional_command({Owner, Pool, Key, Token}, Command) when Owner =:= self() ->
+    StateKey = {?MODULE, transaction, Token},
+    case {lists:keyfind(Key, 1, held_sessions(Pool)), Command, get(StateKey)} of
+        {{Key, Token, Ref, Connection}, 'begin', undefined} ->
+            run_transaction_command(Pool, Key, Ref, Connection, StateKey, 'begin', "BEGIN");
+        {{Key, Token, Ref, Connection}, commit, Scope} when is_reference(Scope) ->
+            run_transaction_command(Pool, Key, Ref, Connection, StateKey, commit, "COMMIT");
+        {{Key, Token, Ref, Connection}, rollback, Scope} when is_reference(Scope) ->
+            run_transaction_command(Pool, Key, Ref, Connection, StateKey, rollback, "ROLLBACK");
+        _ -> {error, session_failed}
+    end;
+transactional_command(_, _) ->
+    {error, session_failed}.
+
+transactional_scope({Owner, _, _, Token} = Leader) when Owner =:= self() ->
+    {Leader, get({?MODULE, transaction, Token})}.
+
+transactional_connection({{Owner, Pool, Key, Token}, Scope})
+        when Owner =:= self(), is_reference(Scope) ->
+    case {get({?MODULE, transaction, Token}), lists:keyfind(Key, 1, held_sessions(Pool))} of
+        {Scope, {Key, Token, _, Connection}} -> {ok, {single_connection, Connection}};
+        _ -> {error, nil}
+    end;
+transactional_connection(_) ->
+    {error, nil}.
+
+run_transaction_command(Pool, Key, Ref, Connection, StateKey, Command, Sql) ->
+    case advisory_query_no_parameter(Connection, Sql) of
+        #{command := 'begin'} when Command =:= 'begin' ->
+            put(StateKey, make_ref()),
+            {ok, {single_connection, Connection}};
+        #{command := Command} ->
+            erase(StateKey),
+            {ok, {single_connection, Connection}};
+        #{command := rollback} when Command =:= commit ->
+            erase(StateKey),
+            {error, rolled_back};
+        _ ->
+            erase(StateKey),
+            discard_session(Pool, Key, Ref, Connection),
+            {error, session_failed}
+    end.
+
+advisory_query_no_parameter(Connection, Sql) ->
+    try pgo_handler:extended_query(Connection, Sql, [], #{queue_time => undefined})
+    catch
+        _:_ -> {error, transactional_command_failed}
+    end.
+
+discard_session(Pool, Key, Ref, Connection) ->
+    save_held_sessions(Pool, lists:keydelete(Key, 1, held_sessions(Pool))),
+    disconnect_session(Ref, Connection).

@@ -140,9 +140,18 @@ pub fn projection_source(
 ) -> delivery.Source(DeliveryError) {
   delivery.Source(
     id,
-    fn() { delivery_frontier(events.pool) |> result.map(delivery_position) },
+    fn() {
+      delivery_frontier(projection_connection(events.pool))
+      |> result.map(delivery_position)
+    },
     fn(selection, page, through) {
-      read_delivery(events.pool, id, selection, page, through)
+      read_delivery(
+        projection_connection(events.pool),
+        id,
+        selection,
+        page,
+        through,
+      )
     },
   )
 }
