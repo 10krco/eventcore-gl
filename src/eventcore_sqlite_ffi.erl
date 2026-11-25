@@ -271,16 +271,21 @@ optional_filters(Options) ->
 
 create_tables(Connection, release_event_schema) ->
     [] = sqlite:query(Connection, "CREATE TABLE IF NOT EXISTS eventcore_release_ids ("
-        "position INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE)"),
+        "position INTEGER PRIMARY KEY, uuid TEXT NOT NULL UNIQUE, milliseconds INTEGER NOT NULL)"),
     % Reserve 42 position bits for key order within a millisecond.
-    Clock = "CAST(round(unixepoch('subsec') * 1000) AS INTEGER)",
+    Clock = "max(CAST(round(unixepoch('subsec') * 1000) AS INTEGER), "
+        "COALESCE((SELECT milliseconds FROM eventcore_release_ids ORDER BY uuid DESC LIMIT 1), 0)) "
+        "+ CASE WHEN (NEW.position & 4398046511103) = 0 THEN 1 ELSE 0 END",
     [] = sqlite:query(Connection, ["CREATE TRIGGER IF NOT EXISTS eventcore_assign_release_id "
         "AFTER INSERT ON eventcore_events BEGIN "
-        "INSERT INTO eventcore_release_ids(position, uuid) VALUES (NEW.position, ",
-        release_uuid(Clock, "NEW.position"), "); "
+        "INSERT INTO eventcore_release_ids(position, uuid, milliseconds) "
+        "SELECT NEW.position, ", release_uuid("milliseconds", "NEW.position"), ", milliseconds "
+        "FROM (SELECT ", Clock, " AS milliseconds); "
         "SELECT CASE WHEN changes() <> 1 THEN RAISE(ABORT, 'event UUID missing') END; END"]),
-    ok = write_query(Connection, ["INSERT INTO eventcore_release_ids(position, uuid) "
-        "SELECT e.position, ", release_uuid("0", "e.position"), " FROM eventcore_events e "
+    BackfillClock = "e.position >> 42",
+    ok = write_query(Connection, ["INSERT INTO eventcore_release_ids(position, uuid, milliseconds) "
+        "SELECT e.position, ", release_uuid(BackfillClock, "e.position"), ", ", BackfillClock,
+        " FROM eventcore_events e "
         "WHERE NOT EXISTS (SELECT 1 FROM eventcore_release_ids p WHERE p.position = e.position)"], []),
     {ok, nil};
 create_tables(Connection, release_checkpoint_schema) ->

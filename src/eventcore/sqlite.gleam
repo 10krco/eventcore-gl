@@ -227,6 +227,8 @@ pub fn migrate_release_checkpoints(
   migrate_schema(checkpoints.server, ReleaseCheckpointSchema)
 }
 
+/// Page by UUID with the release's pre-decode row limit.
+/// An entirely incompatible page returns no deliveries and retains its cursor.
 pub fn projection_release_reader(
   events: EventStore(payload),
   consumer_kind: String,

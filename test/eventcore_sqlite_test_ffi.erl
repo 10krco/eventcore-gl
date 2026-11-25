@@ -1,7 +1,7 @@
 -module(eventcore_sqlite_test_ffi).
 -export([temp_database/0, delete_database/1, two_writers/2, open_supplied/0, pragmas/1,
          reject_kind/1, ignore_kind/1, disable_count_changes/1, sqlite_test_backend/0,
-         insert_invalid_payloads/1, file_journal_mode/1]).
+         insert_invalid_payloads/1, file_journal_mode/1, pin_release_clock/1]).
 
 sqlite_test_backend() ->
     unicode:characters_to_binary(os:getenv("EVENTCORE_SQLITE_TEST_BACKEND", "plain")).
@@ -76,3 +76,13 @@ install_trigger(Db, Action) ->
     [] = sqlite:query(Db, "CREATE TRIGGER reject_kind BEFORE INSERT ON eventcore_events "
                          "WHEN NEW.kind = 'refused' BEGIN SELECT RAISE(" ++ Action ++ "); END"),
     nil.
+
+pin_release_clock(Path) ->
+    Db = sqlite:open(Path),
+    try
+        [{1}] = sqlite:query(Db, "UPDATE eventcore_release_ids SET milliseconds = 140737488355327, "
+            "uuid = '7fffffff-ffff' || substr(uuid, 14) RETURNING 1"),
+        nil
+    after
+        sqlite:close(Db)
+    end.

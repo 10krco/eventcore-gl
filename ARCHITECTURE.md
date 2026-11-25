@@ -157,6 +157,7 @@ See [ADR 0012](docs/decisions/0012-sqlite-projection-replay.md).
 The SQLite release backend reads a separate UUID index with native LIKE
 and GLOB predicates. Its migration backfills old rows and installs an
 insert trigger that assigns new identities atomically with the event.
+The trigger keeps UUID order if the wall clock moves behind a prior append.
 UUID checkpoints persist on the selected checkpoint database. See
 [ADR 0028](docs/decisions/0028-sqlite-release-projection-cursors.md).
 

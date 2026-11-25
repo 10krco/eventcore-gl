@@ -506,12 +506,7 @@ pub fn release_sqlite_uses_native_selection_and_resumes_uuid_after_reopen_test()
   assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
   assert sqlite.migrate_release_delivery(events) == Ok(Nil)
   assert sqlite.migrate_release_checkpoints(checkpoints) == Ok(Nil)
-  let assert Ok(writes) =
-    store.writes()
-    |> store.register(id, stream.next_version(initial))
-    |> result.try(store.append(_, store.Event(id, "other", 99)))
-    |> result.try(store.append(_, last))
-  assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
+  assert pin_release_clock(path) == Nil
   let backend = sqlite.projection_release_backend(events, checkpoints, "note")
   let assert Ok(prefix) = projection.prefix("NOTES/_")
   let assert Ok(first_page) = projection.page(None, 1)
@@ -522,6 +517,12 @@ pub fn release_sqlite_uses_native_selection_and_resumes_uuid_after_reopen_test()
   assert cursor != native
   assert sqlite.save_checkpoint(checkpoints, "notes", 1) == Ok(Nil)
   assert backend.checkpoints.save("notes", cursor) == Ok(Nil)
+  let assert Ok(writes) =
+    store.writes()
+    |> store.register(id, stream.next_version(initial))
+    |> result.try(store.append(_, store.Event(id, "other", 99)))
+    |> result.try(store.append(_, last))
+  assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
   assert sqlite.close_checkpoints(checkpoints) == Ok(Nil)
   assert sqlite.close(events) == Ok(Nil)
 
@@ -544,4 +545,40 @@ pub fn release_sqlite_uses_native_selection_and_resumes_uuid_after_reopen_test()
   assert sqlite.close(events) == Ok(Nil)
   assert delete_database(path) == Nil
   assert delete_database(checkpoint_path) == Nil
+}
+
+@external(erlang, "eventcore_sqlite_test_ffi", "pin_release_clock")
+fn pin_release_clock(path: String) -> Nil
+
+pub fn release_sqlite_counts_an_incompatible_row_before_decoding_test() {
+  let assert Ok(id) = stream.id("sample")
+  let codec = integer_codec()
+  let assert Ok(events) =
+    sqlite.open_memory(
+      sqlite.Codec(codec.encode, fn(kind, bytes) {
+        case codec.decode(kind, bytes) {
+          Ok(0) -> Error("incompatible event")
+          decoded -> decoded
+        }
+      }),
+    )
+  assert sqlite.migrate(events) == Ok(Nil)
+  assert sqlite.migrate_release_delivery(events) == Ok(Nil)
+  let first = store.Event(id, "sample", 0)
+  let last = store.Event(id, "sample", 42)
+  let assert Ok(writes) =
+    store.writes()
+    |> store.register(id, stream.initial_version)
+    |> result.try(store.append(_, first))
+    |> result.try(store.append(_, last))
+  assert sqlite.as_store(events).append_events(writes) == Ok(Nil)
+  let read = sqlite.projection_release_reader(events, "sample")
+  let assert Ok(one) = projection.page(None, 1)
+  assert read(projection.all(), one) == Ok(projection.PageResult([], None))
+  assert read(projection.all(), one) == Ok(projection.PageResult([], None))
+  let assert Ok(two) = projection.page(None, 2)
+  let assert Ok(projection.PageResult([delivery], Some(_))) =
+    read(projection.all(), two)
+  assert delivery.event == last
+  assert sqlite.close(events) == Ok(Nil)
 }
