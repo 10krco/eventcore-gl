@@ -16,6 +16,12 @@ compile_failure(Fixture) ->
                             filename:join(Temp, "gleam.toml")),
         {ok, _} = file:copy(filename:join(Fixtures, binary_to_list(Fixture) ++ ".fixture"),
                             filename:join(Source, File)),
+        case Fixture of
+            <<"missing_field">> ->
+                {ok, _} = file:copy("test/model_transfer_example.gleam",
+                                    filename:join(Source, "model_transfer_example.gleam"));
+            _ -> ok
+        end,
         Arguments = ["compile-package", "--target", "erlang", "--no-beam",
                      "--package", filename:absname(Temp), "--out",
                      filename:absname(filename:join(Temp, "out")),

@@ -2,17 +2,10 @@ import eventcore/model
 import eventcore/stream
 import gleam/option.{type Option, None}
 import gleam/string
-
-type SourceField {
-  SourceField
-}
-
-type DestinationField {
-  DestinationField
-}
-
-type AmountField {
-  AmountField
+import model_transfer_example.{
+  type CreditWitness, type DebitWitness, type Transfer, AmountField,
+  DestinationField, SourceField, Transfer, TransferComponent, build_transfer,
+  credit, debit,
 }
 
 type MemoField {
@@ -21,14 +14,6 @@ type MemoField {
 
 type Request {
   Request(
-    source: model.StreamIdentity(DebitWitness),
-    target: model.StreamIdentity(CreditWitness),
-    amount: Int,
-  )
-}
-
-type Transfer {
-  Transfer(
     source: model.StreamIdentity(DebitWitness),
     target: model.StreamIdentity(CreditWitness),
     amount: Int,
@@ -104,58 +89,16 @@ pub fn typed_transfer_construction_and_fallible_mapping_test() {
   let moved_target = model.apply(map_target, request_value)
   let assert Ok(moved_amount) = model.apply(map_amount, request_value)
   let transferred =
-    build_transfer(transfer, moved_source, moved_target, moved_amount)
+    build_transfer(
+      component: transfer,
+      source: moved_source,
+      target: moved_target,
+      amount: moved_amount,
+    )
   assert model.value(transferred) == Transfer(from, to, 4)
   assert model.stream_id(model.value(transferred).source) == from_id
   assert model.apply(map_amount, model.build(request, Request(from, to, 0)))
     == Error("invalid amount")
-}
-
-fn build_transfer(
-  component: model.Component(model.Command(TransferComponent), Transfer),
-  source: model.FieldValue(
-    model.Command(TransferComponent),
-    Transfer,
-    SourceField,
-    model.StreamIdentity(DebitWitness),
-  ),
-  target: model.FieldValue(
-    model.Command(TransferComponent),
-    Transfer,
-    DestinationField,
-    model.StreamIdentity(CreditWitness),
-  ),
-  amount: model.FieldValue(
-    model.Command(TransferComponent),
-    Transfer,
-    AmountField,
-    Int,
-  ),
-) -> model.Modeled(model.Command(TransferComponent), Transfer) {
-  model.build(
-    component,
-    Transfer(
-      model.field_value(source),
-      model.field_value(target),
-      model.field_value(amount),
-    ),
-  )
-}
-
-type DebitWitness {
-  DebitWitness
-}
-
-type CreditWitness {
-  CreditWitness
-}
-
-fn debit(id: stream.Id) -> model.StreamIdentity(DebitWitness) {
-  model.stream_identity(DebitWitness, id)
-}
-
-fn credit(id: stream.Id) -> model.StreamIdentity(CreditWitness) {
-  model.stream_identity(CreditWitness, id)
 }
 
 pub fn state_recipes_build_empty_state_test() {
@@ -219,10 +162,6 @@ pub fn mapping_combines_fields_from_distinct_components_test() {
 
 type RequestComponent {
   RequestComponent
-}
-
-type TransferComponent {
-  TransferComponent
 }
 
 type LedgerComponent {
