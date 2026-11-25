@@ -179,3 +179,9 @@ fixture. Transactional projector checks in
 application effects and independent progress observations. The integration
 fixture owns SQL setup and backend fault injection.
 See [ADR 0020](docs/decisions/0020-reusable-contracts.md).
+
+Given, when, and then helpers seed a private in-memory store, execute a
+command, and read its history through the legacy runner. Fault wrappers
+operate at the store boundary. Fixed conflicts spend a shared append
+budget, and seeded chaos reproduces injection choices for a fixed call
+order. See [ADR 0021](docs/decisions/0021-deterministic-testing.md).
